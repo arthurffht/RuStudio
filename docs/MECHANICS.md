@@ -2991,3 +2991,19 @@ the head, `ticks/own-contact-solve.patch`); pushing a server-owned character (T1
 bodies that are not characters and their 60 Hz stepping (T14); a pushed block lagging its pusher by a tick of
 friction (T10).
 
+## D3D11 Quality Profiles and Frame Rate Manager (FRM)
+
+Estimated hardware caps and hysteresis constants (`src/mech.rs`, `src/quality.rs`):
+
+| Constant | Value | Meaning | Source |
+|---|---|---|---|
+| `QUALITY_LEVEL_MIN` / `QUALITY_LEVEL_MAX` | `1` / `21` | `Enum.QualityLevel` range (`0` = `Automatic`) | Roblox API dump |
+| `QUALITY_UMA_DEFAULT_LEVEL` | `5` | Default Automatic level when `is_uma` or VRAM <= 512 MB or no 4x FP16 MSAA | estimated (Intel HD 4000 UMA safe preset) |
+| `QUALITY_MID_VRAM_MB` / `QUALITY_MID_DEFAULT_LEVEL` | `2048` / `12` | Default Automatic level for discrete GPUs under 2 GB VRAM | estimated |
+| Feature thresholds | shadows/clouds >= `4`, bloom >= `6`, local shadows >= `8`, 3-cascade >= `10`, SSAO >= `12`, DoF/2048-shadow/LOD 1.0 >= `14`, 4x MSAA/4-cascade >= `16` | Quality scaling ladder (`UMA` caps MSAA=1x, atlas<=1024, local shadows<=4, and disables SSAO/DoF in `auto_mode`) | estimated |
+| `FRM_TARGET_INITIAL_MS` / `FRM_EMA_ALPHA` | `16.6` / `0.1` | Initial smoothed frame time and EMA update weight (clamped to `0.5..500.0` ms) | estimated |
+| `FRM_HYSTERESIS_FRAMES` | `45` | Minimum frames between automatic FRM level changes | estimated |
+| `FRM_DOWNGRADE_MS` / `FRM_DOWNGRADE_STEP` | `22.0` / `2` | Downgrade threshold and step size | estimated |
+| `FRM_UPGRADE_MS` / `FRM_UPGRADE_STEP` | `10.5` / `1` | Upgrade threshold and step size | estimated |
+
+

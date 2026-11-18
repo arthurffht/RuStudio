@@ -264,7 +264,7 @@ pub struct Editor {
     pub clean_view: bool,
     pub log: Vec<LogLine>,
     pub clipboard: Option<Vec<u8>>,
-    pub render_state: Option<egui_wgpu::RenderState>,
+    pub render_state: Option<crate::d3d11::RenderState>,
     pub renderer: Option<Renderer>,
     pub scene: Scene,
     /// The parts inside drawn ViewportFrames (vf_render.rs), drawn by the
@@ -478,24 +478,12 @@ pub fn default_dock() -> DockState<Tab> {
 }
 
 impl RustudioApp {
-    pub fn new(
-        cc: &eframe::CreationContext<'_>,
-        open: Option<PathBuf>,
-        harness: Harness,
-        demo: bool,
-    ) -> Self {
-        // (whether the cursor can truly lock: mouse_lock::platform_locks)
-        use eframe::egui_wgpu::wgpu::rwh::{HasWindowHandle, RawWindowHandle};
-        let wayland = cc.window_handle().ok().map(|h| matches!(h.as_raw(), RawWindowHandle::Wayland(_)));
-        Self::new_in(&cc.egui_ctx, cc.wgpu_render_state.clone(), wayland, open, harness, demo)
-    }
-
-    /// The app on an egui context and (optional) wgpu device of its own:
-    /// eframe's window (`new`) or the offscreen runner (src/offscreen.rs,
-    /// `--headless`, no window; `--no-render`, no GPU).
+    /// The app on an egui context and (optional) D3D11 RenderState of its own:
+    /// the Win32 D3D11 window (`src/d3d11/window.rs`) or the offscreen runner
+    /// (`src/offscreen.rs`, `--headless`, no window; `--no-render`, no GPU).
     pub fn new_in(
         egui_ctx: &egui::Context,
-        render_state: Option<egui_wgpu::RenderState>,
+        render_state: Option<crate::d3d11::RenderState>,
         wayland: Option<bool>,
         open: Option<PathBuf>,
         harness: Harness,
@@ -504,9 +492,7 @@ impl RustudioApp {
         crate::ti::install(egui_ctx);
         theme::apply(egui_ctx);
         crate::mouse_lock::note_window(wayland);
-        let renderer = render_state
-            .as_ref()
-            .map(|rs| Renderer::new(&rs.device, &rs.queue));
+        let renderer = render_state.as_ref().map(Renderer::new);
         let mut ed = Editor {
             dialogs: crate::file_dialog::Dialogs::new(egui_ctx.clone()),
             doc: Document::new_place(),
@@ -636,7 +622,7 @@ impl RustudioApp {
             ed.error(line);
         }
         if ed.renderer.is_none() && !ed.harness.no_render {
-            ed.error("No wgpu renderer available; the 3D viewport is disabled.");
+            ed.error("No D3D11 renderer available; the 3D viewport is disabled.");
         }
         let open_none = open.is_none();
         if let Some(path) = open {
@@ -2126,7 +2112,7 @@ impl RustudioApp {
                 ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
             }
             let ed = &mut self.ed;
-            // eframe panics ("the user callback was never called") when it
+            // The viewport host skips the callback if it
             // can't make the window this frame (no event loop context, or
             // the platform refused the window: seen on a Windows host's hidden
             // desktop). That's not fatal: skip the window this frame, and
@@ -2211,7 +2197,7 @@ impl RustudioApp {
     }
 }
 
-impl eframe::App for RustudioApp {
+impl crate::d3d11::WindowApp for RustudioApp {
     fn on_exit(&mut self) {
         self.ed.mcp = None;
         crate::studio_settings::flush();
@@ -2255,13 +2241,13 @@ impl eframe::App for RustudioApp {
         self.ed.phys.ingest(raw);
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui) {
         self.frame(ui);
     }
 }
 
 impl RustudioApp {
-    /// One frame, in eframe's window or offscreen (src/offscreen.rs).
+    /// One frame, in the D3D11 window host or offscreen (src/offscreen.rs).
     pub fn frame(&mut self, ui: &mut egui::Ui) {
         // (the whole frame, for --bench: the editor's and --no-ui's alike)
         let _frame_scope = crate::bench::scope("frame");
@@ -2625,7 +2611,7 @@ impl RustudioApp {
         ed.last_work_ms = work_ms;
         // RUSTUDIO_GPU_TIMING: resolve this frame's GPU timestamps, collect finished ones.
         if let Some(rs) = ed.render_state.as_ref() {
-            crate::gpu_timing::end_frame(&rs.device, &rs.queue);
+            crate::gpu_timing::end_frame(&rs.device, &rs.context);
         }
         let mut bench_done = false;
         if let Some(b) = ed.harness.bench.as_mut() {

@@ -176,6 +176,8 @@ usage: rustudio [FILE] [--demo] [--play] [--screenshot OUT.png] [--self-test OUT
                        .frames.json / .cursor.json beside it as in the editor)
   --play-only          --no-ui --play
   --overlays           with --no-ui in Edit state: keep the editor's overlays
+  --quality LEVEL      override RenderSettings.EditQualityLevel (automatic or 1..=21)
+  --frm MODE           override RenderSettings.FrameRateManager (auto, on, or off)
   --headless           no window, no compositor: frames are drawn offscreen at --window
                        WxH and read back for shots; 60 frames a second (unpaced
                        with --bench). Silent unless --audio. With --no-ui or
@@ -298,7 +300,26 @@ fn window_arg(argv: &[String]) -> Option<(u32, u32)> {
     Some((w.parse().ok()?, h.parse().ok()?))
 }
 
-fn main() -> eframe::Result<()> {
+fn parse_quality_arg(s: &str) -> Option<u32> {
+    let lower = s.trim().to_ascii_lowercase();
+    if lower == "automatic" || lower == "auto" {
+        return Some(0);
+    }
+    let digits = lower.strip_prefix("level").unwrap_or(&lower);
+    let n: u32 = digits.parse().ok()?;
+    (n <= 21).then_some(n)
+}
+
+fn parse_frm_arg(s: &str) -> Option<u32> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "automatic" | "auto" | "0" => Some(0),
+        "on" | "1" => Some(1),
+        "off" | "2" => Some(2),
+        _ => None,
+    }
+}
+
+fn main() -> Result<(), String> {
     // When invoked from cmd/PowerShell with CLI arguments, attach to the
     // launching console so stdout/stderr output appears despite windows_subsystem.
     #[cfg(windows)]
@@ -528,6 +549,8 @@ fn main() -> eframe::Result<()> {
     let mut no_plugins = false;
     let mut mcp_port: Option<u16> = None;
     let mut no_mcp = false;
+    let mut quality_override: Option<u32> = None;
+    let mut frm_override: Option<u32> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -824,6 +847,26 @@ fn main() -> eframe::Result<()> {
                 }
             }
             "--no-mcp" => no_mcp = true,
+            "--quality" => {
+                let v = args.next().unwrap_or_default();
+                match parse_quality_arg(&v) {
+                    Some(q) => quality_override = Some(q),
+                    None => {
+                        eprintln!("--quality: expected automatic or 0..=21, got {v:?}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--frm" => {
+                let v = args.next().unwrap_or_default();
+                match parse_frm_arg(&v) {
+                    Some(f) => frm_override = Some(f),
+                    None => {
+                        eprintln!("--frm: expected auto, on, or off, got {v:?}");
+                        std::process::exit(2);
+                    }
+                }
+            }
             // (read at the start of main)
             "--audio" => {}
             "-h" | "--help" => {
@@ -922,6 +965,20 @@ fn main() -> eframe::Result<()> {
     };
     // Studio Settings: the user's for plain runs (src/studio_settings.rs).
     studio_settings::init(layout_store::enabled(&harness));
+    if let Some(q) = quality_override {
+        studio_settings::set(
+            "RenderSettings",
+            "EditQualityLevel",
+            studio_settings::Val::Enum(q),
+        );
+    }
+    if let Some(f) = frm_override {
+        studio_settings::set(
+            "RenderSettings",
+            "FrameRateManager",
+            studio_settings::Val::Enum(f),
+        );
+    }
     // rustudio's own options: likewise only for runs a person drives, never
     // under RUSTUDIO_DETERMINISTIC (src/rustudio_settings.rs).
     rustudio_settings::init(layout_store::enabled(&harness));
@@ -942,7 +999,7 @@ fn main() -> eframe::Result<()> {
         viewport = viewport.with_min_inner_size([900.0, 560.0]);
     }
     // A test run gets the size it asked for even on a smaller desktop
-    // (eframe clamps the first size to the monitor: an 800x600 session
+    // (window host clamps the first size to the monitor: an 800x600 session
     // desktop made `--window 1024x768` an 800x600 editor, its docked
     // widgets too short for the checks).
     if cfg!(windows) && is_test_run(&argv) {
@@ -957,68 +1014,31 @@ fn main() -> eframe::Result<()> {
     if std::env::var_os("RUSTUDIO_CONTROL").is_some() {
         viewport = viewport.with_active(false).with_window_level(egui::WindowLevel::AlwaysOnBottom);
     }
-    let wgpu_options = egui_wgpu::WgpuConfiguration {
-        wgpu_setup: {
-            let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
-            // egui_wgpu adds GL (`PRIMARY | GL`), which picks OpenGL over DX12
-            // WARP on older GPUs/CI VMs and fails `max_sampled_textures_per_shader_stage = 24`.
-            setup.instance_descriptor.backends = egui_wgpu::wgpu::Backends::from_env()
-                .unwrap_or(egui_wgpu::wgpu::Backends::PRIMARY);
-            let descriptor = setup.device_descriptor.clone();
-            setup.device_descriptor = std::sync::Arc::new(move |adapter| {
-                let mut d = descriptor(adapter);
-                d.required_limits.max_sampled_textures_per_shader_stage = 24;
-                // Studio HBAO writes its full-resolution R8 visibility UAV.
-                d.required_features |= adapter.features() & egui_wgpu::wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
-                // RUSTUDIO_GPU_TIMING: timestamp queries (gpu_timing.rs).
-                d.required_features |= gpu_timing::features(adapter.features());
-                // GPU memory in blocks sized for memory use (8-64 MB), not
-                // wgpu's default 128-256 MB device blocks: the allocator keeps
-                // its last empty block, so a 1440 island settled 2.18-2.19 GB
-                // with them and 1.79-1.81 GB with these, with the same frame
-                // instructions, GPU time and texture load time (RX 9070,
-                // Vulkan; Windows RTX 3070: 1.83-2.09 -> 1.58-1.61 GB).
-                // RUSTUDIO_GPU_MEMORY=performance: wgpu's default blocks.
-                if std::env::var("RUSTUDIO_GPU_MEMORY").ok().as_deref() != Some("performance") {
-                    d.memory_hints = egui_wgpu::wgpu::MemoryHints::MemoryUsage;
-                }
-                d
-            });
-            egui_wgpu::WgpuSetup::CreateNew(setup)
-        },
-        surface: egui_wgpu::SurfaceConfig {
-            // No vsync when measuring or driven for captures: a shot waits
-            // for a few frames after each camera move.
-            present_mode: if bench_mode || std::env::var_os("RUSTUDIO_CONTROL").is_some() {
-                egui_wgpu::wgpu::PresentMode::AutoNoVsync
-            } else {
-                egui_wgpu::wgpu::PresentMode::AutoVsync
-            },
-            ..egui_wgpu::SurfaceConfig::LOW_LATENCY
-        },
-        ..Default::default()
-    };
+    let vsync = !(bench_mode || std::env::var_os("RUSTUDIO_CONTROL").is_some());
     // --headless / --no-render: no window at all (src/offscreen.rs).
     if headless {
         let px = [size[0].round() as u32, size[1].round() as u32];
         let code = offscreen::run(
-            wgpu_options,
             offscreen::Options { size: px, render: !no_render, paced: !bench_mode },
             move |ctx, rs| app::RustudioApp::new_in(ctx, rs, None, open, harness, demo),
         );
         crate::telemetry::flush();
         std::process::exit(code.max(app::EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed)));
     }
-    let options = eframe::NativeOptions {
-        renderer: eframe::Renderer::Wgpu,
-        viewport,
-        wgpu_options: wgpu_options.clone(),
-        ..Default::default()
-    };
-    let r = eframe::run_native(
-        "rustudio",
-        options,
-        Box::new(move |cc| Ok(Box::new(app::RustudioApp::new(cc, open, harness, demo)))),
+    let rs = d3d11::create_device()?;
+    let r = d3d11::window::run(
+        d3d11::WindowOptions { viewport, vsync },
+        rs,
+        Box::new(move |ctx, rs| {
+            Box::new(app::RustudioApp::new_in(
+                &ctx,
+                Some(rs),
+                Some(false),
+                open,
+                harness,
+                demo,
+            ))
+        }),
     );
     // --fail-on-error (app::Editor::finish_run); a windowed test run's exit
     // status reaches the caller through the headless wrapper's status file.
@@ -1027,4 +1047,26 @@ fn main() -> eframe::Result<()> {
         std::process::exit(code);
     }
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_quality_and_frm_cli_flags() {
+        assert_eq!(parse_quality_arg("automatic"), Some(0));
+        assert_eq!(parse_quality_arg("Auto"), Some(0));
+        assert_eq!(parse_quality_arg("0"), Some(0));
+        assert_eq!(parse_quality_arg("21"), Some(21));
+        assert_eq!(parse_quality_arg("Level05"), Some(5));
+        assert_eq!(parse_quality_arg("22"), None);
+        assert_eq!(parse_quality_arg("invalid"), None);
+
+        assert_eq!(parse_frm_arg("auto"), Some(0));
+        assert_eq!(parse_frm_arg("Automatic"), Some(0));
+        assert_eq!(parse_frm_arg("on"), Some(1));
+        assert_eq!(parse_frm_arg("off"), Some(2));
+        assert_eq!(parse_frm_arg("3"), None);
+    }
 }

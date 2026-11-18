@@ -61,7 +61,7 @@ impl Watchdog {
         let mut p = self.state.lock().unwrap();
         p.completed = Instant::now();
         p.stage = "UI frame";
-        p.pending = "eframe GPU submission/presentation or next redraw event".into();
+        p.pending = "D3D11 GPU submission/presentation or next redraw event".into();
     }
 }
 /// Linux exposes wait channels without ptrace, even when attaching is restricted.

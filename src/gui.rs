@@ -238,7 +238,7 @@ pub struct Gui {
     /// generation: the generation shown (updated in place when it moves on).
     editable_gens: HashMap<String, u64>,
     /// Smaller copies of each GUI image (halving, premultiplied box filter):
-    /// egui-wgpu makes no mipmaps, Roblox samples GUI images with them, so a
+    /// native D3D11 UI textures benefit from explicit mipmaps since Roblox samples GUI images with them, so a
     /// 256 px icon drawn at 48 px was point-sampled (Laser Tag's ammo and
     /// hotbar icons). `mip` picks one by the drawn minification.
     mips: HashMap<String, Vec<egui::TextureHandle>>,
@@ -329,7 +329,7 @@ pub struct Gui {
 
 /// Everything a draw needs from the editor.
 pub struct DrawIn<'a> {
-    pub render_state: Option<&'a egui_wgpu::RenderState>,
+    pub render_state: Option<&'a crate::d3d11::RenderState>,
     pub doc: &'a Document,
     pub cam: &'a Camera,
     pub rect: Rect,
