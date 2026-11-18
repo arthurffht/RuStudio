@@ -1,4 +1,4 @@
-//! wgpu viewport renderer. Draws the scene into a float (HDR, MSAA-resolved)
+//! Direct3D 11 viewport renderer. Draws the scene into a float (HDR, MSAA-resolved)
 //! target, then a post pass tone-maps it into the texture egui shows as an
 //! image, so the 3D view docks like any other panel. The sun's shadow map is
 //! drawn first.
@@ -8,112 +8,94 @@ mod env_probe_gpu;
 #[path = "vf_render.rs"]
 pub mod vf;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
-use egui_wgpu::wgpu;
 use glam::{Mat4, Vec3};
 use rbx_dom_weak::types::Ref;
-use wgpu::util::DeviceExt;
+use windows::Win32::Graphics::Direct3D::*;
+use windows::Win32::Graphics::Direct3D11::*;
+use windows::Win32::Graphics::Dxgi::Common::*;
 
+use crate::d3d11::shaders;
 use crate::math::Xform;
 
 /// The scene is lit in linear light into this target...
-const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+const HDR_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
 /// ...and the post pass writes display values (gamma 2.0) here.
-const DISPLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const DISPLAY_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
+const DEPTH_FORMAT: DXGI_FORMAT = DXGI_FORMAT_D32_FLOAT;
 /// EVSM moments of the local light shadow maps (Studio's warps of 5.54 keep
 /// e^(2·5.54) under half float's 65504).
-const LSHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
-/// One face's uniforms for the light shadow pass, at a dynamic offset.
-const LSHADOW_FACE_STRIDE: u64 = 256;
+const LSHADOW_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
 /// The local light shadow atlas (Studio's Future path: a cube map per
 /// shadowed light, Studio measurements "Local light shadows").
 pub struct LightShadows {
-    moments_view: wgpu::TextureView,
-    depth_view: wgpu::TextureView,
-    sampler: wgpu::Sampler,
+    moments_rtv: ID3D11RenderTargetView,
+    moments_srv: ID3D11ShaderResourceView,
+    depth_dsv: ID3D11DepthStencilView,
+    sampler: ID3D11SamplerState,
     /// ShadowSlot per light (6 view-projections + position / 1 over Range).
-    slots_buf: wgpu::Buffer,
-    /// LFace per face, read at a dynamic offset.
-    face_buf: wgpu::Buffer,
-    face_layout: wgpu::BindGroupLayout,
-    face_bg: wgpu::BindGroup,
+    slots_buf: ID3D11Buffer,
+    slots_srv: ID3D11ShaderResourceView,
+    /// LFace per face, uploaded right before drawing each face (SM 5.0 CB).
+    face_cb: ID3D11Buffer,
     /// What the atlas holds: static scene generation + the lights; redrawn when it changes.
     key: Option<u64>,
 }
 
 impl LightShadows {
-    fn new(device: &wgpu::Device) -> Self {
+    fn new(device: &ID3D11Device) -> Self {
         let side = crate::mech::LSHADOW_ATLAS;
-        let tex = |label: &str, format, usage| {
-            device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some(label),
-                    size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format,
-                    usage,
-                    view_formats: &[],
-                })
-                .create_view(&Default::default())
-        };
-        let moments_view = tex(
-            "light shadow moments",
-            LSHADOW_FORMAT,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        let moments_tex = crate::d3d11::create_tex2d(
+            device,
+            &crate::d3d11::Tex2dSpec {
+                width: side,
+                height: side,
+                format: LSHADOW_FORMAT,
+                bind_flags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+                ..Default::default()
+            },
+            None,
         );
-        let depth_view = tex("light shadow depth", DEPTH_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("light shadow"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let n = crate::mech::LSHADOW_MAX_LIGHTS.max(1);
-        let slots_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("light shadow slots"),
-            size: (n * (6 * 64 + 16)) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let face_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("light shadow faces"),
-            size: n as u64 * 6 * LSHADOW_FACE_STRIDE,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let face_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("light shadow face"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: wgpu::BufferSize::new(96),
-                },
-                count: None,
-            }],
-        });
-        let face_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("light shadow face"),
-            layout: &face_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &face_buf,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(96),
-                }),
-            }],
-        });
-        Self { moments_view, depth_view, sampler, slots_buf, face_buf, face_layout, face_bg, key: None }
+        let moments_rtv = crate::d3d11::create_rtv(device, &moments_tex, LSHADOW_FORMAT, 0, false);
+        let moments_srv = crate::d3d11::create_srv_2d(device, &moments_tex, LSHADOW_FORMAT, false, 0, 1);
+        let depth_tex = crate::d3d11::create_tex2d(
+            device,
+            &crate::d3d11::Tex2dSpec {
+                width: side,
+                height: side,
+                format: DEPTH_FORMAT,
+                bind_flags: D3D11_BIND_DEPTH_STENCIL.0 as u32,
+                ..Default::default()
+            },
+            None,
+        );
+        let depth_dsv = crate::d3d11::create_dsv(device, &depth_tex, DEPTH_FORMAT, false, false);
+        let sampler = crate::d3d11::create_sampler(
+            device,
+            D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            1,
+        );
+        let n = crate::mech::LSHADOW_MAX_LIGHTS.max(1) as u32;
+        let (slots_buf, slots_srv) = crate::d3d11::create_structured_srv(device, 6 * 64 + 16, n, true, None);
+        let face_cb = crate::d3d11::create_cb(device, 96);
+        Self {
+            moments_rtv,
+            moments_srv,
+            depth_dsv,
+            sampler,
+            slots_buf,
+            slots_srv,
+            face_cb,
+            key: None,
+        }
     }
 
     /// The six face view-projections of a light: 93° frusta (Studio's
@@ -128,9 +110,8 @@ impl LightShadows {
         })
     }
 }
-const SAMPLES: u32 = 4;
 /// DepthOfFieldEffect intensity from which Studio runs the reduced near chain
-/// instead of the full-resolution cheap pass (shader.wgsl DOF_CHEAP_BELOW).
+/// instead of the full-resolution cheap pass (DOF_CHEAP_BELOW).
 const DOF_CHEAP_BELOW: f32 = 0.22;
 const SHADOW_SIZE: u32 = crate::mech::SHADOW_MAP_TEXELS;
 
@@ -457,13 +438,10 @@ mod gpu_tests {
     #[test]
     #[ignore = "writes integrated full-domain renderer selection evidence"]
     fn export_integrated_grass_selection() {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap();
-        let mut limits = wgpu::Limits::default();
-        limits.max_sampled_textures_per_shader_stage = 24;
-        limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() })).unwrap();
-        let mut renderer = Renderer::new(&device, &queue);
+        let Ok(rs) = crate::d3d11::device::create_device() else {
+            return;
+        };
+        let mut renderer = Renderer::new(&rs);
         let mut vox = crate::terrain::Voxels::empty();
         // Same FillBlock: x,z in [0,32), y in [-16,0), full Grass voxels.
         for x in 0..8 { for y in -4..0 { for z in 0..8 { vox.set([x,y,z],2,1.0); } } }
@@ -474,7 +452,7 @@ mod gpu_tests {
                 let key = [x,y,z];
                 let geometry = crate::terrain::grass_geometry_density(&vox,key,length,1.0);
                 let positions: Vec<_> = geometry.cells.iter().map(|cell| cell.batch.blades.iter().map(|&(_,first)| geometry.vertices[first..first+3].iter().map(|v|v.pos).collect::<Vec<_>>()).collect::<Vec<_>>()).collect();
-                renderer.set_terrain_grass_geometry(&device,key,geometry);
+                renderer.set_terrain_grass_geometry(&rs.device,key,geometry);
                 if let Some(chunk) = renderer.terrain_grass.get(&key) {
                     for (range, blades) in chunk.grass_ranges.iter().zip(positions) {
                         let count = range.count(Vec3::new(16.,20.,-20.)) as usize / 6;
@@ -486,30 +464,24 @@ mod gpu_tests {
         std::fs::write("checks/grass-full-re/integrated-selection/renderer-selection.json",serde_json::to_vec(&rows).unwrap()).unwrap();
     }
 
-    /// Every pipeline of the 3D view, built on this machine's GPU with the
-    /// limits the app asks for (main.rs): the WGSL through the platform's
-    /// shader compiler (Metal on macOS, Vulkan/SPIR-V on Linux), with wgpu's
-    /// validation errors caught. Skipped with a note where there is no GPU.
+    /// Every pipeline/shader/state of the 3D view, built on this machine's GPU
+    /// via native Direct3D 11 (`d3d11::create_device`), including 1x and MSAA
+    /// target switches. Skipped with a note where there is no GPU.
     #[test]
     fn renderer_pipelines_build_on_this_gpu() {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
-            eprintln!("no GPU adapter here: skipped");
+        let Ok(rs) = crate::d3d11::device::create_device() else {
+            eprintln!("no D3D11 GPU adapter here: skipped");
             return;
         };
-        let info = adapter.get_info();
-        let mut limits = wgpu::Limits::default();
-        limits.max_sampled_textures_per_shader_stage = 24;
-        limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
-        let desc = wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() };
-        let (device, queue) = pollster::block_on(adapter.request_device(&desc))
-            .unwrap_or_else(|e| panic!("{} ({:?}) refused rustudio's limits: {e}", info.name, info.backend));
-        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let r = Renderer::new(&device, &queue);
+        let mut r = Renderer::new(&rs);
+        let q_low = crate::quality::QualityProfile::from_level(1, &rs.caps, false);
+        let q_high = crate::quality::QualityProfile::from_level(21, &rs.caps, false);
+        r.set_quality(q_low);
+        r.ensure_target(&rs, [64, 64]);
+        r.set_quality(q_high);
+        r.ensure_target(&rs, [64, 64]);
         drop(r);
-        let err = pollster::block_on(scope.pop());
-        assert!(err.is_none(), "{} ({:?}): {err:?}", info.name, info.backend);
-        eprintln!("renderer built on {} ({:?})", info.name, info.backend);
+        eprintln!("renderer built on {} (D3D11)", rs.caps.adapter_name);
     }
 }
 
@@ -881,7 +853,7 @@ impl GrassRange {
 struct TerrainChunk {
     grass_ranges: Vec<GrassRange>,
     diagnostic_positions: Vec<[f32; 3]>,
-    vbuf: wgpu::Buffer,
+    vbuf: ID3D11Buffer,
     count: u32,
     lo: Vec3,
     hi: Vec3,
@@ -896,18 +868,18 @@ const MAT_PARAM_LAYERS: usize = 256;
 /// cutoffs/emissive G, cutoff scales/emissive B; then Studio's 32²
 /// noise and 128² Wang index, packed as exact integers in f32 lanes.
 struct MaterialArrays {
-    albedo: wgpu::Texture,
-    surface: wgpu::Texture,
-    emission: wgpu::Texture,
-    albedo_view: wgpu::TextureView,
-    surface_view: wgpu::TextureView,
-    emission_view: wgpu::TextureView,
+    albedo: ID3D11Texture2D,
+    surface: ID3D11Texture2D,
+    emission: ID3D11Texture2D,
+    albedo_srv: ID3D11ShaderResourceView,
+    surface_srv: ID3D11ShaderResourceView,
+    emission_srv: ID3D11ShaderResourceView,
     size: u32,
     capacity: u32,
     layers: std::collections::HashMap<u64, u32>,
     cpu: Vec<std::sync::Arc<crate::matpack::Maps>>,
     params: Vec<[f32; 4]>,
-    params_buf: wgpu::Buffer,
+    params_cb: ID3D11Buffer,
 }
 
 impl MaterialArrays {
@@ -926,46 +898,45 @@ impl MaterialArrays {
         p
     }
 
-    fn new(device: &wgpu::Device, size: u32, capacity: u32) -> Self {
-        Self::with_params(device, size, capacity, Self::default_params())
+    fn new(device: &ID3D11Device, ctx: &ID3D11DeviceContext, size: u32, capacity: u32) -> Self {
+        Self::with_params(device, ctx, size, capacity, Self::default_params())
     }
 
-    fn with_params(device: &wgpu::Device, size: u32, capacity: u32, params: Vec<[f32; 4]>) -> Self {
-        let make = |label, format| {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d {
+    fn with_params(
+        device: &ID3D11Device,
+        ctx: &ID3D11DeviceContext,
+        size: u32,
+        capacity: u32,
+        params: Vec<[f32; 4]>,
+    ) -> Self {
+        let mips = mip_levels(size, size);
+        let make = |format: DXGI_FORMAT| {
+            crate::d3d11::create_tex2d(
+                device,
+                &crate::d3d11::Tex2dSpec {
                     width: size,
                     height: size,
-                    depth_or_array_layers: capacity,
+                    mips,
+                    array_size: capacity,
+                    format,
+                    bind_flags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                    ..Default::default()
                 },
-                mip_level_count: mip_levels(size, size),
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                // (COPY_SRC: growing the arrays copies the layers across)
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            })
+                None,
+            )
         };
-        let view = |t: &wgpu::Texture| {
-            t.create_view(&wgpu::TextureViewDescriptor {
-                dimension: Some(wgpu::TextureViewDimension::D2Array),
-                ..Default::default()
-            })
+        let view = |t: &ID3D11Texture2D, format: DXGI_FORMAT| {
+            crate::d3d11::create_srv_2d_array(device, t, format, mips, 0, capacity)
         };
-        let albedo = make("material albedo", wgpu::TextureFormat::Rgba8Unorm);
-        let surface = make("material surface", wgpu::TextureFormat::Rgba8Unorm);
-        let emission = make("material emission", wgpu::TextureFormat::R8Unorm);
-        let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("material params"),
-            contents: bytemuck::cast_slice(&params),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        let albedo = make(DXGI_FORMAT_R8G8B8A8_UNORM);
+        let surface = make(DXGI_FORMAT_R8G8B8A8_UNORM);
+        let emission = make(DXGI_FORMAT_R8_UNORM);
+        let params_cb = crate::d3d11::create_cb(device, std::mem::size_of_val(params.as_slice()));
+        crate::d3d11::update_dynamic(ctx, &params_cb, bytemuck::cast_slice(&params));
         MaterialArrays {
-            albedo_view: view(&albedo),
-            surface_view: view(&surface),
-            emission_view: view(&emission),
+            albedo_srv: view(&albedo, DXGI_FORMAT_R8G8B8A8_UNORM),
+            surface_srv: view(&surface, DXGI_FORMAT_R8G8B8A8_UNORM),
+            emission_srv: view(&emission, DXGI_FORMAT_R8_UNORM),
             albedo,
             surface,
             emission,
@@ -974,91 +945,93 @@ impl MaterialArrays {
             layers: Default::default(),
             cpu: Vec::new(),
             params,
-            params_buf,
+            params_cb,
         }
     }
 
     /// Copies `from`'s first `layers` layers (every mip) into these arrays.
-    fn copy_layers(&self, device: &wgpu::Device, queue: &wgpu::Queue, from: &MaterialArrays, layers: u32) {
+    fn copy_layers(&self, ctx: &ID3D11DeviceContext, from: &MaterialArrays, layers: u32) {
         if layers == 0 || from.size != self.size {
             return;
         }
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("material arrays grow") });
+        let mips = mip_levels(self.size, self.size);
         for (src, dst) in [(&from.albedo, &self.albedo), (&from.surface, &self.surface), (&from.emission, &self.emission)] {
-            for mip in 0..mip_levels(self.size, self.size) {
-                let side = (self.size >> mip).max(1);
-                let at = |texture| wgpu::TexelCopyTextureInfo {
-                    texture,
-                    mip_level: mip,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                };
-                enc.copy_texture_to_texture(at(src), at(dst), wgpu::Extent3d { width: side, height: side, depth_or_array_layers: layers });
+            for layer in 0..layers {
+                for mip in 0..mips {
+                    let sub = mip + layer * mips;
+                    unsafe { ctx.CopySubresourceRegion(dst, sub, 0, 0, 0, src, sub, None) };
+                }
             }
         }
-        queue.submit(Some(enc.finish()));
     }
 
-    fn upload(&self, queue: &wgpu::Queue, layer: u32, maps: &crate::matpack::Pixels) {
-        for (tex, data, channels) in [(&self.albedo, &maps.albedo, 4), (&self.surface, &maps.surface, 4), (&self.emission, &maps.emissive, 1)] {
+    fn upload(&self, ctx: &ID3D11DeviceContext, layer: u32, maps: &crate::matpack::Pixels) {
+        let mips = mip_levels(self.size, self.size);
+        for (tex, data, channels) in [
+            (&self.albedo, &maps.albedo, 4u32),
+            (&self.surface, &maps.surface, 4u32),
+            (&self.emission, &maps.emissive, 1u32),
+        ] {
             for (mip, (at, size)) in crate::matpack::mip_levels().into_iter().enumerate() {
+                if (mip as u32) >= mips {
+                    break;
+                }
                 let at = at / (4 / channels) as usize;
-                let bytes = (size * size * channels) as usize;
+                let row_pitch = size * channels;
+                let bytes = (row_pitch * size) as usize;
                 let Some(level) = data.get(at..at + bytes) else {
                     break;
                 };
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: tex,
-                        mip_level: mip as u32,
-                        origin: wgpu::Origin3d {
-                            x: 0,
-                            y: 0,
-                            z: layer,
-                        },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    level,
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(size * channels),
-                        rows_per_image: Some(size),
-                    },
-                    wgpu::Extent3d {
-                        width: size,
-                        height: size,
-                        depth_or_array_layers: 1,
-                    },
-                );
+                let sub = mip as u32 + layer * mips;
+                unsafe {
+                    ctx.UpdateSubresource(tex, sub, None, level.as_ptr().cast(), row_pitch, bytes as u32);
+                }
             }
         }
     }
 }
 
 struct Mesh {
-    vbuf: wgpu::Buffer,
+    vbuf: ID3D11Buffer,
     count: u32,
     /// Back faces culled (Some(true)), as Studio draws a MeshPart with
     /// DoubleSided off (an inverted-hull outline shell then shows only as its
     /// rim); Some(false) two-sided by choice (DoubleSided); None two-sided
     /// because the winding isn't known (CSG).
     cull: Option<bool>,
-    /// Made for the skinning pass (STORAGE usage).
+    /// Made for the skinning pass (DEFAULT usage for GPU skinning CopyResource).
     storage: bool,
 }
 
-/// The pipelines that draw decals and see-through parts (linear, or into
-/// the see-through encoding).
-struct SeePipes {
-    transparent: wgpu::RenderPipeline,
-    transparent_culled: wgpu::RenderPipeline,
-    glass: wgpu::RenderPipeline,
-    glass_culled: wgpu::RenderPipeline,
-    overlay: wgpu::RenderPipeline,
+#[derive(Clone, Copy)]
+enum SeePipeKind {
+    Transparent,
+    TransparentCulled,
+    Glass,
+    GlassCulled,
+    Overlay,
+}
+
+/// Texture SRVs held for one uploaded part/material texture slot (`t15..t17`).
+struct PartTex {
+    albedo_srv: ID3D11ShaderResourceView,
+    emissive_srv: ID3D11ShaderResourceView,
+    surface_srv: ID3D11ShaderResourceView,
+}
+
+struct ShaderPair {
+    x1: ID3D11PixelShader,
+    msaa: ID3D11PixelShader,
+}
+
+impl ShaderPair {
+    fn get(&self, msaa: bool) -> &ID3D11PixelShader {
+        if msaa { &self.msaa } else { &self.x1 }
+    }
 }
 
 /// Studio blends see-through surfaces in its scene buffer's encoding,
-/// e = sqrt(clamp(L x 0.25 x exposure)) (shader.wgsl see_enc), not in linear
+/// e = sqrt(clamp(L x 0.25 x exposure)) (scene.hlsl see_enc), not in linear
 /// light. Frames with decals or see-through parts copy the MSAA scene into
 /// that encoding (per sample), draw them there, and decode the pixels they
 /// covered back (the rest keep their linear value, highlights above the
@@ -1066,129 +1039,87 @@ struct SeePipes {
 /// screen tiles those layers can cover (SeeBounds), not the whole view.
 /// RUSTUDIO_LINEAR_BLEND=1 blends in linear light as before (for comparisons).
 struct SeeThrough {
-    layout: wgpu::BindGroupLayout,
-    encode: wgpu::RenderPipeline,
-    decode: wgpu::RenderPipeline,
+    encode: ShaderPair,
+    decode: ShaderPair,
     linear: bool,
 }
 
 impl SeeThrough {
-    fn new(device: &wgpu::Device, shader: &wgpu::ShaderModule, globals: &wgpu::BindGroupLayout, ms: wgpu::MultisampleState) -> Self {
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("see-through scene"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: true,
-                },
-                count: None,
-            }],
-        });
-        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("see-through"),
-            bind_group_layouts: &[Some(globals), Some(&layout)],
-            immediate_size: 0,
-        });
-        let pipe = |label: &str, fs: &str, depth: bool| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&pl),
-                vertex: wgpu::VertexState { module: shader, entry_point: Some("vs_post"), compilation_options: Default::default(), buffers: &[] },
-                primitive: Default::default(),
-                depth_stencil: depth.then(|| wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(false),
-                    depth_compare: Some(wgpu::CompareFunction::Always),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: ms,
-                fragment: Some(wgpu::FragmentState {
-                    module: shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState { format: HDR_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
+    fn new(device: &ID3D11Device) -> Self {
         SeeThrough {
-            encode: pipe("see-through encode", "fs_see_encode", false),
-            // (in the pass that also draws the editor's lines: with depth)
-            decode: pipe("see-through decode", "fs_see_decode", true),
-            layout,
+            encode: ShaderPair {
+                x1: crate::d3d11::create_ps(device, shaders::PS_SEE_ENCODE_1X),
+                msaa: crate::d3d11::create_ps(device, shaders::PS_SEE_ENCODE_MSAA),
+            },
+            decode: ShaderPair {
+                x1: crate::d3d11::create_ps(device, shaders::PS_SEE_DECODE_1X),
+                msaa: crate::d3d11::create_ps(device, shaders::PS_SEE_DECODE_MSAA),
+            },
             linear: std::env::var_os("RUSTUDIO_LINEAR_BLEND").is_some(),
         }
-    }
-
-    fn bind(&self, device: &wgpu::Device, view: &wgpu::TextureView) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("see-through scene"),
-            layout: &self.layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) }],
-        })
     }
 }
 
 struct Target {
     size: [u32; 2],
-    msaa: wgpu::TextureView,
-    /// The MSAA scene in the see-through encoding (SeeThrough), and the bind
-    /// groups reading the scene (encode) and it (decode).
-    see: wgpu::TextureView,
-    see_encode_bg: wgpu::BindGroup,
-    see_decode_bg: wgpu::BindGroup,
-    depth: wgpu::TextureView,
-    /// The resolved scene in linear light.
-    hdr: wgpu::Texture,
-    hdr_view: wgpu::TextureView,
-    /// The opaque scene's colour, copied for the water pass to look through.
-    scene_copy: wgpu::Texture,
-    scene_copy_view: wgpu::TextureView,
-    water_bg: wgpu::BindGroup,
-    water_depth: wgpu::TextureView,
-    glass_bg: wgpu::BindGroup,
-    glass_depth: wgpu::TextureView,
-    hdr_bg: wgpu::BindGroup,
-    post_depth_bg: wgpu::BindGroup,
-    dof_bgs: [wgpu::BindGroup; 2],
-    near_bgs: Vec<wgpu::BindGroup>,
-    near_views: Vec<wgpu::TextureView>,
-    dof_views: [wgpu::TextureView; 2],
+    samples: u32,
+    half_size: [u32; 2],
+    msaa_tex: ID3D11Texture2D,
+    msaa_rtv: ID3D11RenderTargetView,
+    msaa_srv: ID3D11ShaderResourceView,
+    /// The scene in the see-through encoding (SeeThrough).
+    see_rtv: ID3D11RenderTargetView,
+    see_srv: ID3D11ShaderResourceView,
+    depth_dsv: ID3D11DepthStencilView,
+    depth_dsv_ro: ID3D11DepthStencilView,
+    depth_srv: ID3D11ShaderResourceView,
+    /// The resolved scene in linear light (same resource as `msaa_tex` when `samples == 1`).
+    hdr_tex: ID3D11Texture2D,
+    hdr_rtv: ID3D11RenderTargetView,
+    hdr_srv: ID3D11ShaderResourceView,
+    /// The opaque scene's colour, copied for the water/glass/ssao/clouds passes.
+    scene_copy_tex: ID3D11Texture2D,
+    scene_copy_srv: ID3D11ShaderResourceView,
+    water_depth_dsv: ID3D11DepthStencilView,
+    glass_depth_rtv: ID3D11RenderTargetView,
+    glass_depth_srv: ID3D11ShaderResourceView,
+    dof_rtvs: [ID3D11RenderTargetView; 2],
+    dof_srvs: [ID3D11ShaderResourceView; 2],
+    near_sizes: [[u32; 2]; 11],
+    near_rtvs: Vec<ID3D11RenderTargetView>,
+    near_srvs: Vec<ID3D11ShaderResourceView>,
     /// Linear bloom pyramid, from half resolution through 1/32 resolution.
-    bloom_view: wgpu::TextureView,
-    bloom_bright_capture: Option<wgpu::Texture>,
-    bloom_textures: Vec<wgpu::Texture>,
-    bloom_levels: Vec<wgpu::TextureView>,
-    bloom_down_bgs: Vec<wgpu::BindGroup>,
-    bloom_up_bgs: Vec<wgpu::BindGroup>,
-    /// SSAO at half resolution: the AO depth, then (occlusion, depth) ping-
-    /// ponged through the blurs; a bind group per pass (depth + its input).
-    ssao_depth_view: wgpu::TextureView,
-    ssao_views: [wgpu::TextureView; 2],
-    ssao_bgs: [wgpu::BindGroup; 4],
+    bloom_bright_capture: Option<ID3D11Texture2D>,
+    bloom_sizes: [[u32; 2]; 5],
+    bloom_textures: Vec<ID3D11Texture2D>,
+    bloom_rtvs: Vec<ID3D11RenderTargetView>,
+    bloom_srvs: Vec<ID3D11ShaderResourceView>,
+    /// SSAO at half resolution: the AO depth, then (occlusion, depth) ping-ponged through blurs.
+    ssao_depth_rtv: ID3D11RenderTargetView,
+    ssao_depth_srv: ID3D11ShaderResourceView,
+    ssao_rtvs: [ID3D11RenderTargetView; 2],
+    ssao_srvs: [ID3D11ShaderResourceView; 2],
     /// The tone-mapped image egui shows.
-    display: wgpu::Texture,
-    display_view: wgpu::TextureView,
+    display_tex: ID3D11Texture2D,
+    display_rtv: ID3D11RenderTargetView,
+    display_srv: ID3D11ShaderResourceView,
 }
 
 pub struct Renderer {
+    quality: crate::quality::QualityProfile,
+    can_msaa_4x: bool,
+    last_cascades: Option<usize>,
+    probe_samples: u32,
     /// Skinned parts deformed on the GPU (skin_gpu.rs).
     skin: crate::skin_gpu::SkinGpu,
-    /// Highlight instances over the finished image (highlight.rs).
-    highlight: Option<crate::highlight::HighlightPass>,
+    /// Highlight instances over the finished image (highlight.rs), paired with its MSAA sample count.
+    highlight: Option<(u32, crate::highlight::HighlightPass)>,
     /// The last frame's view-projection (Highlights draw with it).
     last_view_proj: Mat4,
     /// SurfaceGuis / BillboardGuis tested against the scene's depth (round 23).
     world_gui: Option<crate::world_gui::WorldGuiPass>,
     /// Terrain water (round 24, water.rs).
     water: crate::water::WaterPass,
-    glass_layout: wgpu::BindGroupLayout,
-    glass_resolve: wgpu::RenderPipeline,
     material_epoch: Instant,
     /// Fog for the world GUI pass (gui_fog).
     gui_fog: ([f32; 4], [f32; 3]),
@@ -1198,106 +1129,121 @@ pub struct Renderer {
     gui_sun_params: [f32; 4],
     /// Local lights in lights_buf this frame (the effects read them).
     gui_n_lights: u32,
-    sky: wgpu::RenderPipeline,
-    opaque: wgpu::RenderPipeline,
-    transparent: wgpu::RenderPipeline,
-    decal_depth: wgpu::RenderPipeline,
-    transparent_culled: wgpu::RenderPipeline,
-    glass: wgpu::RenderPipeline,
-    glass_culled: wgpu::RenderPipeline,
-    opaque_two_sided: wgpu::RenderPipeline,
-    lines: wgpu::RenderPipeline,
-    post: wgpu::RenderPipeline,
+    // Input layouts & D3D11 fixed-function states
+    il_part: ID3D11InputLayout,
+    il_terrain: ID3D11InputLayout,
+    il_line: ID3D11InputLayout,
+    rs_cull_back: ID3D11RasterizerState,
+    rs_cull_none: ID3D11RasterizerState,
+    rs_scissor_back: ID3D11RasterizerState,
+    rs_scissor_none: ID3D11RasterizerState,
+    ds_none: ID3D11DepthStencilState,
+    ds_always_ro: ID3D11DepthStencilState,
+    ds_greater_rw: ID3D11DepthStencilState,
+    ds_greater_ro: ID3D11DepthStencilState,
+    ds_gequal_ro: ID3D11DepthStencilState,
+    ds_less_eq_rw: ID3D11DepthStencilState,
+    bs_opaque: ID3D11BlendState,
+    bs_premul: ID3D11BlendState,
+    bs_alpha: ID3D11BlendState,
+    bs_no_color: ID3D11BlendState,
+    bs_bloom_up: ID3D11BlendState,
+    bs_ssao_apply: ID3D11BlendState,
+    // Shaders
+    vs_sky: ID3D11VertexShader,
+    ps_sky: ID3D11PixelShader,
+    vs_part: ID3D11VertexShader,
+    ps_part: ID3D11PixelShader,
+    ps_part_enc: ID3D11PixelShader,
+    ps_decal_depth: ID3D11PixelShader,
+    vs_terrain: ID3D11VertexShader,
+    ps_terrain: ID3D11PixelShader,
+    vs_terrain_shadow: ID3D11VertexShader,
+    vs_shadow: ID3D11VertexShader,
+    vs_light_shadow: ID3D11VertexShader,
+    ps_light_shadow: ID3D11PixelShader,
+    vs_line: ID3D11VertexShader,
+    ps_line: ID3D11PixelShader,
+    vs_post: ID3D11VertexShader,
+    ps_glass_depth: ShaderPair,
+    ps_post: ShaderPair,
     post_dof: bool,
     post_dof_near: bool,
-    dof_h: wgpu::RenderPipeline,
-    dof_v: wgpu::RenderPipeline,
-    near_pipelines: Vec<wgpu::RenderPipeline>,
-    /// Studio's SSAO passes (shader.wgsl "SSAO"): depth down, occlusion,
-    /// blur across, blur down, and the multiply into the HDR scene.
-    ssao_layout: wgpu::BindGroupLayout,
-    ssao_down: wgpu::RenderPipeline,
-    ssao_main: wgpu::RenderPipeline,
-    ssao_blur_x: wgpu::RenderPipeline,
-    ssao_blur_y: wgpu::RenderPipeline,
-    ssao_apply: wgpu::RenderPipeline,
-    /// Bloom: bright pass, blur across (two targets), blur down.
-    bloom_bright: wgpu::RenderPipeline,
-    bloom_down: wgpu::RenderPipeline,
-    bloom_up: wgpu::RenderPipeline,
+    ps_dof_h: ShaderPair,
+    ps_dof_v: ShaderPair,
+    ps_near_h: ShaderPair,
+    ps_near_v: ShaderPair,
+    ps_near_masks: [ID3D11PixelShader; 6],
+    ps_near_edge: ID3D11PixelShader,
+    ps_near_bokeh: ID3D11PixelShader,
+    ps_near_tent: ID3D11PixelShader,
+    ps_ssao_down: ShaderPair,
+    ps_ssao_main: ID3D11PixelShader,
+    ps_ssao_blur_x: ID3D11PixelShader,
+    ps_ssao_blur_y: ID3D11PixelShader,
+    ps_ssao_apply: ID3D11PixelShader,
+    ps_bloom_bright: ID3D11PixelShader,
+    ps_bloom_down: ID3D11PixelShader,
+    ps_bloom_up: ID3D11PixelShader,
     post_bloom_size: f32,
-    shadow: wgpu::RenderPipeline,
     /// Local light shadow maps (Studio's Future path) and their pass.
     lshadow: LightShadows,
-    lshadow_pipe: wgpu::RenderPipeline,
     /// Bumped whenever the static instances change (light shadow cache key).
     static_gen: u64,
-    /// Smooth terrain (round 21): per-chunk triangle buffers, drawn with
-    /// Studio's terrain shading, and their per-palette parameters.
-    terrain: wgpu::RenderPipeline,
-    terrain_shadow: wgpu::RenderPipeline,
-    terrain_shadow_back: wgpu::RenderPipeline,
-    terrain_params_buf: wgpu::Buffer,
-    terrain_bg: wgpu::BindGroup,
+    terrain_params_cb: ID3D11Buffer,
+    terrain_params_cpu: RefCell<Vec<[f32; 4]>>,
     terrain_chunks: HashMap<[i32; 3], TerrainChunk>,
     /// Decoration grass blades by chunk (color and sun shadow passes).
     terrain_grass: HashMap<[i32; 3], TerrainChunk>,
-    globals_buf: wgpu::Buffer,
-    globals_bg: wgpu::BindGroup,
-    /// The globals alone, for the shadow pass (its map can't be bound there).
-    shadow_globals_bg: wgpu::BindGroup,
-    globals_layout: wgpu::BindGroupLayout,
-    lights_buf: wgpu::Buffer,
+    globals_cb: ID3D11Buffer,
+    lights_buf: ID3D11Buffer,
+    lights_srv: ID3D11ShaderResourceView,
     /// The depth map the sun's cascades are drawn into, one at a time.
-    shadow_view: wgpu::TextureView,
+    shadow_dsv: ID3D11DepthStencilView,
     /// The sun's shadow cascades: the atlas the shaders read (sun_shadow.rs).
     sun: crate::sun_shadow::SunShadows,
     /// Terrain.Clouds' passes (clouds.rs), made on first use.
     clouds: Option<crate::clouds::CloudsGpu>,
-    sky_view: wgpu::TextureView,
+    sky_srv: ID3D11ShaderResourceView,
     /// Studio's indoor environment (textures/sky/indoor512); white 1×1 until
     /// loaded. The scene probe's slots start as it (env_probe_gpu).
-    indoor_view: wgpu::TextureView,
+    indoor_srv: ID3D11ShaderResourceView,
     /// Studio's scene environment probe (env_probe.rs) and the globals its
     /// faces are drawn with.
     probe: env_probe_gpu::ProbeGpu,
-    probe_globals_bg: wgpu::BindGroup,
     /// Studio's split-sum BRDF table (brdfLUT.dds, RG16F).
-    brdf_view: wgpu::TextureView,
-    sky_sampler: wgpu::Sampler,
+    brdf_srv: ID3D11ShaderResourceView,
+    sky_sampler: ID3D11SamplerState,
     /// Studio's light grid: skylight and sun per 4-stud voxel (lightgrid.rs).
-    lightgrid_tex: wgpu::Texture,
-    lightgrid_view: wgpu::TextureView,
-    localgrid_tex: wgpu::Texture,
-    localgrid_view: wgpu::TextureView,
+    lightgrid_tex: ID3D11Texture3D,
+    lightgrid_srv: ID3D11ShaderResourceView,
+    localgrid_tex: ID3D11Texture3D,
+    localgrid_srv: ID3D11ShaderResourceView,
     /// How much of each voxel parts fill, for local lights (lightocc.rs).
-    lightocc_tex: wgpu::Texture,
-    lightocc_view: wgpu::TextureView,
+    lightocc_tex: ID3D11Texture3D,
+    lightocc_srv: ID3D11ShaderResourceView,
     /// Studio's legacy surface atlas (studs.dds); grey (no change) until loaded.
-    studs_view: wgpu::TextureView,
-    studs_sampler: wgpu::Sampler,
+    studs_srv: ID3D11ShaderResourceView,
+    studs_sampler: ID3D11SamplerState,
     /// Material texture packs (matpack.rs): one array layer per pack,
     /// colour + height and normal + roughness + metalness.
     materials: MaterialArrays,
     /// Size of the loaded skybox faces (0 = none, draw the gradient).
     pub sky_size: u32,
     /// 1×1 black: the emissive mask of textures without one.
-    black_view: wgpu::TextureView,
+    black_srv: ID3D11ShaderResourceView,
     meshes: Vec<Mesh>,
     /// (mesh, cull back) -> the second slot drawing it the other way.
     cull_alias: HashMap<(u32, bool), u32>,
-    tex_layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
-    /// Texture bind groups; index 0 is plain white.
-    textures: Vec<wgpu::BindGroup>,
-    overlay: wgpu::RenderPipeline,
+    sampler: ID3D11SamplerState,
+    /// Texture slots (`t15..t17`); index 0 is plain white.
+    textures: Vec<PartTex>,
     /// See-through draws in Studio's encoded blend (SeeThrough).
-    see_pipes: SeePipes,
     see: SeeThrough,
     /// Per-frame instances: moving and see-through parts, overlay.
-    instance_buf: wgpu::Buffer,
+    instance_buf: ID3D11Buffer,
     instance_cap: usize,
-    static_buf: wgpu::Buffer,
+    static_buf: ID3D11Buffer,
     static_cap: usize,
     items: HashMap<Ref, Item>,
     /// Items drawn from the per-frame list (pending and dynamic).
@@ -1312,1026 +1258,358 @@ pub struct Renderer {
     last_rebuild: Instant,
     last_quiet_scan: Instant,
     pub stats: RenderStats,
-    line_buf: wgpu::Buffer,
+    line_buf: ID3D11Buffer,
     line_cap: usize,
     target: Option<Target>,
     pub texture_id: Option<egui::TextureId>,
 }
 
+fn unbind_all_srvs(ctx: &ID3D11DeviceContext) {
+    crate::d3d11::unbind_ps_srvs(ctx, 0, 32);
+    let slots: [Option<ID3D11ShaderResourceView>; 16] = std::array::from_fn(|_| None);
+    unsafe { ctx.VSSetShaderResources(0, Some(&slots)) };
+}
+
+fn input_elem(
+    index: u32,
+    format: DXGI_FORMAT,
+    slot: u32,
+    offset: usize,
+    per_instance: bool,
+) -> D3D11_INPUT_ELEMENT_DESC {
+    D3D11_INPUT_ELEMENT_DESC {
+        SemanticName: windows::core::s!("TEXCOORD"),
+        SemanticIndex: index,
+        Format: format,
+        InputSlot: slot,
+        AlignedByteOffset: offset as u32,
+        InputSlotClass: if per_instance {
+            D3D11_INPUT_PER_INSTANCE_DATA
+        } else {
+            D3D11_INPUT_PER_VERTEX_DATA
+        },
+        InstanceDataStepRate: if per_instance { 1 } else { 0 },
+    }
+}
+
+fn make_blend_custom(
+    device: &ID3D11Device,
+    src: D3D11_BLEND,
+    dst: D3D11_BLEND,
+    op: D3D11_BLEND_OP,
+    src_a: D3D11_BLEND,
+    dst_a: D3D11_BLEND,
+    op_a: D3D11_BLEND_OP,
+) -> ID3D11BlendState {
+    let mut desc = D3D11_BLEND_DESC::default();
+    desc.RenderTarget[0] = D3D11_RENDER_TARGET_BLEND_DESC {
+        BlendEnable: true.into(),
+        SrcBlend: src,
+        DestBlend: dst,
+        BlendOp: op,
+        SrcBlendAlpha: src_a,
+        DestBlendAlpha: dst_a,
+        BlendOpAlpha: op_a,
+        RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
+    };
+    let mut out = None;
+    unsafe { device.CreateBlendState(&desc, Some(&mut out)) }.expect("CreateBlendState custom");
+    out.unwrap()
+}
+
+fn make_tex2d_data(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    mips: u32,
+    array_size: u32,
+    format: DXGI_FORMAT,
+    misc_flags: u32,
+    data: &[u8],
+    bpp: u32,
+) -> ID3D11Texture2D {
+    let (w, h, mips, array_size) = (width.max(1), height.max(1), mips.max(1), array_size.max(1));
+    let mut subs = Vec::with_capacity((mips * array_size) as usize);
+    let mut off = 0usize;
+    for _ in 0..array_size {
+        for m in 0..mips {
+            let mw = (w >> m).max(1);
+            let mh = (h >> m).max(1);
+            let pitch = mw * bpp;
+            let slice = pitch * mh;
+            let end = off + slice as usize;
+            assert!(
+                end <= data.len(),
+                "texture upload truncated: need {end}, got {} ({w}x{h}, mips={mips}, array={array_size}, bpp={bpp})",
+                data.len()
+            );
+            subs.push(D3D11_SUBRESOURCE_DATA {
+                pSysMem: data[off..].as_ptr().cast(),
+                SysMemPitch: pitch,
+                SysMemSlicePitch: slice,
+            });
+            off = end;
+        }
+    }
+    crate::d3d11::create_tex2d(
+        device,
+        &crate::d3d11::Tex2dSpec {
+            width: w,
+            height: h,
+            mips,
+            array_size,
+            format,
+            samples: 1,
+            bind_flags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            misc_flags,
+        },
+        Some(&subs),
+    )
+}
+
 impl Renderer {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rustudio viewport"),
-            source: wgpu::ShaderSource::Wgsl(shader_source().into()),
-        });
-        let uniform_entry = wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let frag = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty,
-            count: None,
-        };
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("globals"),
-            entries: &[
-                uniform_entry,
-                frag(
-                    1,
-                    wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                ),
-                frag(
-                    2,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::Cube,
-                        multisampled: false,
-                    },
-                ),
-                frag(
-                    3,
-                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                ),
-                // The sun's shadow cascades: EVSM moments (sun_shadow.rs).
-                frag(
-                    4,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                ),
-                frag(
-                    7,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                ),
-                frag(
-                    8,
-                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                ),
-                frag(
-                    9,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                ),
-                frag(
-                    10,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                ),
-                frag(
-                    11,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                        multisampled: false,
-                    },
-                ),
-                frag(
-                    12,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                        multisampled: false,
-                    },
-                ),
-                // Studio's indoor environment cube (PrefilteredEnvIndoorTexture).
-                frag(
-                    13,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::Cube,
-                        multisampled: false,
-                    },
-                ),
-                // PrefilteredEnvBlendTargetTexture: the scene probe's next
-                // slot (env_probe.rs), blended in by CB0[32].w (env_spec.w).
-                frag(
-                    21,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::Cube,
-                        multisampled: false,
-                    },
-                ),
-                // PrecomputedBRDFTexture (PlatformContent textures/brdfLUT.dds).
-                frag(
-                    14,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                ),
-                // Local light shadows: EVSM moment atlas, its sampler, the slots.
-                frag(
-                    15,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                ),
-                frag(
-                    16,
-                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                ),
-                frag(
-                    17,
-                    wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                ),
-                frag(
-                    19,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                ),
-                frag(20, wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D3, multisampled: false,
-                }),
-                // Studio's per-material constants and detiling noise (MaterialArrays).
-                frag(
-                    18,
-                    wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                ),
-            ],
-        });
-        let shadow_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("shadow globals"),
-            entries: &[uniform_entry],
-        });
-        let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("globals"),
-            size: std::mem::size_of::<Globals>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let lights_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("lights"),
-            size: (crate::mech::MAX_LIGHTS.max(1) * std::mem::size_of::<LightRaw>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let shadow_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("sun shadow map"),
-            size: wgpu::Extent3d {
+    pub fn new(rs: &crate::d3d11::RenderState) -> Self {
+        let device = &rs.device;
+        let ctx = &rs.context;
+        let can_msaa_4x = rs.caps.msaa_fp16_max_samples >= 4;
+        let mut quality = crate::quality::QualityProfile::resolve(&rs.caps, 0, true, None);
+        quality.msaa_samples = if quality.msaa_samples >= 4 && can_msaa_4x { 4 } else { 1 };
+        let samples = quality.msaa_samples;
+
+        let globals_cb = crate::d3d11::create_cb(device, std::mem::size_of::<Globals>());
+        let (lights_buf, lights_srv) = crate::d3d11::create_structured_srv(
+            device,
+            std::mem::size_of::<LightRaw>() as u32,
+            crate::mech::MAX_LIGHTS.max(1) as u32,
+            true,
+            None,
+        );
+
+        let shadow_tex = crate::d3d11::create_tex2d(
+            device,
+            &crate::d3d11::Tex2dSpec {
                 width: SHADOW_SIZE,
                 height: SHADOW_SIZE,
-                depth_or_array_layers: 1,
+                format: DXGI_FORMAT_R32_TYPELESS,
+                bind_flags: (D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+                ..Default::default()
             },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let shadow_view = shadow_tex.create_view(&Default::default());
+            None,
+        );
+        let shadow_dsv = crate::d3d11::create_dsv(device, &shadow_tex, DEPTH_FORMAT, false, false);
+        let shadow_srv = crate::d3d11::create_srv_2d(device, &shadow_tex, DXGI_FORMAT_R32_FLOAT, false, 0, 1);
+
         let [lg_x, lg_y, lg_z] = crate::lightgrid::dims().map(|n| n as u32);
-        let lightgrid_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("light grid"),
-            size: wgpu::Extent3d {
-                width: lg_x,
-                height: lg_z,
-                depth_or_array_layers: lg_y,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::Rg8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let lightgrid_view = lightgrid_tex.create_view(&Default::default());
-        let localgrid_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("voxel local lights"),
-            size: wgpu::Extent3d { width: lg_x, height: lg_z, depth_or_array_layers: lg_y },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let localgrid_view = localgrid_tex.create_view(&Default::default());
-        let [lo_x, lo_y, lo_z] = crate::lightocc::dims().map(|n| n as u32);
-        let lightocc_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("light occupancy"),
-            size: wgpu::Extent3d {
-                width: lo_x,
-                height: lo_y,
-                depth_or_array_layers: lo_z,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let lightocc_view = lightocc_tex.create_view(&Default::default());
-        let sky_view = Self::cube_view(
+        let lightgrid_tex = crate::d3d11::create_tex3d(
             device,
-            queue,
+            lg_x,
+            lg_z,
+            lg_y,
+            1,
+            DXGI_FORMAT_R8G8_UNORM,
+            D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            None,
+        );
+        let lightgrid_srv = crate::d3d11::create_srv_3d(device, &lightgrid_tex, DXGI_FORMAT_R8G8_UNORM, 1);
+
+        let localgrid_tex = crate::d3d11::create_tex3d(
+            device,
+            lg_x,
+            lg_z,
+            lg_y,
+            1,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            None,
+        );
+        let localgrid_srv = crate::d3d11::create_srv_3d(device, &localgrid_tex, DXGI_FORMAT_R8G8B8A8_UNORM, 1);
+
+        let [lo_x, lo_y, lo_z] = crate::lightocc::dims().map(|n| n as u32);
+        let lightocc_tex = crate::d3d11::create_tex3d(
+            device,
+            lo_x,
+            lo_y,
+            lo_z,
+            1,
+            DXGI_FORMAT_R8_UNORM,
+            D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            None,
+        );
+        let lightocc_srv = crate::d3d11::create_srv_3d(device, &lightocc_tex, DXGI_FORMAT_R8_UNORM, 1);
+
+        let sky_srv = Self::cube_view(
+            device,
+            1,
+            &[vec![255u8; 4], vec![255; 4], vec![255; 4], vec![255; 4], vec![255; 4], vec![255; 4]],
+        );
+        let indoor_srv = Self::cube_view(
+            device,
             1,
             &[
-                [255u8; 4].to_vec(),
-                vec![255; 4],
-                vec![255; 4],
-                vec![255; 4],
-                vec![255; 4],
-                vec![255; 4],
+                vec![0u8, 0, 0, 255],
+                vec![0, 0, 0, 255],
+                vec![0, 0, 0, 255],
+                vec![0, 0, 0, 255],
+                vec![0, 0, 0, 255],
+                vec![0, 0, 0, 255],
             ],
         );
-        let indoor_view = Self::cube_view(
+        let brdf_srv = Self::brdf_lut_view(device);
+        let sky_sampler = crate::d3d11::create_sampler(
             device,
-            queue,
+            D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
             1,
-            &[vec![0u8, 0, 0, 255], vec![0, 0, 0, 255], vec![0, 0, 0, 255], vec![0, 0, 0, 255], vec![0, 0, 0, 255], vec![0, 0, 0, 255]],
         );
-        let brdf_view = Self::brdf_lut_view(device, queue);
-        let sky_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("sky"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            ..Default::default()
-        });
-        let studs_view = Self::studs_texture(device, queue, 1, 1, &[128, 128, 128, 255]);
-        let materials = MaterialArrays::new(device, 1, 1);
-        let studs_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("studs"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            // Also the material maps' sampler: Studio's anisotropic filter
-            // at the device default (mech::TEXTURE_ANISOTROPY).
-            anisotropy_clamp: crate::mech::TEXTURE_ANISOTROPY,
-            ..Default::default()
-        });
+        let studs_srv = Self::studs_texture(device, 1, 1, &[128, 128, 128, 255]);
+        let materials = MaterialArrays::new(device, ctx, 1, 1);
+        let studs_sampler = crate::d3d11::create_sampler(
+            device,
+            D3D11_FILTER_ANISOTROPIC,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            crate::mech::TEXTURE_ANISOTROPY as u32,
+        );
         let lshadow = LightShadows::new(device);
-        let sun = crate::sun_shadow::SunShadows::new(device, &shadow_view);
-        // Studio's scene environment probe (env_probe.rs): binding 13 is its
-        // current slot, 21 the slot it blends to.
-        let probe = env_probe_gpu::ProbeGpu::new(device, queue, SAMPLES, DEPTH_FORMAT, std::mem::size_of::<Globals>() as u64);
-        let probe_globals_bg = Self::globals_group(
+        let sun = crate::sun_shadow::SunShadows::new(device, &shadow_srv);
+        // Studio's scene environment probe (env_probe.rs): t8 is current slot, t14 blend target.
+        let probe = env_probe_gpu::ProbeGpu::new(device, ctx, samples, std::mem::size_of::<Globals>());
+
+        let black_tex = make_tex2d_data(device, 1, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0, &[0, 0, 0, 255], 4);
+        let black_srv = crate::d3d11::create_srv_2d(device, &black_tex, DXGI_FORMAT_R8G8B8A8_UNORM, false, 0, 1);
+        let sampler = crate::d3d11::create_sampler(
             device,
-            &bgl,
-            &probe.globals_buf,
-            &lights_buf,
-            &sky_view,
-            &sky_sampler,
-            &sun.atlas_view,
-            &lightgrid_view,
-            &lightocc_view,
-            &localgrid_view,
-            &studs_view,
-            &studs_sampler,
-            &materials,
-            &probe.slot_views[0],
-            &probe.slot_views[1],
-            &brdf_view,
-            &lshadow,
+            D3D11_FILTER_ANISOTROPIC,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            crate::mech::TEXTURE_ANISOTROPY as u32,
         );
-        let globals_bg = Self::globals_group(
+
+        let part_descs = [
+            input_elem(0, DXGI_FORMAT_R32G32B32_FLOAT, 0, std::mem::offset_of!(Vertex, pos), false),
+            input_elem(1, DXGI_FORMAT_R32G32B32_FLOAT, 0, std::mem::offset_of!(Vertex, normal), false),
+            input_elem(8, DXGI_FORMAT_R32G32_FLOAT, 0, std::mem::offset_of!(Vertex, uv), false),
+            input_elem(12, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, std::mem::offset_of!(Vertex, projection), false),
+            input_elem(11, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, std::mem::offset_of!(Vertex, color), false),
+            input_elem(2, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, std::mem::offset_of!(InstanceRaw, r0), true),
+            input_elem(3, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, std::mem::offset_of!(InstanceRaw, r1), true),
+            input_elem(4, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, std::mem::offset_of!(InstanceRaw, r2), true),
+            input_elem(5, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, std::mem::offset_of!(InstanceRaw, size), true),
+            input_elem(6, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, std::mem::offset_of!(InstanceRaw, color), true),
+            input_elem(7, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, std::mem::offset_of!(InstanceRaw, extra), true),
+            input_elem(9, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, std::mem::offset_of!(InstanceRaw, uvt), true),
+            input_elem(10, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, std::mem::offset_of!(InstanceRaw, emissive), true),
+            input_elem(13, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, std::mem::offset_of!(InstanceRaw, tint), true),
+        ];
+        let terrain_descs = [
+            input_elem(0, DXGI_FORMAT_R32G32B32_FLOAT, 0, std::mem::offset_of!(crate::terrain::TerrainVertex, pos), false),
+            input_elem(1, DXGI_FORMAT_R8G8B8A8_SNORM, 0, std::mem::offset_of!(crate::terrain::TerrainVertex, normal), false),
+            input_elem(2, DXGI_FORMAT_R8G8B8A8_UINT, 0, std::mem::offset_of!(crate::terrain::TerrainVertex, palette), false),
+            input_elem(3, DXGI_FORMAT_R8G8B8A8_UINT, 0, std::mem::offset_of!(crate::terrain::TerrainVertex, axis), false),
+            input_elem(4, DXGI_FORMAT_R8G8B8A8_UINT, 0, std::mem::offset_of!(crate::terrain::TerrainVertex, rand), false),
+            input_elem(5, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, std::mem::offset_of!(crate::terrain::TerrainVertex, wind_local), false),
+        ];
+        let line_descs = [
+            input_elem(0, DXGI_FORMAT_R32G32B32_FLOAT, 0, std::mem::offset_of!(LineVertex, pos), false),
+            input_elem(1, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, std::mem::offset_of!(LineVertex, color), false),
+        ];
+
+        let il_part = crate::d3d11::create_input_layout(device, &part_descs, shaders::VS_PART);
+        let il_terrain = crate::d3d11::create_input_layout(device, &terrain_descs, shaders::VS_TERRAIN);
+        let il_line = crate::d3d11::create_input_layout(device, &line_descs, shaders::VS_LINE);
+
+        let rs_cull_back = crate::d3d11::create_raster_state(device, D3D11_CULL_BACK, false, false, 0, 0.0);
+        let rs_cull_none = crate::d3d11::create_raster_state(device, D3D11_CULL_NONE, false, false, 0, 0.0);
+        let rs_scissor_back = crate::d3d11::create_raster_state(device, D3D11_CULL_BACK, false, true, 0, 0.0);
+        let rs_scissor_none = crate::d3d11::create_raster_state(device, D3D11_CULL_NONE, false, true, 0, 0.0);
+
+        let ds_none = crate::d3d11::create_depth_state(device, false, false, D3D11_COMPARISON_ALWAYS);
+        let ds_always_ro = crate::d3d11::create_depth_state(device, true, false, D3D11_COMPARISON_ALWAYS);
+        let ds_greater_rw = crate::d3d11::create_depth_state(device, true, true, D3D11_COMPARISON_GREATER);
+        let ds_greater_ro = crate::d3d11::create_depth_state(device, true, false, D3D11_COMPARISON_GREATER);
+        let ds_gequal_ro = crate::d3d11::create_depth_state(device, true, false, D3D11_COMPARISON_GREATER_EQUAL);
+        let ds_less_eq_rw = crate::d3d11::create_depth_state(device, true, true, D3D11_COMPARISON_LESS_EQUAL);
+
+        let bs_opaque = crate::d3d11::create_blend_state(device, crate::d3d11::BlendMode::Opaque);
+        let bs_premul = crate::d3d11::create_blend_state(device, crate::d3d11::BlendMode::PremulAlpha);
+        let bs_alpha = crate::d3d11::create_blend_state(device, crate::d3d11::BlendMode::AlphaBlend);
+        let bs_no_color = crate::d3d11::create_blend_state(device, crate::d3d11::BlendMode::NoColorWrite);
+        let bs_bloom_up = make_blend_custom(
             device,
-            &bgl,
-            &globals_buf,
-            &lights_buf,
-            &sky_view,
-            &sky_sampler,
-            &sun.atlas_view,
-            &lightgrid_view,
-            &lightocc_view,
-            &localgrid_view,
-            &studs_view,
-            &studs_sampler,
-            &materials,
-            &probe.slot_views[0],
-            &probe.slot_views[1],
-            &brdf_view,
-            &lshadow,
+            D3D11_BLEND_ONE,
+            D3D11_BLEND_ONE,
+            D3D11_BLEND_OP_ADD,
+            D3D11_BLEND_ONE,
+            D3D11_BLEND_ZERO,
+            D3D11_BLEND_OP_ADD,
         );
-        let shadow_globals_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("shadow globals"),
-            layout: &shadow_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: globals_buf.as_entire_binding(),
-            }],
-        });
-        let tex_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("texture"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                // SurfaceAppearance emissive mask (black = none).
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2, multisampled: false,
-                    }, count: None,
-                },
-            ],
-        });
-        let black_view = device
-            .create_texture_with_data(
-                queue,
-                &wgpu::TextureDescriptor {
-                    label: Some("no emission"),
-                    size: wgpu::Extent3d {
-                        width: 1,
-                        height: 1,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                },
-                wgpu::util::TextureDataOrder::LayerMajor,
-                &[0, 0, 0, 255],
-            )
-            .create_view(&Default::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("texture"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            // Mipmapped and anisotropic, like Studio: finely tiled textures
-            // average out at a distance instead of sparkling.
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            anisotropy_clamp: crate::mech::TEXTURE_ANISOTROPY,
-            ..Default::default()
-        });
-        let glass_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("glass scene"),
-            entries: &[
-                frag(0, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }),
-                frag(1, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }),
-            ],
-        });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("viewport"),
-            bind_group_layouts: &[Some(&bgl), Some(&tex_layout)],
-            immediate_size: 0,
-        });
-
-        let part_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("parts with glass scene"),
-            bind_group_layouts: &[Some(&bgl), Some(&tex_layout), Some(&glass_layout)],
-            immediate_size: 0,
-        });
-        let vertex_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as u64,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 8 => Float32x2, 12 => Float32x4, 11 => Float32x4],
-        };
-        let instance_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<InstanceRaw>() as u64,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4, 9 => Float32x4, 10 => Float32x4, 13 => Float32x4],
-        };
-        let line_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<LineVertex>() as u64,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
-        };
-
-        let ms = wgpu::MultisampleState {
-            count: SAMPLES,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        };
-        let make = |label: &str,
-                    vs: &str,
-                    fs: &str,
-                    buffers: &[Option<wgpu::VertexBufferLayout>],
-                    topology: wgpu::PrimitiveTopology,
-                    cull: Option<wgpu::Face>,
-                    depth_write: bool,
-                    depth_compare: wgpu::CompareFunction,
-                    blend: Option<wgpu::BlendState>| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(if fs == "fs_part" || fs == "fs_part_enc" || fs == "fs_decal_depth" { &part_layout } else { &layout }),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some(vs),
-                    compilation_options: Default::default(),
-                    buffers,
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology,
-                    cull_mode: cull,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(depth_write),
-                    depth_compare: Some(depth_compare),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: ms,
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: HDR_FORMAT,
-                        blend,
-                        write_mask: if fs == "fs_decal_depth" { wgpu::ColorWrites::empty() } else { wgpu::ColorWrites::ALL },
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        use wgpu::CompareFunction as C;
-        use wgpu::PrimitiveTopology as T;
-        let sky = make(
-            "sky",
-            "vs_sky",
-            "fs_sky",
-            &[],
-            T::TriangleList,
-            None,
-            false,
-            C::Always,
-            None,
-        );
-        let opaque = make(
-            "parts",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            Some(wgpu::Face::Back),
-            true,
-            C::Greater,
-            None,
-        );
-        let opaque_two_sided = make(
-            "parts-two-sided",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            None,
-            true,
-            C::Greater,
-            None,
-        );
-        // fs_part writes premultiplied colour (round 26): see-through Neon
-        // adds its glow with cover 0, everything else blends as before.
-        let decal_depth = make("decal opaque texel depth", "vs_part", "fs_decal_depth",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList, None, true, C::Greater, None);
-        let transparent = make(
-            "parts-transparent",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            None,
-            false,
-            C::GreaterEqual,
-            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-        );
-        // See-through built-in shapes show their front faces only, as in
-        // Studio (round 19: from inside a translucent part it draws nothing).
-        let transparent_culled = make(
-            "parts-transparent-culled",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            Some(wgpu::Face::Back),
-            false,
-            C::GreaterEqual,
-            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-        );
-        // GlassTransparentFS already composites the opaque scene. Replace RGB
-        // and preserve its energy-derived alpha; ordinary transparents remain
-        // premultiplied One / OneMinusSrcAlpha.
-        let glass = make("glass-composite", "vs_part", "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList, None, false, C::Greater, None);
-        let glass_culled = make("glass-composite-culled", "vs_part", "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList, Some(wgpu::Face::Back), false, C::Greater, None);
-        // The same five, drawing into the see-through encoding (shader.wgsl
-        // see_out; SeeThrough below).
-        let pm = Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
-        let parts = [Some(vertex_layout.clone()), Some(instance_layout.clone())];
-        let see_pipes = SeePipes {
-            transparent: make("parts-transparent-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::GreaterEqual, pm),
-            transparent_culled: make("parts-transparent-culled-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::GreaterEqual, pm),
-            glass: make("glass-composite-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::Greater, None),
-            glass_culled: make("glass-composite-culled-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::Greater, None),
-            overlay: make("parts-overlay-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::GreaterEqual, pm),
-        };
-        let see = SeeThrough::new(device, &shader, &bgl, ms);
-        let water = crate::water::WaterPass::new(
+        let bs_ssao_apply = make_blend_custom(
             device,
-            queue,
-            &shader,
-            &bgl,
-            &tex_layout,
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            HDR_FORMAT,
-            SAMPLES,
+            D3D11_BLEND_ZERO,
+            D3D11_BLEND_SRC_COLOR,
+            D3D11_BLEND_OP_ADD,
+            D3D11_BLEND_ONE,
+            D3D11_BLEND_INV_SRC_ALPHA,
+            D3D11_BLEND_OP_ADD,
         );
-        // Hover highlight: the same geometry again, on top of itself.
-        let overlay = make(
-            "parts-overlay",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            None,
-            false,
-            C::GreaterEqual,
-            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-        );
-        // Local light shadow faces: EVSM moments + depth, both sides.
-        let lshadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("light shadow"),
-            bind_group_layouts: &[Some(&shadow_bgl), Some(&lshadow.face_layout)],
-            immediate_size: 0,
-        });
-        let lshadow_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("light shadow"),
-            layout: Some(&lshadow_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_light_shadow"),
-                compilation_options: Default::default(),
-                buffers: &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: T::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(C::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_light_shadow"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: LSHADOW_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        // A cascade of the sun's shadow: depth only, both sides (thin
-        // parts). No depth bias: the EVSM test's minimum variance is the bias.
-        let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("shadow"),
-            bind_group_layouts: &[Some(&shadow_bgl), Some(&sun.pass_layout)],
-            immediate_size: 0,
-        });
-        let shadow = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("shadow"),
-            layout: Some(&shadow_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_shadow"),
-                compilation_options: Default::default(),
-                buffers: &[Some(vertex_layout), Some(instance_layout)],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: T::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(C::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: None,
-            multiview_mask: None,
-            cache: None,
-        });
-        // Smooth terrain (round 21): its own vertices (terrain.rs
-        // TerrainVertex) and per-palette parameters in group 1.
-        let terrain_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("terrain params"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let terrain_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("terrain params"),
-            size: (TERRAIN_PALETTE * 4 * 16) as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let terrain_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("terrain params"),
-            layout: &terrain_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: terrain_params_buf.as_entire_binding(),
-            }],
-        });
-        let terrain_vertex_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<crate::terrain::TerrainVertex>() as u64,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Snorm8x4, 2 => Uint8x4, 3 => Uint8x4, 4 => Uint8x4, 5 => Float32x4],
-        };
-        let terrain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("terrain"),
-            bind_group_layouts: &[Some(&bgl), Some(&terrain_bgl)],
-            immediate_size: 0,
-        });
-        let terrain = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("terrain"),
-            layout: Some(&terrain_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_terrain"),
-                compilation_options: Default::default(),
-                buffers: &[Some(terrain_vertex_layout.clone())],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: T::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(C::Greater),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: ms,
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_terrain"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: HDR_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let terrain_shadow = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("terrain shadow"),
-            layout: Some(&shadow_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_terrain_shadow"),
-                compilation_options: Default::default(),
-                buffers: &[Some(terrain_vertex_layout.clone())],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: T::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(C::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: None,
-            multiview_mask: None,
-            cache: None,
-        });
-        let terrain_shadow_back = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("terrain shadow"),
-            layout: Some(&shadow_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_terrain_shadow"),
-                compilation_options: Default::default(),
-                buffers: &[Some(terrain_vertex_layout.clone())],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: T::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(C::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: None,
-            multiview_mask: None,
-            cache: None,
-        });
-        // Exposure, tone mapping, bloom and colour correction into the display texture.
-        let fullscreen = |label: &str, fs: &str, targets: usize| {
-            let t = Some(wgpu::ColorTargetState {
-                format: HDR_FORMAT,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            });
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_post"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: Default::default(),
-                depth_stencil: None,
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &vec![t; targets],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
+
+        let pair = |x1: &[u8], msaa: &[u8]| ShaderPair {
+            x1: crate::d3d11::create_ps(device, x1),
+            msaa: crate::d3d11::create_ps(device, msaa),
         };
 
+        let vs_sky = crate::d3d11::create_vs(device, shaders::VS_SKY);
+        let ps_sky = crate::d3d11::create_ps(device, shaders::PS_SKY);
+        let vs_part = crate::d3d11::create_vs(device, shaders::VS_PART);
+        let ps_part = crate::d3d11::create_ps(device, shaders::PS_PART);
+        let ps_part_enc = crate::d3d11::create_ps(device, shaders::PS_PART_ENC);
+        let ps_decal_depth = crate::d3d11::create_ps(device, shaders::PS_DECAL_DEPTH);
+        let vs_terrain = crate::d3d11::create_vs(device, shaders::VS_TERRAIN);
+        let ps_terrain = crate::d3d11::create_ps(device, shaders::PS_TERRAIN);
+        let vs_terrain_shadow = crate::d3d11::create_vs(device, shaders::VS_TERRAIN_SHADOW);
+        let vs_shadow = crate::d3d11::create_vs(device, shaders::VS_SHADOW);
+        let vs_light_shadow = crate::d3d11::create_vs(device, shaders::VS_LIGHT_SHADOW);
+        let ps_light_shadow = crate::d3d11::create_ps(device, shaders::PS_LIGHT_SHADOW);
+        let vs_line = crate::d3d11::create_vs(device, shaders::VS_LINE);
+        let ps_line = crate::d3d11::create_ps(device, shaders::PS_LINE);
+        let vs_post = crate::d3d11::create_vs(device, shaders::VS_POST);
 
-        let dof_v = fullscreen("dof down", "fs_dof_v", 1);
-        let bloom_bright = fullscreen("bloom bright", "fs_bloom_bright", 1);
-        let bloom_down = fullscreen("bloom pyramid down", "fs_bloom_down", 1);
-        let bloom_up_desc = wgpu::RenderPipelineDescriptor {
-            label: Some("bloom pyramid up"), layout: Some(&layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_post"), compilation_options: Default::default(), buffers: &[] },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_bloom_up"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: HDR_FORMAT, blend: Some(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent::REPLACE }), write_mask: wgpu::ColorWrites::ALL })] }),
-            primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
-        };
-        let bloom_up = device.create_render_pipeline(&bloom_up_desc);
-        let ssao_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("ssao"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: true,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None,
-                },
-            ],
-        });
-        let post_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("post with depth"),
-            bind_group_layouts: &[Some(&bgl), Some(&tex_layout), Some(&ssao_layout)],
-            immediate_size: 0,
-        });
-        let post = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("post"),
-            layout: Some(&post_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_post"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_post"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: DISPLAY_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let near_fullscreen = |label: &str, fs: &str, targets: usize| {
-            let t = Some(wgpu::ColorTargetState {
-                format: HDR_FORMAT,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            });
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&post_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_post"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: Default::default(),
-                depth_stencil: None,
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &vec![t; targets],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let near_pipelines = ["fs_near_h", "fs_near_v", "fs_near_mask0", "fs_near_mask1", "fs_near_mask2", "fs_near_mask3", "fs_near_mask4", "fs_near_mask5", "fs_near_edge", "fs_near_bokeh", "fs_near_tent"].iter().map(|fs| near_fullscreen("dof near", fs, 1)).collect();
-        let dof_h = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("dof prepare"),
-            layout: Some(&post_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_post"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_dof_h"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: HDR_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let ssao_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("ssao"),
-            bind_group_layouts: &[Some(&bgl), Some(&ssao_layout)],
-            immediate_size: 0,
-        });
-        let ssao_pipe = |label: &str, fs: &str, format: wgpu::TextureFormat, blend: Option<wgpu::BlendState>| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&ssao_pl),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_post"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: Default::default(),
-                depth_stencil: None,
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let glass_resolve = ssao_pipe("glass depth", "fs_glass_depth", wgpu::TextureFormat::R32Float, None);
-        let ssao_down = ssao_pipe("ssao depth", "fs_ssao_down", wgpu::TextureFormat::R32Float, None);
-        let ssao_main = ssao_pipe("ssao", "fs_ssao", wgpu::TextureFormat::Rg32Float, None);
-        let ssao_blur_x = ssao_pipe("ssao blur across", "fs_ssao_blur_x", wgpu::TextureFormat::Rg32Float, None);
-        let ssao_blur_y = ssao_pipe("ssao blur down", "fs_ssao_blur_y", wgpu::TextureFormat::Rg32Float, None);
-        // SSAOApply: the scene × the occlusion.
-        let ssao_apply = ssao_pipe(
-            "ssao apply",
-            "fs_ssao_apply",
-            HDR_FORMAT,
-            Some(wgpu::BlendState {
-                color: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::Zero,
-                    dst_factor: wgpu::BlendFactor::Src,
-                    operation: wgpu::BlendOperation::Add,
-                },
-                alpha: wgpu::BlendComponent::OVER,
-            }),
-        );
-        let lines = make(
-            "lines",
-            "vs_line",
-            "fs_line",
-            &[Some(line_layout)],
-            T::LineList,
-            None,
-            false,
-            C::GreaterEqual,
-            Some(wgpu::BlendState::ALPHA_BLENDING),
-        );
+        let ps_glass_depth = pair(shaders::PS_GLASS_DEPTH_1X, shaders::PS_GLASS_DEPTH_MSAA);
+        let ps_post = pair(shaders::PS_POST_1X, shaders::PS_POST_MSAA);
+        let ps_dof_h = pair(shaders::PS_DOF_H_1X, shaders::PS_DOF_H_MSAA);
+        let ps_dof_v = pair(shaders::PS_DOF_V_1X, shaders::PS_DOF_V_MSAA);
+        let ps_near_h = pair(shaders::PS_NEAR_H_1X, shaders::PS_NEAR_H_MSAA);
+        let ps_near_v = pair(shaders::PS_NEAR_V_1X, shaders::PS_NEAR_V_MSAA);
+        let ps_near_masks = [
+            crate::d3d11::create_ps(device, shaders::PS_NEAR_MASK0),
+            crate::d3d11::create_ps(device, shaders::PS_NEAR_MASK1),
+            crate::d3d11::create_ps(device, shaders::PS_NEAR_MASK2),
+            crate::d3d11::create_ps(device, shaders::PS_NEAR_MASK3),
+            crate::d3d11::create_ps(device, shaders::PS_NEAR_MASK4),
+            crate::d3d11::create_ps(device, shaders::PS_NEAR_MASK5),
+        ];
+        let ps_near_edge = crate::d3d11::create_ps(device, shaders::PS_NEAR_EDGE);
+        let ps_near_bokeh = crate::d3d11::create_ps(device, shaders::PS_NEAR_BOKEH);
+        let ps_near_tent = crate::d3d11::create_ps(device, shaders::PS_NEAR_TENT);
+
+        let ps_ssao_down = pair(shaders::PS_SSAO_DOWN_1X, shaders::PS_SSAO_DOWN_MSAA);
+        let ps_ssao_main = crate::d3d11::create_ps(device, shaders::PS_SSAO);
+        let ps_ssao_blur_x = crate::d3d11::create_ps(device, shaders::PS_SSAO_BLUR_X);
+        let ps_ssao_blur_y = crate::d3d11::create_ps(device, shaders::PS_SSAO_BLUR_Y);
+        let ps_ssao_apply = crate::d3d11::create_ps(device, shaders::PS_SSAO_APPLY);
+
+        let ps_bloom_bright = crate::d3d11::create_ps(device, shaders::PS_BLOOM_BRIGHT);
+        let ps_bloom_down = crate::d3d11::create_ps(device, shaders::PS_BLOOM_DOWN);
+        let ps_bloom_up = crate::d3d11::create_ps(device, shaders::PS_BLOOM_UP);
+
+        let see = SeeThrough::new(device);
+        let water = crate::water::WaterPass::new(device, ctx, samples);
+        let terrain_params_cpu = RefCell::new(vec![[0.0f32; 4]; TERRAIN_PALETTE * 4]);
+        let terrain_params_cb = crate::d3d11::create_cb(device, TERRAIN_PALETTE * 4 * 16);
 
         let meshes = build_meshes()
             .into_iter()
@@ -2339,17 +1617,22 @@ impl Renderer {
                 cull: Some(true),
                 storage: false,
                 count: verts.len() as u32,
-                vbuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("mesh"),
-                    contents: bytemuck::cast_slice(&verts),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
+                vbuf: crate::d3d11::create_default_buffer(
+                    device,
+                    D3D11_BIND_VERTEX_BUFFER.0 as u32,
+                    std::mem::size_of_val(verts.as_slice()),
+                    Some(bytemuck::cast_slice(&verts)),
+                ),
             })
             .collect();
 
         let instance_cap = 1024;
         let line_cap = 4096;
         let mut r = Renderer {
+            quality,
+            can_msaa_4x,
+            last_cascades: None,
+            probe_samples: samples,
             skin: crate::skin_gpu::SkinGpu::new(device),
             gui_fog: ([0.0, 1e9, 0.0, 0.0], [0.0; 3]),
             gui_sun: Default::default(),
@@ -2360,89 +1643,98 @@ impl Renderer {
             highlight: None,
             last_view_proj: Mat4::IDENTITY,
             water,
-            glass_layout,
-            glass_resolve,
             material_epoch: Instant::now(),
-            sky,
-            opaque,
-            opaque_two_sided,
-            transparent_culled,
-            glass,
-            glass_culled,
-            transparent,
-            decal_depth,
-            lines,
-            post,
+            il_part,
+            il_terrain,
+            il_line,
+            rs_cull_back,
+            rs_cull_none,
+            rs_scissor_back,
+            rs_scissor_none,
+            ds_none,
+            ds_always_ro,
+            ds_greater_rw,
+            ds_greater_ro,
+            ds_gequal_ro,
+            ds_less_eq_rw,
+            bs_opaque,
+            bs_premul,
+            bs_alpha,
+            bs_no_color,
+            bs_bloom_up,
+            bs_ssao_apply,
+            vs_sky,
+            ps_sky,
+            vs_part,
+            ps_part,
+            ps_part_enc,
+            ps_decal_depth,
+            vs_terrain,
+            ps_terrain,
+            vs_terrain_shadow,
+            vs_shadow,
+            vs_light_shadow,
+            ps_light_shadow,
+            vs_line,
+            ps_line,
+            vs_post,
+            ps_glass_depth,
+            ps_post,
             post_dof: false,
             post_dof_near: false,
-            ssao_layout,
-            ssao_down,
-            ssao_main,
-            dof_h,
-            dof_v,
-            near_pipelines,
-            ssao_blur_x,
-            ssao_blur_y,
-            ssao_apply,
-            bloom_bright,
-            bloom_down,
-            bloom_up,
+            ps_dof_h,
+            ps_dof_v,
+            ps_near_h,
+            ps_near_v,
+            ps_near_masks,
+            ps_near_edge,
+            ps_near_bokeh,
+            ps_near_tent,
+            ps_ssao_down,
+            ps_ssao_main,
+            ps_ssao_blur_x,
+            ps_ssao_blur_y,
+            ps_ssao_apply,
+            ps_bloom_bright,
+            ps_bloom_down,
+            ps_bloom_up,
             post_bloom_size: 24.0,
-            shadow,
-            terrain,
-            terrain_shadow,
-            terrain_shadow_back,
-            terrain_params_buf,
-            terrain_bg,
+            lshadow,
+            static_gen: 0,
+            terrain_params_cb,
+            terrain_params_cpu,
             terrain_chunks: HashMap::new(),
             terrain_grass: HashMap::new(),
-            globals_buf,
-            globals_bg,
-            shadow_globals_bg,
-            lshadow,
-            lshadow_pipe,
-            static_gen: 0,
-            globals_layout: bgl,
+            globals_cb,
             lights_buf,
-            shadow_view,
+            lights_srv,
+            shadow_dsv,
             sun,
             clouds: None,
-            sky_view,
-            indoor_view,
+            sky_srv,
+            indoor_srv,
             probe,
-            probe_globals_bg,
-            brdf_view,
+            brdf_srv,
             sky_sampler,
             lightgrid_tex,
-            lightgrid_view,
+            lightgrid_srv,
             localgrid_tex,
-            localgrid_view,
+            localgrid_srv,
             lightocc_tex,
-            lightocc_view,
-            studs_view,
+            lightocc_srv,
+            studs_srv,
             studs_sampler,
             materials,
             sky_size: 0,
             meshes,
             cull_alias: HashMap::new(),
-            tex_layout,
             sampler,
             textures: Vec::new(),
-            black_view,
-            overlay,
-            see_pipes,
+            black_srv,
             see,
-            instance_buf: Self::make_buf(
-                device,
-                "instances",
-                instance_cap * std::mem::size_of::<InstanceRaw>(),
-            ),
+            instance_buf: Self::make_buf(device, instance_cap * std::mem::size_of::<InstanceRaw>()),
             instance_cap,
-            static_buf: Self::make_buf(
-                device,
-                "static instances",
-                instance_cap * std::mem::size_of::<InstanceRaw>(),
-            ),
+            static_buf: Self::make_static_buf(device, instance_cap * std::mem::size_of::<InstanceRaw>()),
             static_cap: instance_cap,
             items: HashMap::new(),
             per_frame: HashSet::new(),
@@ -2453,73 +1745,36 @@ impl Renderer {
             last_rebuild: Instant::now(),
             last_quiet_scan: Instant::now(),
             stats: RenderStats::default(),
-            line_buf: Self::make_buf(
-                device,
-                "lines",
-                line_cap * std::mem::size_of::<LineVertex>(),
-            ),
+            line_buf: Self::make_buf(device, line_cap * std::mem::size_of::<LineVertex>()),
             line_cap,
             target: None,
             texture_id: None,
         };
-        r.add_texture(device, queue, 1, 1, &[255, 255, 255, 255]);
+        r.add_texture(device, ctx, 1, 1, &[255, 255, 255, 255]);
         r
+    }
+
+    pub fn set_quality(&mut self, mut q: crate::quality::QualityProfile) {
+        q.msaa_samples = if q.msaa_samples >= 4 && self.can_msaa_4x { 4 } else { 1 };
+        if q.shadow_cascades != self.quality.shadow_cascades || q.enable_shadows != self.quality.enable_shadows {
+            self.sun.forget();
+        }
+        if q.max_local_shadows != self.quality.max_local_shadows {
+            self.lshadow.key = None;
+        }
+        self.quality = q;
+    }
+
+    pub(super) fn samples(&self) -> u32 {
+        self.quality.msaa_samples
     }
 
     /// The last frame as shown (RGBA8, top row first): width, height,
     /// pixels. Waits for the GPU; for tests.
-    pub fn read_frame(&self, rs: &egui_wgpu::RenderState) -> Option<(u32, u32, Vec<u8>)> {
+    pub fn read_frame(&self, rs: &crate::d3d11::RenderState) -> Option<(u32, u32, Vec<u8>)> {
         let target = self.target.as_ref()?;
         let [w, h] = target.size;
-        let row = (w * 4).div_ceil(256) * 256;
-        let buf = rs.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("read frame"),
-            size: (row * h) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut enc = rs
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("read frame"),
-            });
-        enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target.display,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buf,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(row),
-                    rows_per_image: Some(h),
-                },
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-        rs.queue.submit([enc.finish()]);
-        let slice = buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        rs.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
-        rx.recv().ok()?.ok()?;
-        let data = slice.get_mapped_range().ok()?;
-        let mut out = Vec::with_capacity((w * h * 4) as usize);
-        for y in 0..h {
-            let o = (y * row) as usize;
-            out.extend_from_slice(&data[o..o + (w * 4) as usize]);
-        }
-        drop(data);
-        buf.unmap();
+        let out = crate::d3d11::read_tex2d_rgba8(&rs.device, &rs.context, &target.display_tex, w, h);
         Some((w, h, out))
     }
 
@@ -2530,152 +1785,149 @@ impl Renderer {
     }
 
     /// Raw RGBA16Float scene before bloom/tone, for render diagnostics.
-    pub fn read_hdr(&self, rs: &egui_wgpu::RenderState) -> Option<(u32, u32, Vec<u8>)> {
+    pub fn read_hdr(&self, rs: &crate::d3d11::RenderState) -> Option<(u32, u32, Vec<u8>)> {
         let target = self.target.as_ref()?;
-        {
-            if let Ok(path) = std::env::var("RUSTUDIO_DUMP_HDR") {
-                let half = [(target.size[0] >> 1).max(1), (target.size[1] >> 1).max(1)];
-                if let Some(texture) = &target.bloom_bright_capture {
-                    if let Some((w,h,data)) = self.read_hdr_texture(rs, texture, half) {
-                        let _ = std::fs::write(format!("{path}.extract-{w}x{h}"), data);
-                    }
+        if let Ok(path) = std::env::var("RUSTUDIO_DUMP_HDR") {
+            let half = [(target.size[0] >> 1).max(1), (target.size[1] >> 1).max(1)];
+            if let Some(texture) = &target.bloom_bright_capture {
+                if let Some((w, h, data)) = self.read_hdr_texture(rs, texture, half) {
+                    let _ = std::fs::write(format!("{path}.extract-{w}x{h}"), data);
                 }
-                if let Some((w,h,data)) = self.read_hdr_texture(rs, &target.bloom_textures[0], half) {
-                    let _ = std::fs::write(format!("{path}.bloom-{w}x{h}"), data);
-                }
-                // The scene environment probe's current slot, level 0 (env_probe.rs).
-                for f in 0..6 {
-                    let size = [crate::env_probe::SIZE; 2];
-                    if let Some((w,h,data)) = self.read_hdr_layer(rs, &self.probe.slots[self.probe.cur], size, f) {
-                        let _ = std::fs::write(format!("{path}.probe{f}-{w}x{h}"), data);
-                    }
+            }
+            if let Some((w, h, data)) = self.read_hdr_texture(rs, &target.bloom_textures[0], half) {
+                let _ = std::fs::write(format!("{path}.bloom-{w}x{h}"), data);
+            }
+            // The scene environment probe's current slot, level 0 (env_probe.rs).
+            for f in 0..6 {
+                let size = [crate::env_probe::SIZE; 2];
+                if let Some((w, h, data)) = self.read_hdr_layer(rs, &self.probe.slots[self.probe.cur], size, f) {
+                    let _ = std::fs::write(format!("{path}.probe{f}-{w}x{h}"), data);
                 }
             }
         }
-        self.read_hdr_texture(rs, &target.hdr, target.size)
+        self.read_hdr_texture(rs, &target.hdr_tex, target.size)
     }
 
-    fn read_hdr_texture(&self, rs: &egui_wgpu::RenderState, texture: &wgpu::Texture, size: [u32; 2]) -> Option<(u32,u32,Vec<u8>)> {
-        self.read_hdr_layer(rs, texture, size, 0)
-    }
-
-    fn read_hdr_layer(&self, rs: &egui_wgpu::RenderState, texture: &wgpu::Texture, size: [u32; 2], layer: u32) -> Option<(u32,u32,Vec<u8>)> {
+    fn read_hdr_texture(
+        &self,
+        rs: &crate::d3d11::RenderState,
+        texture: &ID3D11Texture2D,
+        size: [u32; 2],
+    ) -> Option<(u32, u32, Vec<u8>)> {
         let [w, h] = size;
-        let row = (w * 8).div_ceil(256) * 256;
-        let buf = rs.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("read HDR"),
-            size: (row * h) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut enc = rs
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("read HDR"),
-            });
-        enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buf,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(row),
-                    rows_per_image: Some(h),
-                },
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-        rs.queue.submit([enc.finish()]);
-        let slice = buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        rs.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
-        rx.recv().ok()?.ok()?;
-        let data = slice.get_mapped_range().ok()?;
-        let mut out = Vec::with_capacity((w * h * 8) as usize);
-        for y in 0..h {
-            let o = (y * row) as usize;
-            out.extend_from_slice(&data[o..o + (w * 8) as usize]);
+        let out = crate::d3d11::read_tex2d_rgba16f(&rs.device, &rs.context, texture, w, h);
+        Some((w, h, out))
+    }
+
+    fn read_hdr_layer(
+        &self,
+        rs: &crate::d3d11::RenderState,
+        texture: &ID3D11Texture2D,
+        size: [u32; 2],
+        layer: u32,
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        let [w, h] = size;
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { texture.GetDesc(&mut desc) };
+        let src_sub = layer * desc.MipLevels.max(1);
+        desc.Width = w;
+        desc.Height = h;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.SampleDesc = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        desc.MiscFlags = 0;
+
+        let mut staging = None;
+        unsafe { rs.device.CreateTexture2D(&desc, None, Some(&mut staging)) }.ok()?;
+        let staging = staging?;
+        unsafe { rs.context.CopySubresourceRegion(&staging, 0, 0, 0, 0, texture, src_sub, None) };
+
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe { rs.context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }.ok()?;
+        let row_bytes = (w * 8) as usize;
+        let pitch = mapped.RowPitch as usize;
+        let mut out = Vec::with_capacity(row_bytes * h as usize);
+        for y in 0..h as usize {
+            unsafe {
+                let src = (mapped.pData as *const u8).add(y * pitch);
+                out.extend_from_slice(std::slice::from_raw_parts(src, row_bytes));
+            }
         }
-        drop(data);
-        buf.unmap();
+        unsafe { rs.context.Unmap(&staging, 0) };
         Some((w, h, out))
     }
 
     /// Uploads an RGBA8 (sRGB) image; returns its index for [`PartDraw::texture`].
     pub fn add_texture(
         &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        device: &ID3D11Device,
+        ctx: &ID3D11DeviceContext,
         width: u32,
         height: u32,
         rgba: &[u8],
     ) -> u32 {
-        self.add_texture_emissive(device, queue, width, height, rgba, None)
+        self.add_texture_emissive(device, ctx, width, height, rgba, None)
     }
 
     /// A texture with a SurfaceAppearance emissive mask (RGBA8, its own size;
     /// read as data, not sRGB).
     pub fn add_texture_emissive(
         &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        device: &ID3D11Device,
+        ctx: &ID3D11DeviceContext,
         width: u32,
         height: u32,
         rgba: &[u8],
         mask: Option<(u32, u32, &[u8])>,
     ) -> u32 {
-        self.add_texture_surface(device, queue, width, height, rgba, mask, None)
+        self.add_texture_surface(device, ctx, width, height, rgba, mask, None)
     }
 
     pub fn add_texture_surface(
-        &mut self, device: &wgpu::Device, queue: &wgpu::Queue,
-        width: u32, height: u32, rgba: &[u8],
-        mask: Option<(u32, u32, &[u8])>, surface: Option<(u32, u32, &[u8])>,
+        &mut self,
+        device: &ID3D11Device,
+        _ctx: &ID3D11DeviceContext,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        mask: Option<(u32, u32, &[u8])>,
+        surface: Option<(u32, u32, &[u8])>,
     ) -> u32 {
         let (sw, sh, sp) = surface.unwrap_or((1, 1, &[128, 128, 255, 0]));
-        let surface_view = device.create_texture_with_data(queue, &wgpu::TextureDescriptor {
-            label: Some("SurfaceAppearance normal roughness metalness"),
-            size: wgpu::Extent3d { width: sw, height: sh, depth_or_array_layers: 1 },
-            mip_level_count: mip_levels(sw, sh), sample_count: 1,
-            dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
-        }, wgpu::util::TextureDataOrder::LayerMajor, &data_mip_chain(sw, sh, sp))
-            .create_view(&Default::default());
-        let mask_view = mask.map(|(w, h, px)| {
-            device
-                .create_texture_with_data(
-                    queue,
-                    &wgpu::TextureDescriptor {
-                        label: Some("emissive mask"),
-                        size: wgpu::Extent3d {
-                            width: w.max(1),
-                            height: h.max(1),
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                        view_formats: &[],
-                    },
-                    wgpu::util::TextureDataOrder::LayerMajor,
-                    px,
-                )
-                .create_view(&Default::default())
-        });
+        let (sw, sh) = (sw.max(1), sh.max(1));
+        let surface_mips = mip_levels(sw, sh);
+        let surface_data = data_mip_chain(sw, sh, sp);
+        let surface_tex = make_tex2d_data(
+            device,
+            sw,
+            sh,
+            surface_mips,
+            1,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            0,
+            &surface_data,
+            4,
+        );
+        let surface_srv = crate::d3d11::create_srv_2d(
+            device,
+            &surface_tex,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            false,
+            0,
+            surface_mips,
+        );
+
+        let emissive_srv = mask
+            .map(|(w, h, px)| {
+                let (mw, mh) = (w.max(1), h.max(1));
+                let tex = make_tex2d_data(device, mw, mh, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0, px, 4);
+                crate::d3d11::create_srv_2d(device, &tex, DXGI_FORMAT_R8G8B8A8_UNORM, false, 0, 1)
+            })
+            .unwrap_or_else(|| self.black_srv.clone());
+
         let (w, h) = (width.max(1), height.max(1));
         let ready = READY_MIPS.with(|c| {
             let mut c = c.borrow_mut();
@@ -2684,180 +1936,144 @@ impl Renderer {
                 _ => None,
             }
         });
-        let mips = if rgba.len() == (w * h * 4) as usize {
-            ready.unwrap_or_else(|| mip_chain(w, h, rgba))
+        let (levels, mips_vec): (u32, Vec<u8>) = if rgba.len() == (w * h * 4) as usize {
+            (mip_levels(w, h), ready.unwrap_or_else(|| mip_chain(w, h, rgba)))
         } else {
-            rgba.to_vec()
+            (1, rgba.to_vec())
         };
-        let levels = if rgba.len() == (w * h * 4) as usize {
-            mip_levels(w, h)
-        } else {
-            1
-        };
-        let tex = device.create_texture_with_data(
-            queue,
-            &wgpu::TextureDescriptor {
-                label: Some("part texture"),
-                size: wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: levels,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            &mips,
+        let tex = make_tex2d_data(
+            device,
+            w,
+            h,
+            levels,
+            1,
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            0,
+            &mips_vec,
+            4,
         );
-        let view = tex.create_view(&Default::default());
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("part texture"),
-            layout: &self.tex_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(
-                        mask_view.as_ref().unwrap_or(&self.black_view),
-                    ),
-                },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&surface_view) },
-            ],
-        });
+        let albedo_srv = crate::d3d11::create_srv_2d(
+            device,
+            &tex,
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            false,
+            0,
+            levels,
+        );
+        let part_tex = PartTex { albedo_srv, emissive_srv, surface_srv };
         // An EditableImage texture re-uploaded: into its old slot (the old
-        // bind group and its textures are freed), not a new one.
+        // COM views and their textures are freed), not a new one.
         if let Some(i) = REUSE_TEXTURE_SLOT.with(|c| c.take()) {
             if let Some(slot) = self.textures.get_mut(i as usize) {
-                *slot = bg;
+                *slot = part_tex;
                 return i;
             }
         }
-        self.textures.push(bg);
+        self.textures.push(part_tex);
         (self.textures.len() - 1) as u32
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn globals_group(
-        device: &wgpu::Device,
-        layout: &wgpu::BindGroupLayout,
-        globals: &wgpu::Buffer,
-        lights: &wgpu::Buffer,
-        sky: &wgpu::TextureView,
-        sky_sampler: &wgpu::Sampler,
-        shadow: &wgpu::TextureView,
-        lightgrid: &wgpu::TextureView,
-        lightocc: &wgpu::TextureView,
-        localgrid: &wgpu::TextureView,
-        studs: &wgpu::TextureView,
-        studs_sampler: &wgpu::Sampler,
-        materials: &MaterialArrays,
-        indoor: &wgpu::TextureView,
-        indoor_next: &wgpu::TextureView,
-        brdf: &wgpu::TextureView,
-        lshadow: &LightShadows,
-    ) -> wgpu::BindGroup {
-        use wgpu::BindingResource as B;
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("globals"),
-            layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: globals.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: lights.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: B::TextureView(sky),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: B::Sampler(sky_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: B::TextureView(shadow),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: B::TextureView(studs),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: B::Sampler(studs_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: B::TextureView(&materials.albedo_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: B::TextureView(&materials.surface_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 11,
-                    resource: B::TextureView(lightgrid),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 12,
-                    resource: B::TextureView(lightocc),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 13,
-                    resource: B::TextureView(indoor),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 21,
-                    resource: B::TextureView(indoor_next),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 14,
-                    resource: B::TextureView(brdf),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 15,
-                    resource: B::TextureView(&lshadow.moments_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 16,
-                    resource: B::Sampler(&lshadow.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 17,
-                    resource: lshadow.slots_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 18,
-                    resource: materials.params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry { binding: 20, resource: B::TextureView(localgrid) },
-                wgpu::BindGroupEntry {
-                    binding: 19,
-                    resource: B::TextureView(&materials.emission_view),
-                },
-            ],
-        })
+    pub(super) fn bind_scene_globals_with(&self, ctx: &ID3D11DeviceContext, globals_cb: &ID3D11Buffer) {
+        let cbs = [Some(globals_cb.clone()), Some(self.materials.params_cb.clone())];
+        let srvs = [
+            Some(self.lights_srv.clone()),                        // t0
+            Some(self.sky_srv.clone()),                           // t1
+            Some(self.sun.atlas_srv.clone()),                     // t2
+            Some(self.studs_srv.clone()),                         // t3
+            Some(self.materials.albedo_srv.clone()),              // t4
+            Some(self.materials.surface_srv.clone()),             // t5
+            Some(self.lightgrid_srv.clone()),                     // t6
+            Some(self.lightocc_srv.clone()),                      // t7
+            Some(self.probe.slot_srvs[self.probe.cur].clone()),   // t8
+            Some(self.brdf_srv.clone()),                          // t9
+            Some(self.lshadow.moments_srv.clone()),               // t10
+            Some(self.lshadow.slots_srv.clone()),                 // t11
+            Some(self.materials.emission_srv.clone()),            // t12
+            Some(self.localgrid_srv.clone()),                     // t13
+            Some(self.probe.slot_srvs[self.probe.next()].clone()), // t14
+        ];
+        let samps = [
+            Some(self.sky_sampler.clone()),     // s0
+            Some(self.studs_sampler.clone()),   // s1
+            Some(self.lshadow.sampler.clone()), // s2
+        ];
+        let glass_fallback = [Some(self.black_srv.clone()), Some(self.black_srv.clone())];
+        unsafe {
+            ctx.VSSetConstantBuffers(0, Some(&cbs));
+            ctx.PSSetConstantBuffers(0, Some(&cbs));
+            ctx.VSSetShaderResources(0, Some(&srvs));
+            ctx.PSSetShaderResources(0, Some(&srvs));
+            ctx.VSSetSamplers(0, Some(&samps));
+            ctx.PSSetSamplers(0, Some(&samps));
+            ctx.PSSetShaderResources(19, Some(&glass_fallback));
+        }
+    }
+
+    pub(super) fn bind_part_pipeline(
+        &self,
+        ctx: &ID3D11DeviceContext,
+        transparent: bool,
+        cull_back: bool,
+    ) {
+        unsafe {
+            ctx.IASetInputLayout(&self.il_part);
+            ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx.VSSetShader(&self.vs_part, None);
+            ctx.PSSetShader(&self.ps_part, None);
+            ctx.PSSetSamplers(3, Some(&[Some(self.sampler.clone())]));
+            ctx.RSSetState(if cull_back { &self.rs_cull_back } else { &self.rs_cull_none });
+            ctx.OMSetDepthStencilState(
+                if transparent { &self.ds_gequal_ro } else { &self.ds_greater_rw },
+                0,
+            );
+            ctx.OMSetBlendState(
+                if transparent { &self.bs_premul } else { &self.bs_opaque },
+                Some(&[0.0; 4]),
+                0xFFFFFFFF,
+            );
+        }
+    }
+
+    pub(super) fn draw_part_run(
+        &self,
+        ctx: &ID3D11DeviceContext,
+        key: (usize, usize),
+        inst_buf: &ID3D11Buffer,
+        range: std::ops::Range<u32>,
+    ) {
+        let Some(mesh) = self.meshes.get(key.0) else {
+            return;
+        };
+        let tex = self.textures.get(key.1).unwrap_or(&self.textures[0]);
+        let tex_srvs = [
+            Some(tex.albedo_srv.clone()),
+            Some(tex.emissive_srv.clone()),
+            Some(tex.surface_srv.clone()),
+        ];
+        let vbs = [Some(mesh.vbuf.clone()), Some(inst_buf.clone())];
+        let strides = [
+            std::mem::size_of::<Vertex>() as u32,
+            std::mem::size_of::<InstanceRaw>() as u32,
+        ];
+        let offsets = [0u32, 0u32];
+        crate::runtime::domains::services::perf::draw(
+            crate::runtime::domains::services::perf::SCENE,
+            1,
+            (mesh.count / 3) as u64 * (range.end - range.start) as u64,
+        );
+        unsafe {
+            ctx.PSSetShaderResources(15, Some(&tex_srvs));
+            ctx.PSSetSamplers(3, Some(&[Some(self.sampler.clone())]));
+            ctx.IASetVertexBuffers(0, 2, Some(vbs.as_ptr()), Some(strides.as_ptr()), Some(offsets.as_ptr()));
+            ctx.DrawInstanced(mesh.count, range.end - range.start, 0, range.start);
+        }
     }
 
     /// Studio's split-sum environment BRDF table: PlatformContent
     /// textures/brdfLUT.dds, 256 × 256 R16G16_FLOAT (DX10 header), read by the
     /// part shaders at (roughness, N·V) as PrecomputedBRDFTexture. Without the
     /// file a 1×1 (1, 0): Fresnel F0 alone.
-    fn brdf_lut_view(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView {
+    fn brdf_lut_view(device: &ID3D11Device) -> ID3D11ShaderResourceView {
         let file = crate::assets::resolve("rbxasset://textures/brdfLUT.dds", None)
             .and_then(|p| std::fs::read(p).ok());
         let parsed = file.and_then(|b| {
@@ -2873,172 +2089,76 @@ impl Renderer {
         });
         // (f16 1.0 = 0x3C00)
         let (w, h, data) = parsed.unwrap_or((1, 1, vec![0x00, 0x3C, 0, 0]));
-        device
-            .create_texture_with_data(
-                queue,
-                &wgpu::TextureDescriptor {
-                    label: Some("brdf lut"),
-                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rg16Float,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                },
-                wgpu::util::TextureDataOrder::LayerMajor,
-                &data,
-            )
-            .create_view(&Default::default())
+        let tex = make_tex2d_data(device, w, h, 1, 1, DXGI_FORMAT_R16G16_FLOAT, 0, &data, 4);
+        crate::d3d11::create_srv_2d(device, &tex, DXGI_FORMAT_R16G16_FLOAT, false, 0, 1)
     }
 
     /// Sets Studio's indoor environment cube (textures/sky/indoor512, faces
-    /// in wgpu's cube order like `set_sky`).
-    pub fn set_indoor(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, size: u32, faces: &[Vec<u8>; 6]) {
-        self.indoor_view = Self::cube_view(device, queue, size, faces);
-        // Both probe slots start as this cube (env_probe_gpu fill_default).
-        self.probe.fill_default(device, queue, &self.indoor_view, size);
-        self.rebind_globals(device);
-    }
-
-    /// A cube texture from six square RGBA8 faces in wgpu's order
-    /// (+X, −X, +Y, −Y, +Z, −Z). Texels stay gamma-encoded; the shader
-    /// squares them as Studio does.
-    fn cube_view(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+    /// in cube order (+X, -X, +Y, -Y, +Z, -Z) like `set_sky`).
+    pub fn set_indoor(
+        &mut self,
+        device: &ID3D11Device,
+        ctx: &ID3D11DeviceContext,
         size: u32,
         faces: &[Vec<u8>; 6],
-    ) -> wgpu::TextureView {
+    ) {
+        self.indoor_srv = Self::cube_view(device, size, faces);
+        // Both probe slots start as this cube (env_probe_gpu fill_default).
+        self.probe.fill_default(device, ctx, &self.indoor_srv, size);
+    }
+
+    /// A cube texture from six square RGBA8 faces (+X, −X, +Y, −Y, +Z, −Z).
+    /// Texels stay gamma-encoded; the shader squares them as Studio does.
+    fn cube_view(device: &ID3D11Device, size: u32, faces: &[Vec<u8>; 6]) -> ID3D11ShaderResourceView {
         // Each face with its mip chain (layer-major): the sky's reflection
-        // on rough parts reads a blurred level (shader.wgsl sky_rough).
+        // on rough parts reads a blurred level.
         let data = cube_mips(size, faces);
-        Self::cube_view_mipped(device, queue, size, &data)
+        Self::cube_view_mipped(device, size, &data)
     }
 
     /// A cube texture from faces already with their mip chains (cube_mips).
-    fn cube_view_mipped(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        size: u32,
-        data: &[u8],
-    ) -> wgpu::TextureView {
-        let tex = device.create_texture_with_data(
-            queue,
-            &wgpu::TextureDescriptor {
-                label: Some("sky"),
-                size: wgpu::Extent3d {
-                    width: size,
-                    height: size,
-                    depth_or_array_layers: 6,
-                },
-                mip_level_count: mip_levels(size, size),
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
+    fn cube_view_mipped(device: &ID3D11Device, size: u32, data: &[u8]) -> ID3D11ShaderResourceView {
+        let mips = mip_levels(size, size);
+        let tex = make_tex2d_data(
+            device,
+            size,
+            size,
+            mips,
+            6,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D11_RESOURCE_MISC_TEXTURECUBE.0 as u32,
             data,
+            4,
         );
-        tex.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::Cube),
-            ..Default::default()
-        })
-    }
-
-    fn rebind_globals(&mut self, device: &wgpu::Device) {
-        self.globals_bg = Self::globals_group(
-            device,
-            &self.globals_layout,
-            &self.globals_buf,
-            &self.lights_buf,
-            &self.sky_view,
-            &self.sky_sampler,
-            &self.sun.atlas_view,
-            &self.lightgrid_view,
-            &self.lightocc_view,
-            &self.localgrid_view,
-            &self.studs_view,
-            &self.studs_sampler,
-            &self.materials,
-            &self.probe.slot_views[self.probe.cur],
-            &self.probe.slot_views[self.probe.next()],
-            &self.brdf_view,
-            &self.lshadow,
-        );
-        self.probe_globals_bg = Self::globals_group(
-            device,
-            &self.globals_layout,
-            &self.probe.globals_buf,
-            &self.lights_buf,
-            &self.sky_view,
-            &self.sky_sampler,
-            &self.sun.atlas_view,
-            &self.lightgrid_view,
-            &self.lightocc_view,
-            &self.localgrid_view,
-            &self.studs_view,
-            &self.studs_sampler,
-            &self.materials,
-            &self.probe.slot_views[self.probe.cur],
-            &self.probe.slot_views[self.probe.next()],
-            &self.brdf_view,
-            &self.lshadow,
-        );
+        crate::d3d11::create_srv_cube(device, &tex, DXGI_FORMAT_R8G8B8A8_UNORM, 0, mips)
     }
 
     /// The legacy surface atlas (RGBA8, kept as data: the shader reads its
     /// grey 0.5 as "no change"), with mips averaged in linear light.
-    fn studs_texture(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        w: u32,
-        h: u32,
-        rgba: &[u8],
-    ) -> wgpu::TextureView {
-        device
-            .create_texture_with_data(
-                queue,
-                &wgpu::TextureDescriptor {
-                    label: Some("studs"),
-                    size: wgpu::Extent3d {
-                        width: w,
-                        height: h,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: mip_levels(w, h),
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                },
-                wgpu::util::TextureDataOrder::LayerMajor,
-                &mip_chain(w, h, rgba),
-            )
-            .create_view(&Default::default())
+    fn studs_texture(device: &ID3D11Device, w: u32, h: u32, rgba: &[u8]) -> ID3D11ShaderResourceView {
+        let mips = mip_levels(w, h);
+        let data = mip_chain(w, h, rgba);
+        let tex = make_tex2d_data(device, w, h, mips, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0, &data, 4);
+        crate::d3d11::create_srv_2d(device, &tex, DXGI_FORMAT_R8G8B8A8_UNORM, false, 0, mips)
     }
 
     /// Studio's studs.dds (PlatformContent/pc/textures): 128 px wide, four
     /// 512 px bands (studs, weld, inlet, universal), 2 × 8 studs each.
     pub fn set_studs(
         &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        device: &ID3D11Device,
+        _ctx: &ID3D11DeviceContext,
         w: u32,
         h: u32,
         rgba: &[u8],
     ) {
-        self.studs_view = Self::studs_texture(device, queue, w, h, rgba);
-        self.rebind_globals(device);
+        self.studs_srv = Self::studs_texture(device, w, h, rgba);
     }
 
     /// Replaces one terrain chunk's triangles (none = the chunk goes).
     pub fn set_terrain_chunk(
         &mut self,
-        device: &wgpu::Device,
+        device: &ID3D11Device,
         key: [i32; 3],
         verts: &[crate::terrain::TerrainVertex],
     ) {
@@ -3053,16 +2173,20 @@ impl Renderer {
             lo = lo.min(Vec3::from(v.pos));
             hi = hi.max(Vec3::from(v.pos));
         }
-        let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("terrain chunk"),
-            contents: bytemuck::cast_slice(verts),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        let vbuf = crate::d3d11::create_immutable_buffer(
+            device,
+            D3D11_BIND_VERTEX_BUFFER.0 as u32,
+            bytemuck::cast_slice(verts),
+        );
         self.terrain_chunks.insert(
             key,
             TerrainChunk {
                 grass_ranges: Vec::new(),
-                diagnostic_positions: if std::env::var_os("RUSTUDIO_CULL_EXPORT").is_some() { verts.iter().map(|v| v.pos).collect() } else { Vec::new() },
+                diagnostic_positions: if std::env::var_os("RUSTUDIO_CULL_EXPORT").is_some() {
+                    verts.iter().map(|v| v.pos).collect()
+                } else {
+                    Vec::new()
+                },
                 vbuf,
                 count: verts.len() as u32,
                 lo,
@@ -3081,7 +2205,7 @@ impl Renderer {
     /// Replaces one chunk's decoration grass (none = drop it).
     pub fn set_terrain_grass(
         &mut self,
-        device: &wgpu::Device,
+        device: &ID3D11Device,
         key: [i32; 3],
         verts: &[crate::terrain::TerrainVertex],
     ) {
@@ -3105,7 +2229,12 @@ impl Renderer {
         }
     }
 
-    pub fn set_terrain_grass_geometry(&mut self, device: &wgpu::Device, key: [i32;3], geometry: crate::terrain::GrassGeometry) {
+    pub fn set_terrain_grass_geometry(
+        &mut self,
+        device: &ID3D11Device,
+        key: [i32; 3],
+        geometry: crate::terrain::GrassGeometry,
+    ) {
         let mut vertices = Vec::new();
         let mut ranges = Vec::new();
         for cell in geometry.cells {
@@ -3113,13 +2242,24 @@ impl Renderer {
             let mut ordinals = Vec::new();
             for (ordinal, first) in cell.batch.blades {
                 ordinals.push(ordinal);
-                vertices.extend_from_slice(&geometry.vertices[first..first+6]);
+                vertices.extend_from_slice(&geometry.vertices[first..first + 6]);
             }
-            ranges.push(GrassRange {start, ordinals, allocated:cell.batch.allocated, near:cell.near, lo:cell.lo, hi:cell.hi});
+            ranges.push(GrassRange {
+                start,
+                ordinals,
+                allocated: cell.batch.allocated,
+                near: cell.near,
+                lo: cell.lo,
+                hi: cell.hi,
+            });
         }
-        if ranges.is_empty() { vertices = geometry.vertices; }
+        if ranges.is_empty() {
+            vertices = geometry.vertices;
+        }
         self.set_terrain_grass(device, key, &vertices);
-        if let Some(chunk) = self.terrain_grass.get_mut(&key) {chunk.grass_ranges = ranges;}
+        if let Some(chunk) = self.terrain_grass.get_mut(&key) {
+            chunk.grass_ranges = ranges;
+        }
     }
 
     /// Triangles in the drawn terrain chunks.
@@ -3127,11 +2267,12 @@ impl Renderer {
         self.terrain_chunks.values().map(|c| c.count as usize / 3).sum()
     }
 
-    /// The terrain shader's per-palette parameters (4 vec4s per entry, see
-    /// shader.wgsl TerrainParams).
-    pub fn set_terrain_params(&self, queue: &wgpu::Queue, params: &[[f32; 4]]) {
-        let n = params.len().min(TERRAIN_PALETTE * 4);
-        queue.write_buffer(&self.terrain_params_buf, 0, bytemuck::cast_slice(&params[..n]));
+    /// The terrain shader's per-palette parameters (4 vec4s per entry).
+    pub fn set_terrain_params(&self, ctx: &ID3D11DeviceContext, params: &[[f32; 4]]) {
+        let mut cpu = self.terrain_params_cpu.borrow_mut();
+        let n = params.len().min(cpu.len());
+        cpu[..n].copy_from_slice(&params[..n]);
+        crate::d3d11::update_dynamic(ctx, &self.terrain_params_cb, bytemuck::cast_slice(&cpu));
     }
 
     /// The texture array layer of a material pack, uploading it (and
@@ -3140,8 +2281,8 @@ impl Renderer {
     /// for, and `matpack::generation` changes when they are back.
     pub fn material_layer(
         &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        device: &ID3D11Device,
+        ctx: &ID3D11DeviceContext,
         maps: &std::sync::Arc<crate::matpack::Maps>,
     ) -> i32 {
         if let Some(l) = self.materials.layers.get(&maps.pack) {
@@ -3157,16 +2298,15 @@ impl Renderer {
         if layer >= self.materials.capacity || self.materials.size != crate::matpack::LAYER_SIZE {
             let cap = (layer + 1).next_power_of_two().max(4);
             let params = std::mem::take(&mut self.materials.params);
-            let mut grown = MaterialArrays::with_params(device, crate::matpack::LAYER_SIZE, cap, params);
+            let mut grown = MaterialArrays::with_params(device, ctx, crate::matpack::LAYER_SIZE, cap, params);
             grown.layers = std::mem::take(&mut self.materials.layers);
             grown.cpu = std::mem::take(&mut self.materials.cpu);
             // The layers already there are copied on the GPU (their maps
             // are no longer in memory).
-            grown.copy_layers(device, queue, &self.materials, layer);
+            grown.copy_layers(ctx, &self.materials, layer);
             self.materials = grown;
-            self.rebind_globals(device);
         }
-        self.materials.upload(queue, layer, &pixels);
+        self.materials.upload(ctx, layer, &pixels);
         // On the GPU now: the 14 MB of maps go (see matpack::Maps).
         maps.release_pixels();
         layer as i32
@@ -3174,11 +2314,13 @@ impl Renderer {
 
     /// Studio's material constants for the parts drawn with material layer
     /// `layer` (see `MaterialArrays`): written when they change.
-    pub fn set_material_params(&mut self, queue: &wgpu::Queue, layer: i32, p: [[f32; 4]; 2]) {
+    pub fn set_material_params(&mut self, ctx: &ID3D11DeviceContext, layer: i32, p: [[f32; 4]; 2]) {
         let Ok(l) = usize::try_from(layer) else {
             return;
         };
-        if l >= MAT_PARAM_LAYERS { return; }
+        if l >= MAT_PARAM_LAYERS {
+            return;
+        }
         let mut full = [p[0], p[1], [1.0, 1.0, 1.0, 0.0], [0.0; 4], [1.0, 1.0, 1.0, 0.0]];
         full[1][2] = 4.0;
         full[1][3] = 1.0;
@@ -3189,363 +2331,380 @@ impl Renderer {
             full[3] = [c[9], c[10], c[11], c[18]];
             full[4] = [c[13], c[14], c[15], c[19]];
         }
-        if self.materials.params[l * 5..l * 5 + 5] == full { return; }
+        if self.materials.params[l * 5..l * 5 + 5] == full {
+            return;
+        }
         self.materials.params[l * 5..l * 5 + 5].copy_from_slice(&full);
-        queue.write_buffer(&self.materials.params_buf, (l * 5 * 16) as u64, bytemuck::cast_slice(&full));
+        crate::d3d11::update_dynamic(
+            ctx,
+            &self.materials.params_cb,
+            bytemuck::cast_slice(&self.materials.params),
+        );
     }
 
-    /// Sets the skybox: six square RGBA8 faces of `size` in wgpu's cube
+    /// Sets the skybox: six square RGBA8 faces of `size` in cube
     /// order (+X, −X, +Y, −Y, +Z, −Z). `size` 0 = no skybox.
     /// `mipped`: the six faces with their mip chains, layer-major (cube_mips).
     pub fn set_sky(
         &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        device: &ID3D11Device,
+        _ctx: &ID3D11DeviceContext,
         size: u32,
         mipped: Option<&[u8]>,
     ) {
         match mipped {
             Some(f) if size > 0 => {
-                self.sky_view = Self::cube_view_mipped(device, queue, size, f);
+                self.sky_srv = Self::cube_view_mipped(device, size, f);
                 self.sky_size = size;
             }
             _ => self.sky_size = 0,
         }
-        self.rebind_globals(device);
     }
 
     /// Uploads the light grid (lightgrid.rs: skylight and sun bytes, X, then Z, then Y).
-    pub fn set_lightgrid(&mut self, queue: &wgpu::Queue, data: &[u8]) {
+    pub fn set_lightgrid(&mut self, ctx: &ID3D11DeviceContext, data: &[u8]) {
         let [nx, ny, nz] = crate::lightgrid::dims().map(|n| n as u32);
         if data.len() != (2 * nx * ny * nz) as usize {
             return;
         }
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.lightgrid_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(2 * nx),
-                rows_per_image: Some(nz),
-            },
-            wgpu::Extent3d {
-                width: nx,
-                height: nz,
-                depth_or_array_layers: ny,
-            },
-        );
+        unsafe {
+            ctx.UpdateSubresource(
+                &self.lightgrid_tex,
+                0,
+                None,
+                data.as_ptr().cast(),
+                2 * nx,
+                2 * nx * nz,
+            );
+        }
     }
 
-    pub fn set_localgrid(&mut self, queue: &wgpu::Queue, data: &[u8]) {
+    pub fn set_localgrid(&mut self, ctx: &ID3D11DeviceContext, data: &[u8]) {
         let [nx, ny, nz] = crate::lightgrid::dims().map(|n| n as u32);
-        if data.len() != (nx * ny * nz * 4) as usize { return; }
-        queue.write_texture(wgpu::TexelCopyTextureInfo {
-            texture: &self.localgrid_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        }, data, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(nx * 4), rows_per_image: Some(nz) },
-        wgpu::Extent3d { width: nx, height: nz, depth_or_array_layers: ny });
+        if data.len() != (nx * ny * nz * 4) as usize {
+            return;
+        }
+        unsafe {
+            ctx.UpdateSubresource(
+                &self.localgrid_tex,
+                0,
+                None,
+                data.as_ptr().cast(),
+                nx * 4,
+                nx * nz * 4,
+            );
+        }
     }
 
     /// Uploads part of the local light channel (lightgrid::LocalPatch).
-    pub fn set_localgrid_region(&mut self, queue: &wgpu::Queue, p: &crate::lightgrid::LocalPatch) {
+    pub fn set_localgrid_region(&mut self, ctx: &ID3D11DeviceContext, p: &crate::lightgrid::LocalPatch) {
         let size = [0, 1, 2].map(|k| (p.hi[k] - p.lo[k] + 1) as u32);
-        if p.data.len() != (size[0] * size[1] * size[2] * 4) as usize { return; }
-        queue.write_texture(wgpu::TexelCopyTextureInfo {
-            texture: &self.localgrid_tex, mip_level: 0,
-            origin: wgpu::Origin3d { x: p.lo[0] as u32, y: p.lo[2] as u32, z: p.lo[1] as u32 },
-            aspect: wgpu::TextureAspect::All,
-        }, &p.data, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size[0] * 4), rows_per_image: Some(size[2]) },
-        wgpu::Extent3d { width: size[0], height: size[2], depth_or_array_layers: size[1] });
+        if p.data.len() != (size[0] * size[1] * size[2] * 4) as usize {
+            return;
+        }
+        let dst_box = D3D11_BOX {
+            left: p.lo[0] as u32,
+            top: p.lo[2] as u32,
+            front: p.lo[1] as u32,
+            right: p.hi[0] as u32 + 1,
+            bottom: p.hi[2] as u32 + 1,
+            back: p.hi[1] as u32 + 1,
+        };
+        unsafe {
+            ctx.UpdateSubresource(
+                &self.localgrid_tex,
+                0,
+                Some(&dst_box),
+                p.data.as_ptr().cast(),
+                size[0] * 4,
+                size[0] * size[2] * 4,
+            );
+        }
     }
 
     /// Uploads the parts' light occupancy (lightocc.rs: X, then Y, then Z).
-    pub fn set_lightocc(&mut self, queue: &wgpu::Queue, data: &[u8]) {
+    pub fn set_lightocc(&mut self, ctx: &ID3D11DeviceContext, data: &[u8]) {
         let [nx, ny, nz] = crate::lightocc::dims().map(|n| n as u32);
         if data.len() != (nx * ny * nz) as usize {
             return;
         }
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.lightocc_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(nx),
-                rows_per_image: Some(ny),
-            },
-            wgpu::Extent3d {
-                width: nx,
-                height: ny,
-                depth_or_array_layers: nz,
-            },
-        );
+        unsafe {
+            ctx.UpdateSubresource(
+                &self.lightocc_tex,
+                0,
+                None,
+                data.as_ptr().cast(),
+                nx,
+                nx * ny,
+            );
+        }
     }
 
-    fn make_buf(device: &wgpu::Device, label: &str, size: usize) -> wgpu::Buffer {
-        device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(label),
-            size: size.max(64) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })
+    pub(super) fn make_buf(device: &ID3D11Device, size: usize) -> ID3D11Buffer {
+        crate::d3d11::create_dynamic_buffer(
+            device,
+            D3D11_BIND_VERTEX_BUFFER.0 as u32,
+            size.max(64),
+        )
     }
 
-    fn ensure_target(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2]) {
-        if self.target.as_ref().is_some_and(|t| t.size == size) {
+    fn make_static_buf(device: &ID3D11Device, size: usize) -> ID3D11Buffer {
+        crate::d3d11::create_default_buffer(
+            device,
+            D3D11_BIND_VERTEX_BUFFER.0 as u32,
+            size.max(64),
+            None,
+        )
+    }
+
+    fn ensure_target(&mut self, rs: &crate::d3d11::RenderState, size: [u32; 2]) {
+        let samples = self.quality.msaa_samples;
+        if self.probe_samples != samples {
+            self.probe.set_samples(&rs.device, samples);
+            self.probe_samples = samples;
+        }
+        if self.target.as_ref().is_some_and(|t| t.size == size && t.samples == samples) {
             return;
         }
         let device = &rs.device;
-        let tex =
-            |label: &str, format: wgpu::TextureFormat, samples: u32, usage: wgpu::TextureUsages| {
-                device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some(label),
-                    size: wgpu::Extent3d {
-                        width: size[0],
-                        height: size[1],
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: samples,
-                    dimension: wgpu::TextureDimension::D2,
+        let mk_rt = |w: u32, h: u32, format: DXGI_FORMAT, s: u32| {
+            let tex = crate::d3d11::create_tex2d(
+                device,
+                &crate::d3d11::Tex2dSpec {
+                    width: w,
+                    height: h,
+                    mips: 1,
+                    array_size: 1,
                     format,
-                    usage,
-                    view_formats: &[],
-                })
-            };
-        let msaa = tex(
-            "viewport-msaa",
-            HDR_FORMAT,
-            SAMPLES,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        );
-        let msaa_view = msaa.create_view(&Default::default());
-        let see_view = tex("viewport-see-through", HDR_FORMAT, SAMPLES,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
-        let see_encode_bg = self.see.bind(device, &msaa_view);
-        let see_decode_bg = self.see.bind(device, &see_view);
-        let depth = tex(
-            "viewport-depth",
-            DEPTH_FORMAT,
-            SAMPLES,
-            // (read by the world GUI pass)
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        );
-        let hdr = tex(
-            "viewport-hdr",
-            HDR_FORMAT,
-            1,
-            wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-        );
-        let hdr_view = hdr.create_view(&Default::default());
-        let scene_copy = tex(
-            "viewport-scene-copy",
-            HDR_FORMAT,
-            1,
-            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        );
-        let depth_view = depth.create_view(&Default::default());
-        let water_depth = tex("water surface depth", DEPTH_FORMAT, SAMPLES,
-            wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
-        let water_bg = self.water.bind(device, &scene_copy.create_view(&Default::default()), &depth_view);
-        let glass_depth = tex("glass depth snapshot", wgpu::TextureFormat::R32Float, 1,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
-        let glass_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("glass scene snapshot"), layout: &self.glass_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&scene_copy.create_view(&Default::default())) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&glass_depth) },
-            ],
-        });
-        // Bloom's half-resolution targets.
-        let half = [size[0].div_ceil(2).max(1), size[1].div_ceil(2).max(1)];
-        let half_tex = |label: &str| {
-            device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some(label),
-                    size: wgpu::Extent3d {
-                        width: half[0],
-                        height: half[1],
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: HDR_FORMAT,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                })
-                .create_view(&Default::default())
+                    samples: s,
+                    bind_flags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+                    misc_flags: 0,
+                },
+                None,
+            );
+            let rtv = crate::d3d11::create_rtv(device, &tex, format, 0, s > 1);
+            let srv = crate::d3d11::create_srv_2d(device, &tex, format, s > 1, 0, 1);
+            (tex, rtv, srv)
         };
-        let bloom_textures: Vec<_> = (1..=5).map(|level| device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("bloom pyramid"), size: wgpu::Extent3d { width: (size[0] >> level).max(1), height: (size[1] >> level).max(1), depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,
-            dimension: wgpu::TextureDimension::D2, format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
-        })).collect();
-        let bloom_levels: Vec<_> = bloom_textures.iter().map(|t| t.create_view(&Default::default())).collect();
-        let bloom_view = bloom_levels[0].clone();
-        let bloom_bright_capture = std::env::var_os("RUSTUDIO_DUMP_HDR").map(|_| device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("diagnostic bloom extraction"),
-            size: wgpu::Extent3d { width: (size[0] >> 1).max(1), height: (size[1] >> 1).max(1), depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST, view_formats: &[],
-        }));
+
+        let (hdr_tex, hdr_rtv, hdr_srv) = mk_rt(size[0], size[1], HDR_FORMAT, 1);
+        let (msaa_tex, msaa_rtv, msaa_srv) = if samples > 1 {
+            mk_rt(size[0], size[1], HDR_FORMAT, samples)
+        } else {
+            (hdr_tex.clone(), hdr_rtv.clone(), hdr_srv.clone())
+        };
+        let (_see_tex, see_rtv, see_srv) = mk_rt(size[0], size[1], HDR_FORMAT, samples);
+
+        let depth_tex = crate::d3d11::create_tex2d(
+            device,
+            &crate::d3d11::Tex2dSpec {
+                width: size[0],
+                height: size[1],
+                format: DXGI_FORMAT_R32_TYPELESS,
+                samples,
+                bind_flags: (D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+                ..Default::default()
+            },
+            None,
+        );
+        let depth_dsv = crate::d3d11::create_dsv(device, &depth_tex, DEPTH_FORMAT, samples > 1, false);
+        let depth_dsv_ro = crate::d3d11::create_dsv(device, &depth_tex, DEPTH_FORMAT, samples > 1, true);
+        let depth_srv = crate::d3d11::create_srv_2d(device, &depth_tex, DXGI_FORMAT_R32_FLOAT, samples > 1, 0, 1);
+
+        let water_depth_tex = crate::d3d11::create_tex2d(
+            device,
+            &crate::d3d11::Tex2dSpec {
+                width: size[0],
+                height: size[1],
+                format: DEPTH_FORMAT,
+                samples,
+                bind_flags: D3D11_BIND_DEPTH_STENCIL.0 as u32,
+                ..Default::default()
+            },
+            None,
+        );
+        let water_depth_dsv = crate::d3d11::create_dsv(device, &water_depth_tex, DEPTH_FORMAT, samples > 1, false);
+
+        let (scene_copy_tex, _, scene_copy_srv) = mk_rt(size[0], size[1], HDR_FORMAT, 1);
+        let (_, glass_depth_rtv, glass_depth_srv) = mk_rt(size[0], size[1], DXGI_FORMAT_R32_FLOAT, 1);
+
+        let half_size = [size[0].div_ceil(2).max(1), size[1].div_ceil(2).max(1)];
+        let mut bloom_sizes = [[1u32; 2]; 5];
+        let mut bloom_textures = Vec::with_capacity(5);
+        let mut bloom_rtvs = Vec::with_capacity(5);
+        let mut bloom_srvs = Vec::with_capacity(5);
+        for level in 1..=5usize {
+            let bw = (size[0] >> level).max(1);
+            let bh = (size[1] >> level).max(1);
+            bloom_sizes[level - 1] = [bw, bh];
+            let (tex, rtv, srv) = mk_rt(bw, bh, HDR_FORMAT, 1);
+            bloom_textures.push(tex);
+            bloom_rtvs.push(rtv);
+            bloom_srvs.push(srv);
+        }
+        let bloom_bright_capture = std::env::var_os("RUSTUDIO_DUMP_HDR").map(|_| {
+            crate::d3d11::create_tex2d(
+                device,
+                &crate::d3d11::Tex2dSpec {
+                    width: bloom_sizes[0][0],
+                    height: bloom_sizes[0][1],
+                    format: HDR_FORMAT,
+                    bind_flags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                    ..Default::default()
+                },
+                None,
+            )
+        });
+
         // Native CheapBokeh far path retains full-resolution color/CoC.
         // Downsampling here imposes blur even as FarIntensity approaches zero.
-        let dof_tex = |label: &str| device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(label), size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-            format: HDR_FORMAT, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        }).create_view(&Default::default());
-        let dof_views = [dof_tex("dof across"), dof_tex("dof down")];
-        let pair = |label: &str, a: &wgpu::TextureView, b: &wgpu::TextureView| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &self.tex_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(a),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sky_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(b),
-                    },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.black_view) },
-                ],
-            })
-        };
-        let bloom_down_bgs = (0..5).map(|i| pair("bloom pyramid down", if i == 0 { &hdr_view } else { &bloom_levels[i-1] }, &hdr_view)).collect();
-        let bloom_up_bgs = (1..5).map(|i| pair("bloom pyramid up", &bloom_levels[i], &hdr_view)).collect();
-        let near_views: Vec<_> = (0..11).map(|i| device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("dof near quarter"), size: wgpu::Extent3d { width: (size[0]/4).max(1), height: if i == 0 {size[1]} else {(size[1]/4).max(1)}, depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
-        }).create_view(&Default::default())).collect();
-        let near_bgs = (0..11).map(|i| pair("dof near", if i == 0 { &dof_views[1] } else if i == 8 { &near_views[1] } else { &near_views[i-1] }, if i == 8 || i == 9 { &near_views[7] } else { &self.black_view })).collect();
-        let dof_bgs = [pair("dof across", &hdr_view, &self.black_view), pair("dof down", &dof_views[0], &near_views[10])];
-        let hdr_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("post inputs"), layout: &self.tex_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sky_sampler) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&bloom_view) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&dof_views[1]) },
-            ],
-        });
-        let half_float = |label: &str, format: wgpu::TextureFormat| {
-            device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some(label),
-                    size: wgpu::Extent3d { width: half[0], height: half[1], depth_or_array_layers: 1 },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                })
-                .create_view(&Default::default())
-        };
-        let ssao_depth_view = half_float("ssao depth", wgpu::TextureFormat::R32Float);
-        let ssao_views = [
-            half_float("ssao a", wgpu::TextureFormat::Rg32Float),
-            half_float("ssao b", wgpu::TextureFormat::Rg32Float),
-        ];
-        let ssao_bg = |label: &str, input: &wgpu::TextureView| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &self.ssao_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&depth_view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(input) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&scene_copy.create_view(&Default::default())) },
-                ],
-            })
-        };
-        let post_depth_bg = ssao_bg("post depth and near", &near_views[10]);
-        // down (input unused) → a … occlusion reads the depth → a, blur
-        // across a → b, blur down b → a, apply reads a.
-        let ssao_bgs = [
-            ssao_bg("ssao down", &ssao_views[1]),
-            ssao_bg("ssao", &ssao_depth_view),
-            ssao_bg("ssao blur across", &ssao_views[0]),
-            ssao_bg("ssao blur down", &ssao_views[1]),
-        ];
-        let display = tex(
-            "viewport",
-            DISPLAY_FORMAT,
-            1,
-            wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-        );
-        let display_view = display.create_view(&Default::default());
-        let mut egui_renderer = rs.renderer.write();
-        match self.texture_id {
-            Some(id) => egui_renderer.update_egui_texture_from_wgpu_texture(
-                device,
-                &display_view,
-                wgpu::FilterMode::Linear,
-                id,
-            ),
-            None => {
-                self.texture_id = Some(egui_renderer.register_native_texture(
-                    device,
-                    &display_view,
-                    wgpu::FilterMode::Linear,
-                ))
-            }
+        let (_, dof_rtv0, dof_srv0) = mk_rt(size[0], size[1], HDR_FORMAT, 1);
+        let (_, dof_rtv1, dof_srv1) = mk_rt(size[0], size[1], HDR_FORMAT, 1);
+        let dof_rtvs = [dof_rtv0, dof_rtv1];
+        let dof_srvs = [dof_srv0, dof_srv1];
+
+        let mut near_sizes = [[1u32; 2]; 11];
+        let mut near_rtvs = Vec::with_capacity(11);
+        let mut near_srvs = Vec::with_capacity(11);
+        for i in 0..11usize {
+            let nw = (size[0] / 4).max(1);
+            let nh = if i == 0 { size[1] } else { (size[1] / 4).max(1) };
+            near_sizes[i] = [nw, nh];
+            let (_, rtv, srv) = mk_rt(nw, nh, HDR_FORMAT, 1);
+            near_rtvs.push(rtv);
+            near_srvs.push(srv);
         }
+
+        let (_, ssao_depth_rtv, ssao_depth_srv) = mk_rt(half_size[0], half_size[1], DXGI_FORMAT_R32_FLOAT, 1);
+        let (_, ssao_rtv0, ssao_srv0) = mk_rt(half_size[0], half_size[1], DXGI_FORMAT_R32G32_FLOAT, 1);
+        let (_, ssao_rtv1, ssao_srv1) = mk_rt(half_size[0], half_size[1], DXGI_FORMAT_R32G32_FLOAT, 1);
+        let ssao_rtvs = [ssao_rtv0, ssao_rtv1];
+        let ssao_srvs = [ssao_srv0, ssao_srv1];
+
+        let (display_tex, display_rtv, display_srv) = mk_rt(size[0], size[1], DISPLAY_FORMAT, 1);
+        match self.texture_id {
+            Some(id) => rs.update_native_texture(id, display_srv.clone(), size),
+            None => self.texture_id = Some(rs.register_native_texture(display_srv.clone(), size)),
+        }
+
         self.target = Some(Target {
             size,
-            msaa: msaa_view,
-            see: see_view,
-            see_encode_bg,
-            see_decode_bg,
-            depth: depth_view,
-            hdr,
-            hdr_view,
-            scene_copy_view: scene_copy.create_view(&Default::default()),
-            scene_copy,
-            water_bg,
-            water_depth,
-            glass_bg,
-            glass_depth,
-            hdr_bg,
-            post_depth_bg,
-            dof_views,
-            dof_bgs,
-            near_bgs,
-            near_views,
-            bloom_view,
+            samples,
+            half_size,
+            msaa_tex,
+            msaa_rtv,
+            msaa_srv,
+            see_rtv,
+            see_srv,
+            depth_dsv,
+            depth_dsv_ro,
+            depth_srv,
+            hdr_tex,
+            hdr_rtv,
+            hdr_srv,
+            scene_copy_tex,
+            scene_copy_srv,
+            water_depth_dsv,
+            glass_depth_rtv,
+            glass_depth_srv,
+            dof_rtvs,
+            dof_srvs,
+            near_sizes,
+            near_rtvs,
+            near_srvs,
             bloom_bright_capture,
+            bloom_sizes,
             bloom_textures,
-            bloom_levels,
-            bloom_down_bgs,
-            bloom_up_bgs,
-            ssao_depth_view,
-            ssao_views,
-            ssao_bgs,
-            display,
-            display_view,
+            bloom_rtvs,
+            bloom_srvs,
+            ssao_depth_rtv,
+            ssao_depth_srv,
+            ssao_rtvs,
+            ssao_srvs,
+            display_tex,
+            display_rtv,
+            display_srv,
         });
+    }
+
+    fn bind_see_pipe(&self, ctx: &ID3D11DeviceContext, kind: SeePipeKind, encoded: bool) {
+        let ps = if encoded { &self.ps_part_enc } else { &self.ps_part };
+        let rs = match kind {
+            SeePipeKind::TransparentCulled | SeePipeKind::GlassCulled => &self.rs_cull_back,
+            _ => &self.rs_cull_none,
+        };
+        let ds = match kind {
+            SeePipeKind::Glass | SeePipeKind::GlassCulled => &self.ds_greater_ro,
+            _ => &self.ds_gequal_ro,
+        };
+        let bs = match kind {
+            SeePipeKind::Glass | SeePipeKind::GlassCulled => &self.bs_opaque,
+            _ => &self.bs_premul,
+        };
+        unsafe {
+            ctx.IASetInputLayout(&self.il_part);
+            ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx.VSSetShader(&self.vs_part, None);
+            ctx.PSSetShader(ps, None);
+            ctx.PSSetSamplers(3, Some(&[Some(self.sampler.clone())]));
+            ctx.RSSetState(rs);
+            ctx.OMSetDepthStencilState(ds, 0);
+            ctx.OMSetBlendState(bs, Some(&[0.0; 4]), 0xFFFFFFFF);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_post_pass(
+        &self,
+        ctx: &ID3D11DeviceContext,
+        rtv: &ID3D11RenderTargetView,
+        size: [u32; 2],
+        clear: Option<[f32; 4]>,
+        ps: &ID3D11PixelShader,
+        srvs: [Option<&ID3D11ShaderResourceView>; 8],
+        blend: &ID3D11BlendState,
+    ) {
+        crate::d3d11::unbind_ps_srvs(ctx, 15, 8);
+        unsafe { ctx.OMSetRenderTargets(None, None) };
+        if let Some(c) = clear {
+            unsafe { ctx.ClearRenderTargetView(rtv, &c) };
+        }
+        unsafe { ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None) };
+        crate::d3d11::set_viewport(ctx, 0.0, 0.0, size[0] as f32, size[1] as f32);
+        let views: [Option<ID3D11ShaderResourceView>; 8] = srvs.map(|s| s.cloned());
+        unsafe {
+            ctx.IASetInputLayout(None);
+            ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx.VSSetShader(&self.vs_post, None);
+            ctx.PSSetShader(ps, None);
+            ctx.PSSetSamplers(3, Some(&[Some(self.sky_sampler.clone())]));
+            ctx.PSSetShaderResources(15, Some(&views));
+            ctx.RSSetState(&self.rs_cull_none);
+            ctx.OMSetDepthStencilState(&self.ds_none, 0);
+            ctx.OMSetBlendState(blend, Some(&[0.0; 4]), 0xFFFFFFFF);
+            ctx.Draw(3, 0);
+        }
+    }
+
+    fn resolve_msaa(&self, ctx: &ID3D11DeviceContext, target: &Target) {
+        unsafe { ctx.OMSetRenderTargets(None, None) };
+        if target.samples > 1 {
+            unsafe { ctx.ResolveSubresource(&target.hdr_tex, 0, &target.msaa_tex, 0, HDR_FORMAT) };
+        }
+    }
+
+    fn resolve_glass_depth(&self, ctx: &ID3D11DeviceContext, target: &Target) {
+        self.run_post_pass(
+            ctx,
+            &target.glass_depth_rtv,
+            target.size,
+            Some([0.0; 4]),
+            self.ps_glass_depth.get(target.samples > 1),
+            [None, None, None, None, None, None, Some(&target.depth_srv), None],
+            &self.bs_opaque,
+        );
+        crate::d3d11::unbind_ps_srvs(ctx, 15, 8);
+        unsafe { ctx.OMSetRenderTargets(None, None) };
     }
 
     /// World GUIs and effects enter the HDR scene before bloom, DoF and
@@ -3553,7 +2712,7 @@ impl Renderer {
     /// screen GUIs are composed separately by egui.
     pub fn draw_world_gui(
         &mut self,
-        rs: &egui_wgpu::RenderState,
+        rs: &crate::d3d11::RenderState,
         batches: &[crate::world_gui::GuiBatch],
         fx: Option<&crate::world_gui::FxFrame>,
         tone_curve: Option<[f32; 5]>,
@@ -3561,30 +2720,53 @@ impl Renderer {
         let Some(t) = self.target.as_ref() else { return };
         let pass = self
             .world_gui
-            .get_or_insert_with(|| crate::world_gui::WorldGuiPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT));
-        pass.sun_atlas = self.sun.atlas_view.clone();
-        pass.sun_grid = self.lightgrid_view.clone();
+            .get_or_insert_with(|| crate::world_gui::WorldGuiPass::new(&rs.device, &rs.context));
+        pass.sun_atlas = self.sun.atlas_srv.clone();
+        pass.sun_grid = self.lightgrid_srv.clone();
         pass.lightgrid = self.gui_lightgrid;
         pass.sun_params = self.gui_sun_params;
         pass.sun_cascades = self.gui_sun;
         // (effects light themselves from the frame's local lights)
-        pass.lights = self.lights_buf.clone();
+        pass.lights = self.lights_srv.clone();
         pass.n_lights = self.gui_n_lights;
-        if pass.effects(rs, &t.hdr_view, t.size, &t.depth, batches, fx, tone_curve, self.gui_fog.0, self.gui_fog.1) {
+        crate::d3d11::unbind_ps_srvs(&rs.context, 0, 32);
+        unsafe { rs.context.OMSetRenderTargets(None, None) };
+        if pass.effects(
+            rs,
+            &t.hdr_rtv,
+            &t.hdr_srv,
+            t.size,
+            &t.depth_srv,
+            t.samples > 1,
+            batches,
+            fx,
+            tone_curve,
+            self.gui_fog.0,
+            self.gui_fog.1,
+        ) {
             self.finish_again(rs);
         }
     }
 
     /// Highlights over the finished image (highlight.rs): each one's parts
     /// as drawn this frame (their deformed / clothed meshes included).
-    pub fn draw_highlights(&mut self, rs: &egui_wgpu::RenderState, list: &[crate::highlight::HighlightDraw]) {
+    pub fn draw_highlights(
+        &mut self,
+        rs: &crate::d3d11::RenderState,
+        list: &[crate::highlight::HighlightDraw],
+    ) {
         if list.is_empty() {
             return;
         }
         let Some(t) = self.target.as_ref() else { return };
-        let pass = self.highlight.get_or_insert_with(|| {
-            crate::highlight::HighlightPass::new(&rs.device, DISPLAY_FORMAT, DEPTH_FORMAT, SAMPLES, std::mem::size_of::<Vertex>() as u64)
-        });
+        let samples = t.samples;
+        let pass = match &mut self.highlight {
+            Some((s, p)) if *s == samples => p,
+            slot => {
+                *slot = Some((samples, crate::highlight::HighlightPass::new(&rs.device, samples)));
+                &mut slot.as_mut().unwrap().1
+            }
+        };
         let mut work = Vec::new();
         for h in list.iter().take(crate::highlight::MAX) {
             let mut meshes = Vec::new();
@@ -3598,98 +2780,164 @@ impl Renderer {
                     let Some(m) = self.meshes.get(mesh_slot(d)) else { continue };
                     let raw = to_raw(d, 0.0);
                     let bias = item.bias;
-                    meshes.push((&m.vbuf, m.count, crate::highlight::Inst { r0: raw.r0, r1: raw.r1, r2: raw.r2, size: [raw.size[0], raw.size[1], raw.size[2], bias] }));
+                    meshes.push((
+                        &m.vbuf,
+                        m.count,
+                        crate::highlight::Inst {
+                            r0: raw.r0,
+                            r1: raw.r1,
+                            r2: raw.r2,
+                            size: [raw.size[0], raw.size[1], raw.size[2], bias],
+                        },
+                    ));
                 }
             }
             if !meshes.is_empty() {
                 work.push((h, meshes));
             }
         }
-        pass.draw(&rs.device, &rs.queue, t.size, SAMPLES, &t.depth, &t.display_view, self.last_view_proj, &work);
+        crate::d3d11::unbind_ps_srvs(&rs.context, 0, 32);
+        unsafe { rs.context.OMSetRenderTargets(None, None) };
+        pass.draw(
+            &rs.device,
+            &rs.context,
+            t.size,
+            samples,
+            &t.depth_dsv_ro,
+            &t.display_rtv,
+            self.last_view_proj,
+            &work,
+        );
     }
 
     /// The bloom and the final image again, from the HDR image as it is now
-    /// (effects drawn into it after `render`; the frame's globals still
-    /// bound).
-    fn encode_bloom(&self, encoder: &mut wgpu::CommandEncoder, target: &Target, size: f32) {
+    /// (effects drawn into it after `render`).
+    fn encode_bloom(&self, ctx: &ID3D11DeviceContext, target: &Target, size: f32) {
         let scale = ((target.size[0] as f32 * target.size[1] as f32) / 2073600.0).sqrt();
-        let levels = (3.0 + (scale.log2() + (size / 7.0).log2().max(0.0)).max(-1.0)).min(5.999) as usize;
+        let levels = ((3.0 + (scale.log2() + (size / 7.0).log2().max(0.0)).max(-1.0)).min(5.999) as usize).clamp(1, 5);
         for i in 0..levels {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("bloom pyramid down"), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &target.bloom_levels[i], depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
-            });
-            pass.set_pipeline(if i == 0 { &self.bloom_bright } else { &self.bloom_down });
-            pass.set_bind_group(0, &self.globals_bg, &[]); pass.set_bind_group(1, &target.bloom_down_bgs[i], &[]); pass.draw(0..3, 0..1);
-            drop(pass);
+            let src = if i == 0 { &target.hdr_srv } else { &target.bloom_srvs[i - 1] };
+            let ps = if i == 0 { &self.ps_bloom_bright } else { &self.ps_bloom_down };
+            self.run_post_pass(
+                ctx,
+                &target.bloom_rtvs[i],
+                target.bloom_sizes[i],
+                Some([0.0; 4]),
+                ps,
+                [Some(src), None, None, None, None, None, None, None],
+                &self.bs_opaque,
+            );
             if i == 0 {
-                if let Some(texture) = &target.bloom_bright_capture {
-                    encoder.copy_texture_to_texture(target.bloom_textures[0].as_image_copy(), texture.as_image_copy(), texture.size());
+                if let Some(capture) = &target.bloom_bright_capture {
+                    unsafe {
+                        ctx.OMSetRenderTargets(None, None);
+                        ctx.CopyResource(capture, &target.bloom_textures[0]);
+                    }
                 }
             }
         }
         for i in (1..levels).rev() {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("bloom pyramid up"), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &target.bloom_levels[i-1], depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
-            });
-            pass.set_pipeline(&self.bloom_up); pass.set_bind_group(0, &self.globals_bg, &[]); pass.set_bind_group(1, &target.bloom_up_bgs[i-1], &[]); pass.draw(0..3, 0..1);
+            self.run_post_pass(
+                ctx,
+                &target.bloom_rtvs[i - 1],
+                target.bloom_sizes[i - 1],
+                None,
+                &self.ps_bloom_up,
+                [Some(&target.bloom_srvs[i]), None, None, None, None, None, None, None],
+                &self.bs_bloom_up,
+            );
         }
     }
 
-    fn finish_again(&self, rs: &egui_wgpu::RenderState) {
+    fn run_dof_and_post(&self, ctx: &ID3D11DeviceContext, target: &Target) {
+        let msaa = target.samples > 1;
+        if self.post_dof {
+            self.run_post_pass(
+                ctx,
+                &target.dof_rtvs[0],
+                target.size,
+                Some([0.0; 4]),
+                self.ps_dof_h.get(msaa),
+                [Some(&target.hdr_srv), None, Some(&target.depth_srv), None, None, None, None, None],
+                &self.bs_opaque,
+            );
+            self.run_post_pass(
+                ctx,
+                &target.dof_rtvs[1],
+                target.size,
+                Some([0.0; 4]),
+                self.ps_dof_v.get(msaa),
+                [Some(&target.dof_srvs[0]), None, Some(&target.depth_srv), None, None, None, None, None],
+                &self.bs_opaque,
+            );
+            if self.post_dof_near {
+                for i in 0..11usize {
+                    let ps = match i {
+                        0 => self.ps_near_h.get(msaa),
+                        1 => self.ps_near_v.get(msaa),
+                        2..=7 => &self.ps_near_masks[i - 2],
+                        8 => &self.ps_near_edge,
+                        9 => &self.ps_near_bokeh,
+                        _ => &self.ps_near_tent,
+                    };
+                    let t15 = if i == 0 {
+                        &target.dof_srvs[1]
+                    } else if i == 8 {
+                        &target.near_srvs[1]
+                    } else {
+                        &target.near_srvs[i - 1]
+                    };
+                    let t16 = if i == 8 || i == 9 { Some(&target.near_srvs[7]) } else { None };
+                    let t17 = if i <= 1 { Some(&target.depth_srv) } else { None };
+                    self.run_post_pass(
+                        ctx,
+                        &target.near_rtvs[i],
+                        target.near_sizes[i],
+                        Some([0.0; 4]),
+                        ps,
+                        [Some(t15), t16, t17, None, None, None, None, None],
+                        &self.bs_opaque,
+                    );
+                }
+            }
+        }
+        self.run_post_pass(
+            ctx,
+            &target.display_rtv,
+            target.size,
+            Some([0.0; 4]),
+            self.ps_post.get(msaa),
+            [
+                Some(&target.hdr_srv),
+                Some(&target.bloom_srvs[0]),
+                Some(&target.depth_srv),
+                None,
+                None,
+                Some(&target.scene_copy_srv),
+                Some(&target.dof_srvs[1]),
+                Some(&target.near_srvs[10]),
+            ],
+            &self.bs_opaque,
+        );
+        crate::d3d11::unbind_ps_srvs(ctx, 15, 8);
+        unsafe { ctx.OMSetRenderTargets(None, None) };
+    }
+
+    pub(super) fn finish_again(&self, rs: &crate::d3d11::RenderState) {
         let _b = crate::bench::scope("fx_post_again");
         let Some(target) = self.target.as_ref() else { return };
-        let mut encoder = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("effects post") });
-        self.encode_bloom(&mut encoder, target, self.post_bloom_size);
-        let steps: [(&str, &wgpu::RenderPipeline, &wgpu::BindGroup, Vec<&wgpu::TextureView>); 14] = [
-            ("dof across", &self.dof_h, &target.dof_bgs[0], vec![&target.dof_views[0]]),
-            ("dof down", &self.dof_v, &target.dof_bgs[1], vec![&target.dof_views[1]]),
-            ("dof near", &self.near_pipelines[0], &target.near_bgs[0], vec![&target.near_views[0]]),
-            ("dof near", &self.near_pipelines[1], &target.near_bgs[1], vec![&target.near_views[1]]),
-            ("dof near", &self.near_pipelines[2], &target.near_bgs[2], vec![&target.near_views[2]]),
-            ("dof near", &self.near_pipelines[3], &target.near_bgs[3], vec![&target.near_views[3]]),
-            ("dof near", &self.near_pipelines[4], &target.near_bgs[4], vec![&target.near_views[4]]),
-            ("dof near", &self.near_pipelines[5], &target.near_bgs[5], vec![&target.near_views[5]]),
-            ("dof near", &self.near_pipelines[6], &target.near_bgs[6], vec![&target.near_views[6]]),
-            ("dof near", &self.near_pipelines[7], &target.near_bgs[7], vec![&target.near_views[7]]),
-            ("dof near", &self.near_pipelines[8], &target.near_bgs[8], vec![&target.near_views[8]]),
-            ("dof near", &self.near_pipelines[9], &target.near_bgs[9], vec![&target.near_views[9]]),
-            ("dof near", &self.near_pipelines[10], &target.near_bgs[10], vec![&target.near_views[10]]),
-            ("post", &self.post, &target.hdr_bg, vec![&target.display_view]),
-        ];
-        for (label, pipeline, bg, views) in steps {
-            if label.starts_with("dof ") && !self.post_dof { continue; }
-            if label == "dof near" && !self.post_dof_near { continue; }
-            let attachments: Vec<_> = views
-                .iter()
-                .map(|v| {
-                    Some(wgpu::RenderPassColorAttachment {
-                        view: v,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                    })
-                })
-                .collect();
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(label),
-                color_attachments: &attachments,
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(1, bg, &[]);
-            if label == "post" { pass.set_bind_group(2, &target.post_depth_bg, &[]); }
-            else if label == "dof across" || label == "dof near" { pass.set_bind_group(2, &target.ssao_bgs[0], &[]); }
-            pass.draw(0..3, 0..1);
+        let ctx = &rs.context;
+        self.bind_scene_globals_with(ctx, &self.globals_cb);
+        if self.quality.enable_bloom {
+            self.encode_bloom(ctx, target, self.post_bloom_size);
+        } else {
+            unsafe { ctx.ClearRenderTargetView(&target.bloom_rtvs[0], &[0.0; 4]) };
         }
-        rs.queue.submit([encoder.finish()]);
+        self.run_dof_and_post(ctx, target);
     }
 
     /// The last frame's fog (`Globals::fog`) and its linear colour, as
-    /// shader.wgsl fog_rgb works it out (world GUIs are fogged the same).
+    /// fog_rgb works it out (world GUIs are fogged the same).
     fn gui_fog(g: &Globals) -> ([f32; 4], [f32; 3]) {
         let c = [g.fog_color[0], g.fog_color[1], g.fog_color[2]];
         if g.fog[2] > 1.5 && g.fog[2] < 2.5 {
@@ -3707,7 +2955,7 @@ impl Renderer {
     /// Renders a frame at `size` physical pixels; returns the texture to show.
     pub fn render(
         &mut self,
-        rs: &egui_wgpu::RenderState,
+        rs: &crate::d3d11::RenderState,
         size: [u32; 2],
         frame: &Frame,
     ) -> Option<egui::TextureId> {
@@ -3715,7 +2963,20 @@ impl Renderer {
         let size = [size[0].clamp(1, 8192), size[1].clamp(1, 8192)];
         self.ensure_target(rs, size);
         let device = &rs.device;
-        let queue = &rs.queue;
+        let ctx = &rs.context;
+
+        let shadows_on = frame.shadows && self.quality.enable_shadows;
+        let active_cascades = if shadows_on {
+            self.quality.shadow_cascades.min(crate::sun_shadow::CASCADES)
+        } else {
+            0
+        };
+        let max_local_shadows = if shadows_on {
+            self.quality.max_local_shadows.min(crate::mech::LSHADOW_MAX_LIGHTS)
+        } else {
+            0
+        };
+
         // cam_pos.w is unused by the camera math. Keep material animation
         // continuous across scene rebuilds, independently of lighting time.
         let mut globals = frame.globals;
@@ -3725,7 +2986,10 @@ impl Renderer {
             let state = [globals.cc_tint[3], globals.bloom[1], globals.bloom[0], globals.params[1]];
             let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
             if *last != Some(state) {
-                eprintln!("BLOOM intensity={} size={} threshold={} exposure={} dof={:?} pipeline=bright/down/up/composite-before-tone", state[0],state[1],state[2],state[3],globals.dof);
+                eprintln!(
+                    "BLOOM intensity={} size={} threshold={} exposure={} dof={:?} pipeline=bright/down/up/composite-before-tone",
+                    state[0], state[1], state[2], state[3], globals.dof
+                );
                 *last = Some(state);
             }
         }
@@ -3735,33 +2999,76 @@ impl Renderer {
         if let Some(pf) = frame.probe.as_ref() {
             if pf.swap {
                 self.probe.cur = self.probe.next();
-                self.rebind_globals(device);
             }
             globals.env_spec[3] = pf.blend;
         }
+        if !shadows_on {
+            globals.bloom[2] = 0.0;
+        }
+        for ci in active_cascades..crate::sun_shadow::CASCADES {
+            globals.sun_sphere[ci][3] = 0.0;
+        }
+        if !self.quality.enable_ssao {
+            globals.ssao[3] = 0.0;
+        }
         self.post_bloom_size = globals.bloom[1];
+        if !self.quality.enable_bloom {
+            globals.cc_tint[3] = 0.0;
+        }
         // NearIntensity below 0.22 takes the cheap full-resolution pass
-        // (fs_dof_v), not the near chain (shader.wgsl DOF_CHEAP_BELOW).
-        self.post_dof_near = globals.dof[2] >= DOF_CHEAP_BELOW;
-        self.post_dof = globals.dof[2] > 0.0 || globals.dof[3] > 0.0;
+        // (fs_dof_v), not the near chain (DOF_CHEAP_BELOW).
+        self.post_dof = self.quality.enable_dof && (globals.dof[2] > 0.0 || globals.dof[3] > 0.0);
+        self.post_dof_near = self.post_dof && globals.dof[2] >= DOF_CHEAP_BELOW;
+        if !self.quality.enable_dof {
+            globals.dof = [0.0; 4];
+        }
         globals.cam_pos[3] = self.material_epoch.elapsed().as_secs_f32();
         // Deterministic isolated render probes (no effect in ordinary runs).
         if let Ok(t) = std::env::var("RUSTUDIO_MATERIAL_TIME") {
-            if let Ok(t) = t.parse::<f32>() { globals.cam_pos[3] = t; }
+            if let Ok(t) = t.parse::<f32>() {
+                globals.cam_pos[3] = t;
+            }
         }
         if let Some(n) = crate::grass_temporal::index() {
             globals.cam_pos[3] = crate::grass_temporal::time(n);
             use std::io::Write;
-            let dir=std::env::var("RUSTUDIO_GRASS_TEMPORAL").unwrap();
-            let mut f=std::fs::OpenOptions::new().create(true).append(true).open(format!("{dir}/frames.jsonl")).unwrap();
-            writeln!(f,"{}",serde_json::json!({"frame":n,"shader_time":globals.cam_pos[3],"camera":globals.cam_pos,"spheres":globals.sun_sphere,"matrices":globals.sun_casc,"rects":globals.sun_rect,"viewport":size,"wall":self.material_epoch.elapsed().as_secs_f64()})).unwrap();
+            let dir = std::env::var("RUSTUDIO_GRASS_TEMPORAL").unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(format!("{dir}/frames.jsonl"))
+                .unwrap();
+            writeln!(
+                f,
+                "{}",
+                serde_json::json!({
+                    "frame": n,
+                    "shader_time": globals.cam_pos[3],
+                    "camera": globals.cam_pos,
+                    "spheres": globals.sun_sphere,
+                    "matrices": globals.sun_casc,
+                    "rects": globals.sun_rect,
+                    "viewport": size,
+                    "wall": self.material_epoch.elapsed().as_secs_f64()
+                })
+            )
+            .unwrap();
         }
-        queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
+        crate::d3d11::upload_cb(ctx, &self.globals_cb, &globals);
         self.vf.base = Some(globals);
-        self.gui_fog = Self::gui_fog(&frame.globals);
-        self.gui_lightgrid = frame.globals.lightgrid;
-        self.gui_sun_params = [if frame.globals.sun_color[3] < 0.5 { 1.0 } else { 0.0 }, crate::mech::SUN_DIST, crate::mech::HYBRID_LERP_SLOPE, if frame.shadows { 1.0 } else { 0.0 }];
-        self.gui_sun = crate::world_gui::SunCascades { local: frame.globals.sun_casc, sphere: frame.globals.sun_sphere, rect: frame.globals.sun_rect };
+        self.gui_fog = Self::gui_fog(&globals);
+        self.gui_lightgrid = globals.lightgrid;
+        self.gui_sun_params = [
+            if globals.sun_color[3] < 0.5 { 1.0 } else { 0.0 },
+            crate::mech::SUN_DIST,
+            crate::mech::HYBRID_LERP_SLOPE,
+            if shadows_on { 1.0 } else { 0.0 },
+        ];
+        self.gui_sun = crate::world_gui::SunCascades {
+            local: globals.sun_casc,
+            sphere: globals.sun_sphere,
+            rect: globals.sun_rect,
+        };
         let mut stats = RenderStats {
             rebuilds: self.stats.rebuilds,
             ..Default::default()
@@ -3781,10 +3088,10 @@ impl Renderer {
         {
             self.last_rebuild = Instant::now();
             let _p = crate::bench::scope("render_static_rebuild");
-            self.rebuild_static(device, queue);
+            self.rebuild_static(device, ctx);
             stats.rebuilds += 1;
         }
-        self.flush_static_writes(queue);
+        self.flush_static_writes(ctx);
 
         let cam = Vec3::new(
             frame.globals.cam_pos[0],
@@ -3794,7 +3101,7 @@ impl Renderer {
         let planes = frustum(frame.cull_view_proj);
         // A part whose bounding radius covers less than LOD_MIN_PX pixels is skipped.
         let focal = size[1] as f32 * 0.5 / (frame.fov_y * 0.5).tan().max(1e-3);
-        let lod_k = crate::mech::LOD_MIN_PX / focal;
+        let lod_k = crate::mech::LOD_MIN_PX * self.quality.lod_bias.max(0.5) / focal;
 
         // Static batches: frustum test per cell, then trim the smallest parts.
         let mut static_ranges: Vec<(Pass, (usize, usize), u32, u32)> = Vec::new();
@@ -3874,9 +3181,15 @@ impl Renderer {
                     // DoubleSided; checks/translucent-inside), as the GPU
                     // does here. (Not terrain water, material 5, nor
                     // decals: their boxes span the map / the host.)
-                    None if d.custom_mesh.is_some() && !self.culling_known(mesh_slot(d)) && d.material != 5.0 && d.tex_mode != TexMode::Decal && camera_inside(d, cam) => {}
+                    None if d.custom_mesh.is_some()
+                        && !self.culling_known(mesh_slot(d))
+                        && d.material != 5.0
+                        && d.tex_mode != TexMode::Decal
+                        && camera_inside(d, cam) => {}
                     // Terrain water: its own pass (water.rs).
-                    None if d.custom_mesh.is_some() && d.material == 5.0 => water.push((draw_key(d), raw)),
+                    None if d.custom_mesh.is_some() && d.material == 5.0 => {
+                        water.push((draw_key(d), raw))
+                    }
                     None if solid_host && d.tex_mode == TexMode::Decal && d.texture.is_some() => {
                         see_bound(&mut see_bounds);
                         surface_decals.push((dist, draw_key(d), raw))
@@ -3921,12 +3234,11 @@ impl Renderer {
             self.instance_cap = raw.len().next_power_of_two();
             self.instance_buf = Self::make_buf(
                 device,
-                "instances",
                 self.instance_cap * std::mem::size_of::<InstanceRaw>(),
             );
         }
         if !raw.is_empty() {
-            queue.write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&raw));
+            crate::d3d11::update_dynamic(ctx, &self.instance_buf, bytemuck::cast_slice(&raw));
         }
         // Runs of equal keys in a per-frame list → (key, start, end) in `raw`.
         let runs = |keys: &mut dyn Iterator<Item = (usize, usize)>,
@@ -3970,51 +3282,79 @@ impl Renderer {
             self.line_cap = frame.lines.len().next_power_of_two();
             self.line_buf = Self::make_buf(
                 device,
-                "lines",
                 self.line_cap * std::mem::size_of::<LineVertex>(),
             );
         }
         if !frame.lines.is_empty() {
-            queue.write_buffer(&self.line_buf, 0, bytemuck::cast_slice(frame.lines));
+            crate::d3d11::update_dynamic(ctx, &self.line_buf, bytemuck::cast_slice(frame.lines));
         }
 
         let n_lights = frame.lights.len().min(crate::mech::MAX_LIGHTS);
         self.gui_n_lights = n_lights as u32;
-        if n_lights > 0 {
-            queue.write_buffer(
-                &self.lights_buf,
-                0,
-                bytemuck::cast_slice(&frame.lights[..n_lights]),
-            );
+        let mut lights_upload: Vec<LightRaw> = frame.lights[..n_lights].to_vec();
+        if max_local_shadows < crate::mech::LSHADOW_MAX_LIGHTS {
+            for l in &mut lights_upload {
+                if l.extra[3] >= max_local_shadows as f32 {
+                    l.extra[3] = -1.0;
+                }
+            }
+        }
+        if !lights_upload.is_empty() {
+            crate::d3d11::update_dynamic(ctx, &self.lights_buf, bytemuck::cast_slice(&lights_upload));
         }
 
         // The sun's shadow cascades (sun_shadow.rs): which to redraw.
-        let diagnostic_back = std::env::var_os("RUSTUDIO_CULL_BACK").is_some() || std::env::var_os("RUSTUDIO_CULL_SWITCH").is_some_and(|p| std::path::Path::new(&p).exists());
+        let diagnostic_back = std::env::var_os("RUSTUDIO_CULL_BACK").is_some()
+            || std::env::var_os("RUSTUDIO_CULL_SWITCH").is_some_and(|p| std::path::Path::new(&p).exists());
         let scene_gen = self.static_gen.wrapping_add(if diagnostic_back { 1u64 << 63 } else { 0 });
         static GRASS_SHADOWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let grass_shadows = *GRASS_SHADOWS.get_or_init(|| std::env::var_os("RUSTUDIO_NO_GRASS_SHADOW").is_none());
-        let sun_due = if frame.shadows {
-            self.sun.upload(queue, &frame.sun_cascades);
-            self.sun.plan(&frame.sun_cascades, scene_gen, !opaque_runs.is_empty() || !self.terrain_grass.is_empty())
+        if self.last_cascades != Some(active_cascades) {
+            self.sun.clear_atlas(ctx);
+            self.last_cascades = Some(active_cascades);
+        }
+        let sun_due = if shadows_on && active_cascades > 0 {
+            self.sun.upload(ctx, &frame.sun_cascades);
+            self.sun.plan(
+                &frame.sun_cascades,
+                scene_gen,
+                !opaque_runs.is_empty() || !self.terrain_grass.is_empty(),
+            )
         } else {
             self.sun.forget();
             [false; crate::sun_shadow::CASCADES]
         };
 
         let target = self.target.as_ref()?;
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("viewport"),
-        });
-        crate::gpu_timing::begin(device, queue, &mut encoder);
+        let msaa = target.samples > 1;
+        let part_stride = std::mem::size_of::<Vertex>() as u32;
+        let inst_stride = std::mem::size_of::<InstanceRaw>() as u32;
+        let terrain_stride = std::mem::size_of::<crate::terrain::TerrainVertex>() as u32;
+        let line_stride = std::mem::size_of::<LineVertex>() as u32;
+
+        crate::gpu_timing::begin(device, ctx);
         // Skinned parts' vertices for this frame, before anything draws them.
-        self.skin.encode(&mut encoder);
-        crate::gpu_timing::mark(&mut encoder, "gpu: skinning");
-        match frame.clouds.as_ref().filter(|_| frame.sky) {
+        self.skin.encode(ctx);
+        crate::gpu_timing::mark(ctx, "gpu: skinning");
+
+        let clouds_active = self.quality.enable_clouds && frame.sky;
+        match frame.clouds.as_ref().filter(|_| clouds_active) {
             Some(look) => {
-                let clouds = self.clouds.get_or_insert_with(|| {
-                    crate::clouds::CloudsGpu::new(device, queue, &self.globals_layout, &shader_source(), HDR_FORMAT)
-                });
-                clouds.encode(device, queue, &mut encoder, &self.globals_bg, look, -frame.globals.sun_dir[1], target.size);
+                let clouds = self
+                    .clouds
+                    .get_or_insert_with(|| crate::clouds::CloudsGpu::new(device, ctx));
+                self.bind_scene_globals_with(ctx, &self.globals_cb);
+                clouds.encode(
+                    device,
+                    ctx,
+                    look,
+                    -globals.sun_dir[1],
+                    target.size,
+                    &target.depth_srv,
+                    msaa,
+                );
+                unbind_all_srvs(ctx);
+                unsafe { ctx.OMSetRenderTargets(None, None) };
             }
             None => {
                 if let Some(c) = self.clouds.as_mut() {
@@ -4022,13 +3362,13 @@ impl Renderer {
                 }
             }
         }
-        crate::gpu_timing::mark(&mut encoder, "gpu: clouds");
-        for (ci, cascade) in frame.sun_cascades.iter().enumerate() {
+        crate::gpu_timing::mark(ctx, "gpu: clouds");
+
+        // Sun shadow cascades (0..active_cascades).
+        for (ci, cascade) in frame.sun_cascades.iter().enumerate().take(active_cascades) {
             if !sun_due[ci] {
                 continue;
             }
-            // Casters: static opaque cells that can reach the cascade's box
-            // (trimmed like the view), plus this frame's moving opaque parts.
             let sp = frustum(cascade.caster_view_proj());
             let mut shadow_ranges: Vec<((usize, usize), u32, u32)> = Vec::new();
             for b in self.st.batches.iter().filter(|b| b.pass == Pass::Opaque) {
@@ -4046,89 +3386,129 @@ impl Renderer {
                     _ => shadow_ranges.push((b.key, b.start, b.start + n)),
                 }
             }
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("sun shadow cascade"),
-                    color_attachments: &[],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.shadow_view,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(1.0),
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                let side = cascade.tile.min(SHADOW_SIZE);
-                pass.set_viewport(0.0, 0.0, side as f32, side as f32, 0.0, 1.0);
-                pass.set_scissor_rect(0, 0, side, side);
-                pass.set_pipeline(&self.shadow);
-                pass.set_bind_group(0, &self.shadow_globals_bg, &[]);
-                self.sun.bind(&mut pass, ci);
-                let cast =
-                    |pass: &mut wgpu::RenderPass, key: (usize, usize), range: std::ops::Range<u32>| {
-                        if let Some(mesh) = self.meshes.get(key.0) {
-                            crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::SHADOW, 1, (mesh.count / 3) as u64 * (range.end - range.start) as u64);
-                            pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
-                            pass.draw(0..mesh.count, range);
-                        }
-                    };
-                pass.set_vertex_buffer(1, self.static_buf.slice(..));
-                for r in &shadow_ranges {
-                    cast(&mut pass, r.0, r.1..r.2);
-                }
-                pass.set_vertex_buffer(1, self.instance_buf.slice(..));
-                for r in &opaque_runs {
-                    cast(&mut pass, r.0, r.1..r.2);
-                }
-                if !self.terrain_chunks.is_empty() || !self.terrain_grass.is_empty() {
-                    // Grass remains two-sided, including in the opt-in solid
-                    // terrain BACK-culling attribution capture.
-                    pass.set_pipeline(&self.terrain_shadow);
-                    if let Some(dir) = std::env::var_os("RUSTUDIO_CULL_EXPORT") {
-                        let dir = std::path::PathBuf::from(dir);
-                        std::fs::create_dir_all(&dir).unwrap();
-                        let vp = cascade.view_proj();
-                        let mut clip = Vec::<[f32;4]>::new();
-                        let mut chunks = Vec::new();
-                        for (key,c) in &self.terrain_chunks {
-                            if box_visible(&sp,c.lo,c.hi) {
-                                chunks.push((*key,c.count));
-                                clip.extend(c.diagnostic_positions.iter().map(|p| (vp * Vec3::from(*p).extend(1.0)).to_array()));
-                            }
-                        }
-                        std::fs::write(dir.join(format!("cascade{ci}-clip.bin")),bytemuck::cast_slice(&clip)).unwrap();
-                        std::fs::write(dir.join(format!("cascade{ci}.json")),serde_json::to_vec_pretty(&serde_json::json!({"vp":vp.to_cols_array(),"tile":cascade.tile,"chunks":chunks,"vertices":clip.len()})).unwrap()).unwrap();
+
+            unbind_all_srvs(ctx);
+            let side = cascade.tile.min(SHADOW_SIZE);
+            unsafe {
+                ctx.ClearDepthStencilView(&self.shadow_dsv, D3D11_CLEAR_DEPTH.0 as u32, 1.0, 0);
+                ctx.OMSetRenderTargets(None, Some(&self.shadow_dsv));
+            }
+            crate::d3d11::set_viewport(ctx, 0.0, 0.0, side as f32, side as f32);
+            crate::d3d11::set_scissor(ctx, 0, 0, side as i32, side as i32);
+            unsafe {
+                ctx.IASetInputLayout(&self.il_part);
+                ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                ctx.VSSetShader(&self.vs_shadow, None);
+                ctx.PSSetShader(None, None);
+                ctx.VSSetConstantBuffers(0, Some(&[Some(self.globals_cb.clone())]));
+                ctx.PSSetConstantBuffers(0, Some(&[Some(self.globals_cb.clone())]));
+                ctx.RSSetState(&self.rs_scissor_none);
+                ctx.OMSetDepthStencilState(&self.ds_less_eq_rw, 0);
+                ctx.OMSetBlendState(&self.bs_no_color, Some(&[0.0; 4]), 0xFFFFFFFF);
+            }
+            self.sun.bind(ctx, ci);
+
+            let cast = |key: (usize, usize), inst: &ID3D11Buffer, range: std::ops::Range<u32>| {
+                if let Some(mesh) = self.meshes.get(key.0) {
+                    crate::runtime::domains::services::perf::draw(
+                        crate::runtime::domains::services::perf::SHADOW,
+                        1,
+                        (mesh.count / 3) as u64 * (range.end - range.start) as u64,
+                    );
+                    let vbs = [Some(mesh.vbuf.clone()), Some(inst.clone())];
+                    let strides = [part_stride, inst_stride];
+                    let offsets = [0u32, 0u32];
+                    unsafe {
+                        ctx.IASetVertexBuffers(0, 2, Some(vbs.as_ptr()), Some(strides.as_ptr()), Some(offsets.as_ptr()));
+                        ctx.DrawInstanced(mesh.count, range.end - range.start, 0, range.start);
                     }
-                    for (solid,c) in self.terrain_chunks.values().map(|c|(true,c)).chain(self.terrain_grass.values().filter(|_| grass_shadows).map(|c|(false,c))) {
-                        pass.set_pipeline(if solid && diagnostic_back { &self.terrain_shadow_back } else { &self.terrain_shadow });
+                }
+            };
+            for r in &shadow_ranges {
+                cast(r.0, &self.static_buf, r.1..r.2);
+            }
+            for r in &opaque_runs {
+                cast(r.0, &self.instance_buf, r.1..r.2);
+            }
+            if !self.terrain_chunks.is_empty() || !self.terrain_grass.is_empty() {
+                unsafe {
+                    ctx.IASetInputLayout(&self.il_terrain);
+                    ctx.VSSetShader(&self.vs_terrain_shadow, None);
+                }
+                if let Some(dir) = std::env::var_os("RUSTUDIO_CULL_EXPORT") {
+                    let dir = std::path::PathBuf::from(dir);
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let vp = cascade.view_proj();
+                    let mut clip = Vec::<[f32; 4]>::new();
+                    let mut chunks = Vec::new();
+                    for (key, c) in &self.terrain_chunks {
                         if box_visible(&sp, c.lo, c.hi) {
-                            crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::SHADOW, 1, (c.count / 3) as u64);
-                            pass.set_vertex_buffer(0, c.vbuf.slice(..));
-                            if c.grass_ranges.is_empty() { pass.draw(0..c.count, 0..1); }
-                        else { for range in &c.grass_ranges {
-                            let camera = Vec3::new(frame.globals.cam_pos[0], frame.globals.cam_pos[1], frame.globals.cam_pos[2]);
-                            pass.draw(range.start..range.start + range.count(camera), 0..1);
-                        }}
+                            chunks.push((*key, c.count));
+                            clip.extend(c.diagnostic_positions.iter().map(|p| (vp * Vec3::from(*p).extend(1.0)).to_array()));
+                        }
+                    }
+                    std::fs::write(dir.join(format!("cascade{ci}-clip.bin")), bytemuck::cast_slice(&clip)).unwrap();
+                    std::fs::write(
+                        dir.join(format!("cascade{ci}.json")),
+                        serde_json::to_vec_pretty(&serde_json::json!({
+                            "vp": vp.to_cols_array(),
+                            "tile": cascade.tile,
+                            "chunks": chunks,
+                            "vertices": clip.len()
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                }
+                for (solid, c) in self
+                    .terrain_chunks
+                    .values()
+                    .map(|c| (true, c))
+                    .chain(self.terrain_grass.values().filter(|_| grass_shadows).map(|c| (false, c)))
+                {
+                    unsafe {
+                        ctx.RSSetState(if solid && diagnostic_back {
+                            &self.rs_scissor_back
+                        } else {
+                            &self.rs_scissor_none
+                        });
+                    }
+                    if box_visible(&sp, c.lo, c.hi) {
+                        crate::runtime::domains::services::perf::draw(
+                            crate::runtime::domains::services::perf::SHADOW,
+                            1,
+                            (c.count / 3) as u64,
+                        );
+                        unsafe {
+                            ctx.IASetVertexBuffers(0, 1, Some(&Some(c.vbuf.clone())), Some(&terrain_stride), Some(&0));
+                            if c.grass_ranges.is_empty() {
+                                ctx.Draw(c.count, 0);
+                            } else {
+                                let camera = Vec3::new(
+                                    frame.globals.cam_pos[0],
+                                    frame.globals.cam_pos[1],
+                                    frame.globals.cam_pos[2],
+                                );
+                                for range in &c.grass_ranges {
+                                    ctx.Draw(range.count(camera), range.start);
+                                }
+                            }
                         }
                     }
                 }
             }
-            self.sun.blur(&mut encoder, cascade, ci);
+            unsafe { ctx.OMSetRenderTargets(None, None) };
+            self.sun.blur(ctx, cascade, ci);
         }
-        crate::gpu_timing::mark(&mut encoder, "gpu: sun shadows");
-        // Local light shadow maps (Studio's Future path): the lights the
-        // light list gave a slot (LightRaw.extra.w), each a cube of EVSM
-        // moments; redrawn only when those lights or the static scene change.
-        {
-            let slots: Vec<(usize, Vec3, f32)> = frame.lights[..n_lights]
+        crate::gpu_timing::mark(ctx, "gpu: sun shadows");
+
+        // Local light shadow maps (Studio's Future path).
+        if shadows_on && max_local_shadows > 0 {
+            let slots: Vec<(usize, Vec3, f32)> = lights_upload
                 .iter()
                 .filter(|l| l.extra[3] >= 0.0)
                 .map(|l| (l.extra[3] as usize, Vec3::new(l.pos_range[0], l.pos_range[1], l.pos_range[2]), l.pos_range[3]))
-                .filter(|s| s.0 < crate::mech::LSHADOW_MAX_LIGHTS)
+                .filter(|s| s.0 < max_local_shadows)
                 .collect();
             let key = {
                 use std::hash::{Hash, Hasher};
@@ -4145,54 +3525,42 @@ impl Renderer {
                 self.lshadow.key = Some(key);
                 let n = crate::mech::LSHADOW_MAX_LIGHTS;
                 let mut slot_data = vec![0f32; n * 100];
-                let mut face_data = vec![0u8; n * 6 * LSHADOW_FACE_STRIDE as usize];
                 for (slot, pos, range) in &slots {
                     let inv = 1.0 / range.max(1e-3);
-                    for (f, (vp, axis)) in LightShadows::faces(*pos, *range).iter().enumerate() {
+                    for (f, (vp, _)) in LightShadows::faces(*pos, *range).iter().enumerate() {
                         slot_data[slot * 100 + f * 16..slot * 100 + f * 16 + 16].copy_from_slice(&vp.to_cols_array());
-                        let mut u = [0f32; 24];
-                        u[..16].copy_from_slice(&vp.to_cols_array());
-                        u[16..20].copy_from_slice(&[pos.x, pos.y, pos.z, inv]);
-                        u[20..24].copy_from_slice(&[axis.x, axis.y, axis.z, 0.0]);
-                        let o = (slot * 6 + f) * LSHADOW_FACE_STRIDE as usize;
-                        face_data[o..o + 96].copy_from_slice(bytemuck::cast_slice(&u));
                     }
                     slot_data[slot * 100 + 96..slot * 100 + 100].copy_from_slice(&[pos.x, pos.y, pos.z, inv]);
                 }
-                queue.write_buffer(&self.lshadow.slots_buf, 0, bytemuck::cast_slice(&slot_data));
-                queue.write_buffer(&self.lshadow.face_buf, 0, &face_data);
-                let far_p = crate::mech::EVSM_POS_EXP.exp() as f64;
-                let far_n = -(-crate::mech::EVSM_NEG_EXP).exp() as f64;
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("light shadows"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &self.lshadow.moments_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color { r: far_p, g: far_p * far_p, b: far_n, a: far_n * far_n }),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.lshadow.depth_view,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(1.0),
-                            store: wgpu::StoreOp::Discard,
-                        }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(&self.lshadow_pipe);
-                pass.set_bind_group(0, &self.shadow_globals_bg, &[]);
-                pass.set_vertex_buffer(1, self.static_buf.slice(..));
+                crate::d3d11::update_dynamic(ctx, &self.lshadow.slots_buf, bytemuck::cast_slice(&slot_data));
+
+                let far_p = crate::mech::EVSM_POS_EXP.exp();
+                let far_n = -(-crate::mech::EVSM_NEG_EXP).exp();
+                let clear_col = [far_p, far_p * far_p, far_n, far_n * far_n];
+                unbind_all_srvs(ctx);
+                unsafe {
+                    ctx.ClearRenderTargetView(&self.lshadow.moments_rtv, &clear_col);
+                    ctx.ClearDepthStencilView(&self.lshadow.depth_dsv, D3D11_CLEAR_DEPTH.0 as u32, 1.0, 0);
+                    ctx.OMSetRenderTargets(
+                        Some(&[Some(self.lshadow.moments_rtv.clone())]),
+                        Some(&self.lshadow.depth_dsv),
+                    );
+                    ctx.IASetInputLayout(&self.il_part);
+                    ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    ctx.VSSetShader(&self.vs_light_shadow, None);
+                    ctx.PSSetShader(&self.ps_light_shadow, None);
+                    ctx.VSSetConstantBuffers(0, Some(&[Some(self.globals_cb.clone())]));
+                    ctx.PSSetConstantBuffers(0, Some(&[Some(self.globals_cb.clone())]));
+                    ctx.VSSetConstantBuffers(2, Some(&[Some(self.lshadow.face_cb.clone())]));
+                    ctx.PSSetConstantBuffers(2, Some(&[Some(self.lshadow.face_cb.clone())]));
+                    ctx.RSSetState(&self.rs_scissor_none);
+                    ctx.OMSetDepthStencilState(&self.ds_less_eq_rw, 0);
+                    ctx.OMSetBlendState(&self.bs_opaque, Some(&[0.0; 4]), 0xFFFFFFFF);
+                }
+
                 let cols = crate::mech::LSHADOW_ATLAS / crate::mech::LSHADOW_FACE;
                 let face_px = crate::mech::LSHADOW_FACE;
                 for (slot, pos, range) in &slots {
-                    // The static cells the light reaches.
                     let near: Vec<&Batch> = self
                         .st
                         .batches
@@ -4200,51 +3568,53 @@ impl Renderer {
                         .filter(|b| b.pass == Pass::Opaque)
                         .filter(|b| (pos.clamp(b.lo, b.hi) - *pos).length_squared() <= range * range)
                         .collect();
-                    for f in 0..6u32 {
-                        let k = *slot as u32 * 6 + f;
+                    let inv = 1.0 / range.max(1e-3);
+                    for (f, (vp, axis)) in LightShadows::faces(*pos, *range).iter().enumerate() {
+                        let mut u = [0f32; 24];
+                        u[..16].copy_from_slice(&vp.to_cols_array());
+                        u[16..20].copy_from_slice(&[pos.x, pos.y, pos.z, inv]);
+                        u[20..24].copy_from_slice(&[axis.x, axis.y, axis.z, 0.0]);
+                        crate::d3d11::upload_cb(ctx, &self.lshadow.face_cb, &u);
+                        let k = *slot as u32 * 6 + f as u32;
                         let (x, y) = ((k % cols) * face_px, (k / cols) * face_px);
-                        pass.set_viewport(x as f32, y as f32, face_px as f32, face_px as f32, 0.0, 1.0);
-                        pass.set_scissor_rect(x, y, face_px, face_px);
-                        pass.set_bind_group(1, &self.lshadow.face_bg, &[k * LSHADOW_FACE_STRIDE as u32]);
+                        crate::d3d11::set_viewport(ctx, x as f32, y as f32, face_px as f32, face_px as f32);
+                        crate::d3d11::set_scissor(ctx, x as i32, y as i32, face_px as i32, face_px as i32);
                         for b in &near {
                             if let Some(mesh) = self.meshes.get(b.key.0) {
-                                crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::SHADOW, 1, (mesh.count / 3) as u64 * b.count as u64);
-                                pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
-                                pass.draw(0..mesh.count, b.start..b.start + b.count);
+                                crate::runtime::domains::services::perf::draw(
+                                    crate::runtime::domains::services::perf::SHADOW,
+                                    1,
+                                    (mesh.count / 3) as u64 * b.count as u64,
+                                );
+                                let vbs = [Some(mesh.vbuf.clone()), Some(self.static_buf.clone())];
+                                let strides = [part_stride, inst_stride];
+                                let offsets = [0u32, 0u32];
+                                unsafe {
+                                    ctx.IASetVertexBuffers(0, 2, Some(vbs.as_ptr()), Some(strides.as_ptr()), Some(offsets.as_ptr()));
+                                    ctx.DrawInstanced(mesh.count, b.count, 0, b.start);
+                                }
                             }
                         }
                     }
                 }
+                unsafe { ctx.OMSetRenderTargets(None, None) };
             }
         }
-        crate::gpu_timing::mark(&mut encoder, "gpu: light shadows");
-        // With terrain water in view the scene is drawn in three passes:
-        // the opaque scene; then (after copying its colour) the water,
-        // which looks through it; then decals and see-through parts.
+        crate::gpu_timing::mark(ctx, "gpu: light shadows");
+
         let has_glass = blended.iter().any(|e| (e.2.extra[0] as u32 & 7) == 3);
-        // See-through Neon blends against the opaque snapshot too
-        // (shader.wgsl neon_over_scene).
         let has_neon = blended.iter().any(|e| (e.2.extra[0] as u32 & 7) == 1);
         let split = !water_runs.is_empty() || has_glass || has_neon;
         let mut calls = 0usize;
-        // One instanced draw per run of (mesh, texture).
-        let draw = |pass: &mut wgpu::RenderPass,
-                    key: (usize, usize),
-                    range: std::ops::Range<u32>,
-                    calls: &mut usize| {
-            let Some(mesh) = self.meshes.get(key.0) else {
-                return;
-            };
-            pass.set_bind_group(1, self.textures.get(key.1).unwrap_or(&self.textures[0]), &[]);
-            pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
-            crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::SCENE, 1, (mesh.count / 3) as u64 * (range.end - range.start) as u64);
-            pass.draw(0..mesh.count, range);
-            *calls += 1;
+
+        let draw_part = |key: (usize, usize), inst: &ID3D11Buffer, range: std::ops::Range<u32>, calls: &mut usize| {
+            self.draw_part_run(ctx, key, inst, range);
+            if self.meshes.get(key.0).is_some() {
+                *calls += 1;
+            }
         };
-        // Scene environment probe work (env_probe.rs): Studio draws one cube
-        // face a frame at the probe box's centre (Studio; 90 degrees,
-        // far 3000), the opaque scene without the sky, then builds the
-        // pyramid and convolves mips 1 and 2.
+
+        // Scene environment probe work (env_probe.rs).
         if let Some(pf) = frame.probe.as_ref() {
             for task in &pf.tasks {
                 if let crate::env_probe::Task::Face(f) = *task {
@@ -4260,484 +3630,500 @@ impl Renderer {
                     pg.inv_view_proj = (ordinary.as_dmat4() * view_rel.as_dmat4()).inverse().as_mat4().to_cols_array_2d();
                     pg.cam_pos = [centre.x, centre.y, centre.z, globals.cam_pos[3]];
                     pg.env_spec[3] = 0.0;
-                    queue.write_buffer(&self.probe.globals_buf, 0, bytemuck::bytes_of(&pg));
+                    crate::d3d11::update_dynamic(ctx, &self.probe.globals_cb, bytemuck::bytes_of(&pg));
                     let face_planes = frustum(ordinary * view);
-                    {
-                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("env probe face"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &self.probe.face_msaa,
-                                depth_slice: None,
-                                resolve_target: Some(self.probe.face_resolve()),
-                                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Discard },
-                            })],
-                            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                                view: &self.probe.face_depth,
-                                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }),
-                                stencil_ops: None,
-                            }),
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                            multiview_mask: None,
-                        });
-                        pass.set_bind_group(0, &self.probe_globals_bg, &[]);
-                        pass.set_bind_group(2, &target.glass_bg, &[]);
-                        pass.set_vertex_buffer(1, self.static_buf.slice(..));
-                        for b in self.st.batches.iter().filter(|b| b.pass == Pass::Opaque) {
-                            if !box_visible(&face_planes, b.lo, b.hi) {
-                                continue;
-                            }
-                            pass.set_pipeline(if self.culls_back(b.key.0) { &self.opaque } else { &self.opaque_two_sided });
-                            draw(&mut pass, b.key, b.start..b.start + b.count, &mut calls);
+
+                    unbind_all_srvs(ctx);
+                    unsafe {
+                        ctx.ClearRenderTargetView(&self.probe.face_rtv, &[0.0; 4]);
+                        ctx.ClearDepthStencilView(&self.probe.face_dsv, D3D11_CLEAR_DEPTH.0 as u32, 0.0, 0);
+                        ctx.OMSetRenderTargets(
+                            Some(&[Some(self.probe.face_rtv.clone())]),
+                            Some(&self.probe.face_dsv),
+                        );
+                    }
+                    let ps = crate::env_probe::SIZE as f32;
+                    crate::d3d11::set_viewport(ctx, 0.0, 0.0, ps, ps);
+                    self.bind_scene_globals_with(ctx, &self.probe.globals_cb);
+                    unsafe {
+                        ctx.IASetInputLayout(&self.il_part);
+                        ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                        ctx.VSSetShader(&self.vs_part, None);
+                        ctx.PSSetShader(&self.ps_part, None);
+                        ctx.OMSetDepthStencilState(&self.ds_greater_rw, 0);
+                        ctx.OMSetBlendState(&self.bs_opaque, Some(&[0.0; 4]), 0xFFFFFFFF);
+                    }
+                    for b in self.st.batches.iter().filter(|b| b.pass == Pass::Opaque) {
+                        if !box_visible(&face_planes, b.lo, b.hi) {
+                            continue;
                         }
-                        pass.set_vertex_buffer(1, self.instance_buf.slice(..));
-                        for r in &opaque_runs {
-                            pass.set_pipeline(if self.culls_back(r.0.0) { &self.opaque } else { &self.opaque_two_sided });
-                            draw(&mut pass, r.0, r.1..r.2, &mut calls);
+                        unsafe {
+                            ctx.RSSetState(if self.culls_back(b.key.0) { &self.rs_cull_back } else { &self.rs_cull_none });
                         }
-                        if !self.terrain_chunks.is_empty() {
-                            pass.set_pipeline(&self.terrain);
-                            pass.set_bind_group(1, &self.terrain_bg, &[]);
-                            for c in self.terrain_chunks.values() {
-                                if box_visible(&face_planes, c.lo, c.hi) {
-                                    pass.set_vertex_buffer(0, c.vbuf.slice(..));
-                                    pass.draw(0..c.count, 0..1);
+                        draw_part(b.key, &self.static_buf, b.start..b.start + b.count, &mut calls);
+                    }
+                    for r in &opaque_runs {
+                        unsafe {
+                            ctx.RSSetState(if self.culls_back(r.0 .0) { &self.rs_cull_back } else { &self.rs_cull_none });
+                        }
+                        draw_part(r.0, &self.instance_buf, r.1..r.2, &mut calls);
+                    }
+                    if !self.terrain_chunks.is_empty() {
+                        unsafe {
+                            ctx.IASetInputLayout(&self.il_terrain);
+                            ctx.VSSetShader(&self.vs_terrain, None);
+                            ctx.PSSetShader(&self.ps_terrain, None);
+                            ctx.VSSetConstantBuffers(2, Some(&[Some(self.terrain_params_cb.clone())]));
+                            ctx.PSSetConstantBuffers(2, Some(&[Some(self.terrain_params_cb.clone())]));
+                            ctx.RSSetState(&self.rs_cull_back);
+                        }
+                        for c in self.terrain_chunks.values() {
+                            if box_visible(&face_planes, c.lo, c.hi) {
+                                unsafe {
+                                    ctx.IASetVertexBuffers(0, 1, Some(&Some(c.vbuf.clone())), Some(&terrain_stride), Some(&0));
+                                    ctx.Draw(c.count, 0);
                                 }
                             }
                         }
                     }
-                    self.probe.store_face(device, &mut encoder, f);
+                    unsafe { ctx.OMSetRenderTargets(None, None) };
+                    unbind_all_srvs(ctx);
+                    self.probe.store_face(ctx, f);
                 } else {
-                    self.probe.encode(device, &mut encoder, *task);
+                    unbind_all_srvs(ctx);
+                    unsafe { ctx.OMSetRenderTargets(None, None) };
+                    self.probe.encode(ctx, *task);
                 }
             }
         }
-        crate::gpu_timing::mark(&mut encoder, "gpu: env probe");
-        // Decals, then see-through parts back to front, then the hover overlay.
-        let linear_pipes = SeePipes {
-            transparent: self.transparent.clone(),
-            transparent_culled: self.transparent_culled.clone(),
-            glass: self.glass.clone(),
-            glass_culled: self.glass_culled.clone(),
-            overlay: self.overlay.clone(),
-        };
-        // Studio's encoded blend (SeeThrough), when anything blends this frame.
+        crate::gpu_timing::mark(ctx, "gpu: env probe");
+
         let encoded = !self.see.linear
             && (!surface_decal_runs.is_empty()
                 || !decal_runs.is_empty()
                 || !blend_runs.is_empty()
                 || !overlay_runs.is_empty()
                 || static_ranges.iter().any(|r| r.0 == Pass::Decal));
-        let pipes = if encoded { &self.see_pipes } else { &linear_pipes };
-        let surface_decals = |pass: &mut wgpu::RenderPass, calls: &mut usize| {
+
+        let draw_surface_decals = |calls: &mut usize| {
             if !surface_decal_runs.is_empty() {
-                pass.set_pipeline(&pipes.transparent);
-                pass.set_vertex_buffer(1, self.instance_buf.slice(..));
+                self.bind_see_pipe(ctx, SeePipeKind::Transparent, encoded);
                 for r in &surface_decal_runs {
-                    draw(pass, r.0, r.1..r.2, calls);
+                    draw_part(r.0, &self.instance_buf, r.1..r.2, calls);
                 }
-                pass.set_bind_group(1, &self.textures[0], &[]);
             }
         };
-        let see_through = |pass: &mut wgpu::RenderPass, calls: &mut usize| {
-            pass.set_bind_group(2, &target.glass_bg, &[]);
-            pass.set_pipeline(&pipes.transparent);
-            pass.set_vertex_buffer(1, self.static_buf.slice(..));
+        let draw_see_through = |glass_ready: bool, calls: &mut usize| {
+            let glass_srvs = if glass_ready {
+                [Some(target.scene_copy_srv.clone()), Some(target.glass_depth_srv.clone())]
+            } else {
+                [Some(self.black_srv.clone()), Some(self.black_srv.clone())]
+            };
+            unsafe { ctx.PSSetShaderResources(19, Some(&glass_srvs)) };
+            self.bind_see_pipe(ctx, SeePipeKind::Transparent, encoded);
             for r in static_ranges.iter().filter(|r| r.0 == Pass::Decal) {
-                draw(pass, r.1, r.2..r.3, calls);
+                draw_part(r.1, &self.static_buf, r.2..r.3, calls);
             }
-            pass.set_vertex_buffer(1, self.instance_buf.slice(..));
             for r in &decal_runs {
-                draw(pass, r.0, r.1..r.2, calls);
+                draw_part(r.0, &self.instance_buf, r.1..r.2, calls);
             }
             for r in &blend_runs {
-                pass.set_pipeline(if r.1 < glass_end {
-                    if self.culls_back(r.0 .0) { &pipes.glass_culled } else { &pipes.glass }
+                let kind = if r.1 < glass_end {
+                    if self.culls_back(r.0 .0) { SeePipeKind::GlassCulled } else { SeePipeKind::Glass }
                 } else if self.culls_back(r.0 .0) {
-                    &pipes.transparent_culled
+                    SeePipeKind::TransparentCulled
                 } else {
-                    &pipes.transparent
-                });
-                draw(pass, r.0, r.1..r.2, calls);
+                    SeePipeKind::Transparent
+                };
+                self.bind_see_pipe(ctx, kind, encoded);
+                draw_part(r.0, &self.instance_buf, r.1..r.2, calls);
             }
             if !overlay_runs.is_empty() {
-                pass.set_pipeline(&pipes.overlay);
+                self.bind_see_pipe(ctx, SeePipeKind::Overlay, encoded);
                 for r in &overlay_runs {
-                    draw(pass, r.0, r.1..r.2, calls);
+                    draw_part(r.0, &self.instance_buf, r.1..r.2, calls);
                 }
             }
         };
-        let scene_pass = |encoder: &mut wgpu::CommandEncoder, label: &str, first: bool, last: bool| {
-            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(label),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target.msaa,
-                    depth_slice: None,
-                    resolve_target: Some(&target.hdr_view),
-                    ops: wgpu::Operations {
-                        load: if first { wgpu::LoadOp::Clear(wgpu::Color::BLACK) } else { wgpu::LoadOp::Load },
-                        store: if last { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store },
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &target.depth,
-                    depth_ops: Some(wgpu::Operations {
-                        load: if first { wgpu::LoadOp::Clear(0.0) } else { wgpu::LoadOp::Load },
-                        // Kept: the world GUI pass tests against it (round 23).
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            })
-            .forget_lifetime()
-        };
-        // The see-through encoding: the MSAA scene copied in (per sample),
-        // then a pass drawing into it with the scene's depth.
-        let see_begin = |encoder: &mut wgpu::CommandEncoder| {
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("see-through encode"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &target.see,
-                        depth_slice: None,
-                        resolve_target: None,
-                        // (not cleared: only the tiles written below are
-                        // drawn into and decoded, SeeBounds)
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(&self.see.encode);
-                pass.set_bind_group(0, &self.globals_bg, &[]);
-                pass.set_bind_group(1, &target.see_encode_bg, &[]);
-                for &[x, y, w, h] in &see_rects {
-                    pass.set_scissor_rect(x, y, w, h);
-                    pass.draw(0..3, 0..1);
-                }
-            }
-            crate::gpu_timing::mark(encoder, "gpu: see-through encode (bounded)");
-            let mut pass = encoder
-                .begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("see-through"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &target.see,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                    })],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &target.depth,
-                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                })
-                .forget_lifetime();
-            pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(2, &target.glass_bg, &[]);
-            pass
-        };
-        // ... and the covered pixels decoded back into the scene (resolved);
-        // the pass stays open for the editor's lines.
-        let see_end = |encoder: &mut wgpu::CommandEncoder, last: bool| {
-            let mut pass = scene_pass(encoder, "see-through decode", false, last);
-            pass.set_pipeline(&self.see.decode);
-            pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(1, &target.see_decode_bg, &[]);
-            for &[x, y, w, h] in &see_rects {
-                pass.set_scissor_rect(x, y, w, h);
-                pass.draw(0..3, 0..1);
-            }
-            // (the editor's lines follow over the whole view)
-            pass.set_scissor_rect(0, 0, target.size[0], target.size[1]);
-            pass
-        };
-        let lines = |pass: &mut wgpu::RenderPass| {
+        let draw_lines = || {
             if !frame.lines.is_empty() {
-                pass.set_bind_group(0, &self.globals_bg, &[]);
-                pass.set_bind_group(1, &self.textures[0], &[]);
-                pass.set_pipeline(&self.lines);
-                pass.set_vertex_buffer(0, self.line_buf.slice(..));
-                pass.draw(0..frame.lines.len() as u32, 0..1);
+                crate::d3d11::set_scissor(ctx, 0, 0, target.size[0] as i32, target.size[1] as i32);
+                unsafe {
+                    ctx.IASetInputLayout(&self.il_line);
+                    ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+                    ctx.VSSetShader(&self.vs_line, None);
+                    ctx.PSSetShader(&self.ps_line, None);
+                    ctx.RSSetState(&self.rs_cull_none);
+                    ctx.OMSetDepthStencilState(&self.ds_gequal_ro, 0);
+                    ctx.OMSetBlendState(&self.bs_alpha, Some(&[0.0; 4]), 0xFFFFFFFF);
+                    ctx.IASetVertexBuffers(0, 1, Some(&Some(self.line_buf.clone())), Some(&line_stride), Some(&0));
+                    ctx.Draw(frame.lines.len() as u32, 0);
+                }
             }
         };
-        {
-            let mut pass = scene_pass(&mut encoder, "viewport", true, !split && !encoded);
-            pass.set_bind_group(2, &target.glass_bg, &[]);
-            pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(1, &self.textures[0], &[]);
-            if frame.sky {
-                pass.set_pipeline(&self.sky);
-                pass.draw(0..3, 0..1);
+        let run_see_encode = || {
+            crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
+            unsafe { ctx.OMSetRenderTargets(None, None) };
+            self.bind_scene_globals_with(ctx, &self.globals_cb);
+            unsafe { ctx.OMSetRenderTargets(Some(&[Some(target.see_rtv.clone())]), None) };
+            crate::d3d11::set_viewport(ctx, 0.0, 0.0, target.size[0] as f32, target.size[1] as f32);
+            unsafe {
+                ctx.IASetInputLayout(None);
+                ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                ctx.VSSetShader(&self.vs_post, None);
+                ctx.PSSetShader(self.see.encode.get(msaa), None);
+                ctx.PSSetShaderResources(18, Some(&[Some(target.msaa_srv.clone())]));
+                ctx.RSSetState(&self.rs_scissor_none);
+                ctx.OMSetDepthStencilState(&self.ds_none, 0);
+                ctx.OMSetBlendState(&self.bs_opaque, Some(&[0.0; 4]), 0xFFFFFFFF);
             }
+            for &[x, y, w, h] in &see_rects {
+                crate::d3d11::set_scissor(ctx, x as i32, y as i32, w as i32, h as i32);
+                unsafe { ctx.Draw(3, 0) };
+            }
+            crate::gpu_timing::mark(ctx, "gpu: see-through encode (bounded)");
+            crate::d3d11::unbind_ps_srvs(ctx, 18, 1);
+            unsafe { ctx.OMSetRenderTargets(Some(&[Some(target.see_rtv.clone())]), Some(&target.depth_dsv)) };
+            crate::d3d11::set_viewport(ctx, 0.0, 0.0, target.size[0] as f32, target.size[1] as f32);
+        };
+        let run_see_decode = |with_lines: bool| {
+            crate::gpu_timing::mark(ctx, "gpu: see-through draws");
+            crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
+            unsafe { ctx.OMSetRenderTargets(None, None) };
+            unsafe { ctx.OMSetRenderTargets(Some(&[Some(target.msaa_rtv.clone())]), Some(&target.depth_dsv)) };
+            crate::d3d11::set_viewport(ctx, 0.0, 0.0, target.size[0] as f32, target.size[1] as f32);
+            unsafe {
+                ctx.IASetInputLayout(None);
+                ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                ctx.VSSetShader(&self.vs_post, None);
+                ctx.PSSetShader(self.see.decode.get(msaa), None);
+                ctx.PSSetShaderResources(18, Some(&[Some(target.see_srv.clone())]));
+                ctx.RSSetState(&self.rs_scissor_none);
+                ctx.OMSetDepthStencilState(&self.ds_always_ro, 0);
+                ctx.OMSetBlendState(&self.bs_opaque, Some(&[0.0; 4]), 0xFFFFFFFF);
+            }
+            for &[x, y, w, h] in &see_rects {
+                crate::d3d11::set_scissor(ctx, x as i32, y as i32, w as i32, h as i32);
+                unsafe { ctx.Draw(3, 0) };
+            }
+            crate::d3d11::unbind_ps_srvs(ctx, 18, 1);
+            if with_lines {
+                draw_lines();
+            }
+            self.resolve_msaa(ctx, target);
+            crate::gpu_timing::mark(ctx, "gpu: see-through decode (bounded)");
+        };
 
-            // Loaded meshes are two-sided unless mesh_cull_slot culls them
-            // (file meshes, unless a MeshPart is DoubleSided: as Studio).
-            let opaque_pipe = |key: (usize, usize)| {
-                if self.culls_back(key.0) {
-                    &self.opaque
-                } else {
-                    &self.opaque_two_sided
-                }
-            };
+        // Initial viewport pass: sky, opaque parts, decal depth, terrain & grass.
+        unbind_all_srvs(ctx);
+        self.bind_scene_globals_with(ctx, &self.globals_cb);
+        unsafe {
+            ctx.ClearRenderTargetView(&target.msaa_rtv, &[0.0; 4]);
+            ctx.ClearDepthStencilView(&target.depth_dsv, D3D11_CLEAR_DEPTH.0 as u32, 0.0, 0);
+            ctx.OMSetRenderTargets(Some(&[Some(target.msaa_rtv.clone())]), Some(&target.depth_dsv));
+        }
+        crate::d3d11::set_viewport(ctx, 0.0, 0.0, target.size[0] as f32, target.size[1] as f32);
 
-            pass.set_vertex_buffer(1, self.static_buf.slice(..));
-            for r in static_ranges.iter().filter(|r| r.0 == Pass::Opaque) {
-                pass.set_pipeline(opaque_pipe(r.1));
-                draw(&mut pass, r.1, r.2..r.3, &mut calls);
+        if frame.sky {
+            unsafe {
+                ctx.IASetInputLayout(None);
+                ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                ctx.VSSetShader(&self.vs_sky, None);
+                ctx.PSSetShader(&self.ps_sky, None);
+                ctx.RSSetState(&self.rs_cull_none);
+                ctx.OMSetDepthStencilState(&self.ds_none, 0);
+                ctx.OMSetBlendState(&self.bs_opaque, Some(&[0.0; 4]), 0xFFFFFFFF);
+                ctx.Draw(3, 0);
             }
-            pass.set_vertex_buffer(1, self.instance_buf.slice(..));
-            for r in &opaque_runs {
-                pass.set_pipeline(opaque_pipe(r.0));
-                draw(&mut pass, r.0, r.1..r.2, &mut calls);
+        }
+
+        // Opaque parts (back-culled or two-sided).
+        unsafe {
+            ctx.IASetInputLayout(&self.il_part);
+            ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx.VSSetShader(&self.vs_part, None);
+            ctx.PSSetShader(&self.ps_part, None);
+            ctx.PSSetSamplers(3, Some(&[Some(self.sampler.clone())]));
+            ctx.OMSetDepthStencilState(&self.ds_greater_rw, 0);
+            ctx.OMSetBlendState(&self.bs_opaque, Some(&[0.0; 4]), 0xFFFFFFFF);
+        }
+        for r in static_ranges.iter().filter(|r| r.0 == Pass::Opaque) {
+            unsafe {
+                ctx.RSSetState(if self.culls_back(r.1 .0) { &self.rs_cull_back } else { &self.rs_cull_none });
             }
-            // Only opaque authored decal texels contribute scene depth. The
-            // shader rejects other blended materials and fractional coverage;
-            // the invisible host never enters this pass. Keep the ordinary
-            // sorted color pass for layer order and semitransparent edges.
-            pass.set_pipeline(&self.decal_depth);
+            draw_part(r.1, &self.static_buf, r.2..r.3, &mut calls);
+        }
+        for r in &opaque_runs {
+            unsafe {
+                ctx.RSSetState(if self.culls_back(r.0 .0) { &self.rs_cull_back } else { &self.rs_cull_none });
+            }
+            draw_part(r.0, &self.instance_buf, r.1..r.2, &mut calls);
+        }
+
+        // Decal opaque texel depth.
+        if !surface_decal_runs.is_empty() || !blend_runs.is_empty() {
+            unsafe {
+                ctx.PSSetShader(&self.ps_decal_depth, None);
+                ctx.RSSetState(&self.rs_cull_none);
+                ctx.OMSetDepthStencilState(&self.ds_greater_rw, 0);
+                ctx.OMSetBlendState(&self.bs_no_color, Some(&[0.0; 4]), 0xFFFFFFFF);
+            }
             for r in surface_decal_runs.iter().chain(&blend_runs) {
-                draw(&mut pass, r.0, r.1..r.2, &mut calls);
+                draw_part(r.0, &self.instance_buf, r.1..r.2, &mut calls);
             }
-            // Terrain chunks in view.
-            if !self.terrain_chunks.is_empty() {
-                pass.set_pipeline(&self.terrain);
-                pass.set_bind_group(1, &self.terrain_bg, &[]);
-                for c in self.terrain_chunks.values().chain(self.terrain_grass.values()) {
-                    if box_visible(&planes, c.lo, c.hi) {
-                        crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::SCENE, 1, (c.count / 3) as u64);
-                        pass.set_vertex_buffer(0, c.vbuf.slice(..));
-                        if c.grass_ranges.is_empty() { pass.draw(0..c.count, 0..1); }
-                        else { for range in &c.grass_ranges {
-                            let camera = Vec3::new(frame.globals.cam_pos[0], frame.globals.cam_pos[1], frame.globals.cam_pos[2]);
-                            pass.draw(range.start..range.start + range.count(camera), 0..1);
-                        }}
+        }
+
+        // Terrain chunks + decoration grass in view.
+        if !self.terrain_chunks.is_empty() || !self.terrain_grass.is_empty() {
+            unsafe {
+                ctx.IASetInputLayout(&self.il_terrain);
+                ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                ctx.VSSetShader(&self.vs_terrain, None);
+                ctx.PSSetShader(&self.ps_terrain, None);
+                ctx.VSSetConstantBuffers(2, Some(&[Some(self.terrain_params_cb.clone())]));
+                ctx.PSSetConstantBuffers(2, Some(&[Some(self.terrain_params_cb.clone())]));
+                ctx.RSSetState(&self.rs_cull_back);
+                ctx.OMSetDepthStencilState(&self.ds_greater_rw, 0);
+                ctx.OMSetBlendState(&self.bs_opaque, Some(&[0.0; 4]), 0xFFFFFFFF);
+            }
+            for c in self.terrain_chunks.values().chain(self.terrain_grass.values()) {
+                if box_visible(&planes, c.lo, c.hi) {
+                    crate::runtime::domains::services::perf::draw(
+                        crate::runtime::domains::services::perf::SCENE,
+                        1,
+                        (c.count / 3) as u64,
+                    );
+                    unsafe {
+                        ctx.IASetVertexBuffers(0, 1, Some(&Some(c.vbuf.clone())), Some(&terrain_stride), Some(&0));
+                        if c.grass_ranges.is_empty() {
+                            ctx.Draw(c.count, 0);
+                        } else {
+                            let camera = Vec3::new(
+                                frame.globals.cam_pos[0],
+                                frame.globals.cam_pos[1],
+                                frame.globals.cam_pos[2],
+                            );
+                            for range in &c.grass_ranges {
+                                ctx.Draw(range.count(camera), range.start);
+                            }
+                        }
                     }
                 }
-                pass.set_bind_group(1, &self.textures[0], &[]);
-            }
-            if !encoded {
-                surface_decals(&mut pass, &mut calls);
-                lines(&mut pass);
-                if !split {
-                    see_through(&mut pass, &mut calls);
-                }
             }
         }
-        crate::gpu_timing::mark(&mut encoder, "gpu: scene (opaque, terrain, unencoded blends)");
-        // Decals on solid hosts belong to the surface: before terrain water
-        // and glass read the scene.
+
+        if !encoded {
+            draw_surface_decals(&mut calls);
+            draw_lines();
+            if !split {
+                draw_see_through(false, &mut calls);
+            }
+        }
+        unsafe { ctx.OMSetRenderTargets(None, None) };
+        if split || !encoded {
+            self.resolve_msaa(ctx, target);
+        }
+        crate::gpu_timing::mark(ctx, "gpu: scene (opaque, terrain, unencoded blends)");
+
         if encoded && split && !surface_decal_runs.is_empty() {
-            let mut pass = see_begin(&mut encoder);
-            surface_decals(&mut pass, &mut calls);
-            drop(pass);
-            crate::gpu_timing::mark(&mut encoder, "gpu: see-through draws");
-            drop(see_end(&mut encoder, false));
-            crate::gpu_timing::mark(&mut encoder, "gpu: see-through decode (bounded)");
+            run_see_encode();
+            draw_surface_decals(&mut calls);
+            run_see_decode(false);
         }
+
+        let mut glass_depth_ran = false;
         if split {
-            let u = self.water.uniforms(&frame.water, target.size);
-            queue.write_buffer(&self.water.buf, 0, bytemuck::bytes_of(&u));
-            encoder.copy_texture_to_texture(
-                target.hdr.as_image_copy(),
-                target.scene_copy.as_image_copy(),
-                wgpu::Extent3d {
-                    width: target.size[0],
-                    height: target.size[1],
-                    depth_or_array_layers: 1,
-                },
-            );
-            if !water_runs.is_empty() {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("water"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &target.msaa,
-                        depth_slice: None,
-                        resolve_target: Some(&target.hdr_view),
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &target.water_depth,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(0.0),
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(&self.water.pipeline);
-                pass.set_bind_group(0, &self.globals_bg, &[]);
-                pass.set_bind_group(2, &target.water_bg, &[]);
-                pass.set_vertex_buffer(1, self.instance_buf.slice(..));
-                for r in &water_runs {
-                    draw(&mut pass, r.0, r.1..r.2, &mut calls);
-                }
+            crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
+            unsafe {
+                ctx.OMSetRenderTargets(None, None);
+                ctx.CopyResource(&target.scene_copy_tex, &target.hdr_tex);
             }
-            // A separate immutable snapshot prevents sampling an active depth attachment.
+            if !water_runs.is_empty() {
+                let u = self.water.uniforms(&frame.water, target.size);
+                self.water.upload(ctx, &u);
+                unsafe {
+                    ctx.ClearDepthStencilView(&target.water_depth_dsv, D3D11_CLEAR_DEPTH.0 as u32, 0.0, 0);
+                    ctx.OMSetRenderTargets(
+                        Some(&[Some(target.msaa_rtv.clone())]),
+                        Some(&target.water_depth_dsv),
+                    );
+                }
+                crate::d3d11::set_viewport(ctx, 0.0, 0.0, target.size[0] as f32, target.size[1] as f32);
+                self.bind_scene_globals_with(ctx, &self.globals_cb);
+                unsafe {
+                    ctx.IASetInputLayout(&self.il_part);
+                    ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    ctx.PSSetSamplers(3, Some(&[Some(self.sampler.clone())]));
+                }
+                self.water.bind(ctx, &target.scene_copy_srv, &target.depth_srv, msaa);
+                for r in &water_runs {
+                    draw_part(r.0, &self.instance_buf, r.1..r.2, &mut calls);
+                }
+                crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
+                self.resolve_msaa(ctx, target);
+            }
             if has_glass {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("glass depth snapshot"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &target.glass_depth,
-                        depth_slice: None, resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
-                    depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
-                });
-                pass.set_pipeline(&self.glass_resolve);
-                pass.set_bind_group(0, &self.globals_bg, &[]);
-                pass.set_bind_group(1, &target.ssao_bgs[0], &[]);
-                pass.draw(0..3, 0..1);
+                self.resolve_glass_depth(ctx, target);
+                glass_depth_ran = true;
             }
             if !encoded {
-                let mut pass = scene_pass(&mut encoder, "see-through", false, true);
-                pass.set_bind_group(0, &self.globals_bg, &[]);
-                see_through(&mut pass, &mut calls);
+                self.bind_scene_globals_with(ctx, &self.globals_cb);
+                unsafe {
+                    ctx.OMSetRenderTargets(
+                        Some(&[Some(target.msaa_rtv.clone())]),
+                        Some(&target.depth_dsv),
+                    );
+                }
+                crate::d3d11::set_viewport(ctx, 0.0, 0.0, target.size[0] as f32, target.size[1] as f32);
+                draw_see_through(has_glass, &mut calls);
+                crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
+                self.resolve_msaa(ctx, target);
             }
         }
         if encoded {
-            let mut pass = see_begin(&mut encoder);
+            run_see_encode();
             if !split {
-                surface_decals(&mut pass, &mut calls);
+                draw_surface_decals(&mut calls);
             }
-            see_through(&mut pass, &mut calls);
-            drop(pass);
-            crate::gpu_timing::mark(&mut encoder, "gpu: see-through draws");
-            let mut pass = see_end(&mut encoder, true);
-            lines(&mut pass);
-            drop(pass);
-            crate::gpu_timing::mark(&mut encoder, "gpu: see-through decode (bounded)");
+            draw_see_through(has_glass, &mut calls);
+            run_see_decode(true);
         }
-        // (only when something ran: an empty span would still read a few
-        // nanoseconds of "see-through" in frames without any)
         if split || encoded {
-            crate::gpu_timing::mark(&mut encoder, "gpu: water, glass, split see-through");
+            crate::gpu_timing::mark(ctx, "gpu: water, glass, split see-through");
         }
         stats.draw_calls = calls;
-        // Scene colour snapshot (water/glass reads are complete).
-        encoder.copy_texture_to_texture(target.hdr.as_image_copy(), target.scene_copy.as_image_copy(),
-            wgpu::Extent3d { width: target.size[0], height: target.size[1], depth_or_array_layers: 1 });
-        crate::gpu_timing::mark(&mut encoder, "gpu: scene copy");
-        // Bloom: bright pass, blur across, blur down (half resolution).
-        // SSAO, then its multiply into the scene.
-        {
-            let steps: [(&str, &wgpu::RenderPipeline, usize, &wgpu::TextureView, bool); 5] = [
-                ("ssao depth", &self.ssao_down, 0, &target.ssao_depth_view, true),
-                ("ssao", &self.ssao_main, 1, &target.ssao_views[0], true),
-                ("ssao blur across", &self.ssao_blur_x, 2, &target.ssao_views[1], true),
-                ("ssao blur down", &self.ssao_blur_y, 3, &target.ssao_views[0], true),
-                ("ssao apply", &self.ssao_apply, 2, &target.hdr_view, false),
-            ];
-            for (label, pipeline, bg, view, clear) in steps {
-                if label == "ssao apply" && (std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_NO_AO").is_some() || std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_ID").is_some()) { continue; }
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some(label),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: if clear { wgpu::LoadOp::Clear(wgpu::Color::WHITE) } else { wgpu::LoadOp::Load },
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &self.globals_bg, &[]);
-                pass.set_bind_group(1, &target.ssao_bgs[bg], &[]);
-                pass.draw(0..3, 0..1);
+
+        crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
+        unsafe {
+            ctx.OMSetRenderTargets(None, None);
+            ctx.CopyResource(&target.scene_copy_tex, &target.hdr_tex);
+        }
+        crate::gpu_timing::mark(ctx, "gpu: scene copy");
+
+        self.bind_scene_globals_with(ctx, &self.globals_cb);
+
+        // SSAO passes.
+        if self.quality.enable_ssao {
+            if msaa && !glass_depth_ran {
+                self.resolve_glass_depth(ctx, target);
+                glass_depth_ran = true;
+            }
+            let depth_1x_srv = if msaa { &target.glass_depth_srv } else { &target.depth_srv };
+            self.run_post_pass(
+                ctx,
+                &target.ssao_depth_rtv,
+                target.half_size,
+                Some([1.0; 4]),
+                self.ps_ssao_down.get(msaa),
+                [None, None, None, Some(&target.depth_srv), None, None, None, None],
+                &self.bs_opaque,
+            );
+            self.run_post_pass(
+                ctx,
+                &target.ssao_rtvs[0],
+                target.half_size,
+                Some([1.0; 4]),
+                &self.ps_ssao_main,
+                [None, None, None, None, Some(&target.ssao_depth_srv), None, None, None],
+                &self.bs_opaque,
+            );
+            self.run_post_pass(
+                ctx,
+                &target.ssao_rtvs[1],
+                target.half_size,
+                Some([1.0; 4]),
+                &self.ps_ssao_blur_x,
+                [
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&target.ssao_srvs[0]),
+                    Some(&target.scene_copy_srv),
+                    None,
+                    None,
+                ],
+                &self.bs_opaque,
+            );
+            self.run_post_pass(
+                ctx,
+                &target.ssao_rtvs[0],
+                target.half_size,
+                Some([1.0; 4]),
+                &self.ps_ssao_blur_y,
+                [
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&target.ssao_srvs[1]),
+                    Some(&target.scene_copy_srv),
+                    None,
+                    None,
+                ],
+                &self.bs_opaque,
+            );
+            if std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_NO_AO").is_none()
+                && std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_ID").is_none()
+            {
+                self.run_post_pass(
+                    ctx,
+                    &target.hdr_rtv,
+                    target.size,
+                    None,
+                    &self.ps_ssao_apply,
+                    [
+                        None,
+                        None,
+                        None,
+                        Some(depth_1x_srv),
+                        Some(&target.ssao_srvs[0]),
+                        Some(&target.scene_copy_srv),
+                        None,
+                        None,
+                    ],
+                    &self.bs_ssao_apply,
+                );
+            }
+            crate::d3d11::unbind_ps_srvs(ctx, 15, 8);
+            unsafe { ctx.OMSetRenderTargets(None, None) };
+        }
+        crate::gpu_timing::mark(ctx, "gpu: ssao");
+
+        // Terrain.Clouds over the sky (Studio composes them after SSAO).
+        if clouds_active && frame.clouds.is_some() {
+            if msaa && !glass_depth_ran {
+                self.resolve_glass_depth(ctx, target);
+            }
+            let depth_1x_srv = if msaa { &target.glass_depth_srv } else { &target.depth_srv };
+            if let Some(c) = self.clouds.as_mut() {
+                crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
+                unsafe {
+                    ctx.OMSetRenderTargets(None, None);
+                    ctx.CopyResource(&target.scene_copy_tex, &target.hdr_tex);
+                }
+                self.bind_scene_globals_with(ctx, &self.globals_cb);
+                crate::d3d11::set_viewport(ctx, 0.0, 0.0, target.size[0] as f32, target.size[1] as f32);
+                c.composite(ctx, &target.hdr_rtv, &target.scene_copy_srv, depth_1x_srv);
+                crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
+                unsafe { ctx.OMSetRenderTargets(None, None) };
             }
         }
-        crate::gpu_timing::mark(&mut encoder, "gpu: ssao");
-        // Terrain.Clouds over the sky (Studio composes them after SSAO).
-        if let Some(c) = self.clouds.as_mut() {
-            encoder.copy_texture_to_texture(target.hdr.as_image_copy(), target.scene_copy.as_image_copy(),
-                wgpu::Extent3d { width: target.size[0], height: target.size[1], depth_or_array_layers: 1 });
-            c.composite(device, &mut encoder, &self.globals_bg, &target.hdr_view, &target.scene_copy_view, &target.depth);
+        crate::gpu_timing::mark(ctx, "gpu: clouds composite");
+
+        if self.quality.enable_bloom {
+            self.encode_bloom(ctx, target, globals.bloom[1]);
+        } else {
+            unsafe { ctx.ClearRenderTargetView(&target.bloom_rtvs[0], &[0.0; 4]) };
         }
-        crate::gpu_timing::mark(&mut encoder, "gpu: clouds composite");
-        self.encode_bloom(&mut encoder, target, globals.bloom[1]);
-        crate::gpu_timing::mark(&mut encoder, "gpu: bloom");
-        let mut fullscreen = |label: &str,
-                              pipeline: &wgpu::RenderPipeline,
-                              bg: &wgpu::BindGroup,
-                              views: &[&wgpu::TextureView]| {
-            let attachments: Vec<_> = views
-                .iter()
-                .map(|v| {
-                    Some(wgpu::RenderPassColorAttachment {
-                        view: v,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })
-                })
-                .collect();
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(label),
-                color_attachments: &attachments,
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(1, bg, &[]);
-            if label == "dof across" || label == "dof near" { pass.set_bind_group(2, &target.ssao_bgs[0], &[]); }
-            pass.draw(0..3, 0..1);
-        };
-        if globals.dof[2] > 0.0 || globals.dof[3] > 0.0 {
-            fullscreen("dof across", &self.dof_h, &target.dof_bgs[0], &[&target.dof_views[0]]);
-            fullscreen("dof down", &self.dof_v, &target.dof_bgs[1], &[&target.dof_views[1]]);
-            if globals.dof[2] >= DOF_CHEAP_BELOW { for i in 0..11 { fullscreen("dof near", &self.near_pipelines[i], &target.near_bgs[i], &[&target.near_views[i]]); } }
-        }
-        crate::gpu_timing::mark(&mut encoder, "gpu: dof");
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("post"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target.display_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.post);
-            pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(1, &target.hdr_bg, &[]);
-            pass.set_bind_group(2, &target.post_depth_bg, &[]);
-            pass.draw(0..3, 0..1);
-        }
-        crate::gpu_timing::mark(&mut encoder, "gpu: post");
-        self.probe.flush(queue);
-        queue.submit([encoder.finish()]);
+        crate::gpu_timing::mark(ctx, "gpu: bloom");
+
+        self.run_dof_and_post(ctx, target);
+        crate::gpu_timing::mark(ctx, "gpu: dof");
+        crate::gpu_timing::mark(ctx, "gpu: post");
+
+        crate::gpu_timing::end_frame(device, ctx);
+        self.probe.flush(ctx);
         if let Some(c) = self.clouds.as_mut() {
             c.after_submit();
         }
@@ -4797,7 +4183,7 @@ impl Renderer {
     /// match) and returns its index for [`PartDraw::custom_mesh`].
     pub fn add_mesh(
         &mut self,
-        device: &wgpu::Device,
+        device: &ID3D11Device,
         positions: &[Vec3],
         normals: &[Vec3],
         uvs: &[glam::Vec2],
@@ -4808,7 +4194,7 @@ impl Renderer {
     /// `add_mesh` with per-vertex colours (sRGB 0..1, alpha 1), or none.
     pub fn add_mesh_colored(
         &mut self,
-        device: &wgpu::Device,
+        device: &ID3D11Device,
         positions: &[Vec3],
         normals: &[Vec3],
         uvs: &[glam::Vec2],
@@ -4818,8 +4204,13 @@ impl Renderer {
     }
 
     pub fn add_mesh_projected(
-        &mut self, device: &wgpu::Device, positions: &[Vec3], normals: &[Vec3],
-        uvs: &[glam::Vec2], colors: &[glam::Vec4], planes: &[glam::Vec4],
+        &mut self,
+        device: &ID3D11Device,
+        positions: &[Vec3],
+        normals: &[Vec3],
+        uvs: &[glam::Vec2],
+        colors: &[glam::Vec4],
+        planes: &[glam::Vec4],
     ) -> u32 {
         self.add_mesh_with(device, positions, normals, uvs, colors, planes, false)
     }
@@ -4827,8 +4218,14 @@ impl Renderer {
     /// `add_mesh_projected`; `storage` also lets the skinning pass write it.
     #[allow(clippy::too_many_arguments)]
     fn add_mesh_with(
-        &mut self, device: &wgpu::Device, positions: &[Vec3], normals: &[Vec3],
-        uvs: &[glam::Vec2], colors: &[glam::Vec4], planes: &[glam::Vec4], storage: bool,
+        &mut self,
+        device: &ID3D11Device,
+        positions: &[Vec3],
+        normals: &[Vec3],
+        uvs: &[glam::Vec2],
+        colors: &[glam::Vec4],
+        planes: &[glam::Vec4],
+        storage: bool,
     ) -> u32 {
         let verts: Vec<Vertex> = positions
             .iter()
@@ -4842,15 +4239,12 @@ impl Renderer {
                 color: colors.get(i).map(|c| c.to_array()).unwrap_or([0.0; 4]),
             })
             .collect();
-        let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("loaded mesh"),
-            contents: bytemuck::cast_slice(&verts),
-            usage: if storage {
-                wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE
-            } else {
-                wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST
-            },
-        });
+        let vbuf = crate::d3d11::create_default_buffer(
+            device,
+            D3D11_BIND_VERTEX_BUFFER.0 as u32,
+            std::mem::size_of_val(verts.as_slice()),
+            Some(bytemuck::cast_slice(&verts)),
+        );
         self.meshes.push(Mesh {
             vbuf,
             count: verts.len() as u32,
@@ -4862,26 +4256,44 @@ impl Renderer {
 
     /// Uploads ready-made vertices (an EditableMesh's live copy,
     /// runtime/editable.rs) and returns the index for `custom_mesh`.
-    pub fn add_mesh_vertices(&mut self, device: &wgpu::Device, verts: &[Vertex]) -> u32 {
-        let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("live mesh"),
-            contents: bytemuck::cast_slice(verts),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        });
+    pub fn add_mesh_vertices(&mut self, device: &ID3D11Device, verts: &[Vertex]) -> u32 {
+        let vbuf = crate::d3d11::create_default_buffer(
+            device,
+            D3D11_BIND_VERTEX_BUFFER.0 as u32,
+            std::mem::size_of_val(verts),
+            Some(bytemuck::cast_slice(verts)),
+        );
         self.meshes.push(Mesh { vbuf, count: verts.len() as u32, cull: None, storage: false });
         (self.meshes.len() - 1 - BUILTIN_MESHES) as u32
     }
 
     /// Overwrites vertices `first..` of loaded mesh `index` in place (no new
     /// buffer, only these bytes go up). False when they don't fit.
-    pub fn write_mesh_vertices(&mut self, queue: &wgpu::Queue, index: u32, first: u32, verts: &[Vertex]) -> bool {
+    pub fn write_mesh_vertices(
+        &mut self,
+        ctx: &ID3D11DeviceContext,
+        index: u32,
+        first: u32,
+        verts: &[Vertex],
+    ) -> bool {
         let Some(m) = self.meshes.get(index as usize + BUILTIN_MESHES) else { return false };
         if m.storage || first as usize + verts.len() > m.count as usize {
             return false;
         }
         if !verts.is_empty() {
-            queue.write_buffer(&m.vbuf, first as u64 * std::mem::size_of::<Vertex>() as u64, bytemuck::cast_slice(verts));
-            crate::bench::add("live_mesh_bytes", 0.0, (verts.len() * std::mem::size_of::<Vertex>()) as u64);
+            let stride = std::mem::size_of::<Vertex>() as u32;
+            let byte_off = first * stride;
+            let bytes = std::mem::size_of_val(verts) as u32;
+            let dst_box = D3D11_BOX {
+                left: byte_off,
+                top: 0,
+                front: 0,
+                right: byte_off + bytes,
+                bottom: 1,
+                back: 1,
+            };
+            unsafe { ctx.UpdateSubresource(&m.vbuf, 0, Some(&dst_box), verts.as_ptr().cast(), 0, 0) };
+            crate::bench::add("live_mesh_bytes", 0.0, bytes as u64);
         }
         true
     }
@@ -4892,8 +4304,14 @@ impl Renderer {
     /// palette it already holds. False when the sizes differ.
     #[allow(clippy::too_many_arguments)]
     pub fn rewrite_mesh(
-        &mut self, queue: &wgpu::Queue, index: u32, positions: &[Vec3], normals: &[Vec3],
-        uvs: &[glam::Vec2], colors: &[glam::Vec4], projection: [f32; 4],
+        &mut self,
+        ctx: &ID3D11DeviceContext,
+        index: u32,
+        positions: &[Vec3],
+        normals: &[Vec3],
+        uvs: &[glam::Vec2],
+        colors: &[glam::Vec4],
+        projection: [f32; 4],
     ) -> bool {
         let Some(m) = self.meshes.get(index as usize + BUILTIN_MESHES) else { return false };
         if m.count as usize != positions.len() || normals.len() != positions.len() {
@@ -4912,8 +4330,10 @@ impl Renderer {
                 color: colors.get(i).map(|c| c.to_array()).unwrap_or([0.0; 4]),
             })
             .collect();
-        queue.write_buffer(&m.vbuf, 0, bytemuck::cast_slice(&verts));
-        crate::bench::add("live_mesh_bytes", 0.0, (verts.len() * std::mem::size_of::<Vertex>()) as u64);
+        if !verts.is_empty() {
+            unsafe { ctx.UpdateSubresource(&m.vbuf, 0, None, verts.as_ptr().cast(), 0, 0) };
+        }
+        crate::bench::add("live_mesh_bytes", 0.0, std::mem::size_of_val(verts.as_slice()) as u64);
         if m.storage {
             self.skin.again(index);
         }
@@ -4926,7 +4346,10 @@ impl Renderer {
     /// this frame's palette is queued for the compute pass. Returns the
     /// index to draw with.
     pub fn skin_mesh(
-        &mut self, device: &wgpu::Device, queue: &wgpu::Queue, index: Option<u32>,
+        &mut self,
+        device: &ID3D11Device,
+        ctx: &ID3D11DeviceContext,
+        index: Option<u32>,
         req: &crate::skin_gpu::Request,
     ) -> u32 {
         let base = req.base;
@@ -4947,7 +4370,7 @@ impl Renderer {
             }
         };
         let m = &self.meshes[idx as usize + BUILTIN_MESHES];
-        self.skin.queue(device, queue, idx, &m.vbuf, req);
+        self.skin.queue(device, ctx, idx, &m.vbuf, req);
         idx
     }
 
@@ -4960,8 +4383,14 @@ impl Renderer {
     /// their deformed copy, skin.rs), or adds a new mesh when `index` is
     /// None or its size differs. Returns the index to draw with.
     pub fn set_mesh(
-        &mut self, device: &wgpu::Device, queue: &wgpu::Queue, index: Option<u32>,
-        positions: &[Vec3], normals: &[Vec3], uvs: &[glam::Vec2], colors: &[glam::Vec4],
+        &mut self,
+        device: &ID3D11Device,
+        ctx: &ID3D11DeviceContext,
+        index: Option<u32>,
+        positions: &[Vec3],
+        normals: &[Vec3],
+        uvs: &[glam::Vec2],
+        colors: &[glam::Vec4],
     ) -> u32 {
         let slot = index.map(|i| i as usize + BUILTIN_MESHES);
         match slot.and_then(|s| self.meshes.get(s)) {
@@ -4978,7 +4407,9 @@ impl Renderer {
                         color: colors.get(i).map(|c| c.to_array()).unwrap_or([0.0; 4]),
                     })
                     .collect();
-                queue.write_buffer(&m.vbuf, 0, bytemuck::cast_slice(&verts));
+                if !verts.is_empty() {
+                    unsafe { ctx.UpdateSubresource(&m.vbuf, 0, None, verts.as_ptr().cast(), 0, 0) };
+                }
                 index.unwrap_or(0)
             }
             _ => self.add_mesh_colored(device, positions, normals, uvs, colors),
@@ -5166,7 +4597,7 @@ impl Renderer {
     }
 
     /// Re-sorts every settled part into the static buffer.
-    fn rebuild_static(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    fn rebuild_static(&mut self, device: &ID3D11Device, ctx: &ID3D11DeviceContext) {
         struct Row {
             pass: Pass,
             key: (usize, usize),
@@ -5248,14 +4679,24 @@ impl Renderer {
         }
         if st.raw.len() > self.static_cap {
             self.static_cap = st.raw.len().next_power_of_two();
-            self.static_buf = Self::make_buf(
+            self.static_buf = Self::make_static_buf(
                 device,
-                "static instances",
                 self.static_cap * std::mem::size_of::<InstanceRaw>(),
             );
         }
         if !st.raw.is_empty() {
-            queue.write_buffer(&self.static_buf, 0, bytemuck::cast_slice(&st.raw));
+            let bytes = std::mem::size_of_val(st.raw.as_slice()) as u32;
+            let dst_box = D3D11_BOX {
+                left: 0,
+                top: 0,
+                front: 0,
+                right: bytes,
+                bottom: 1,
+                back: 1,
+            };
+            unsafe {
+                ctx.UpdateSubresource(&self.static_buf, 0, Some(&dst_box), st.raw.as_ptr().cast(), 0, 0);
+            }
         }
         self.st = st;
         self.static_gen += 1;
@@ -5267,7 +4708,7 @@ impl Renderer {
     }
 
     /// Uploads static slots changed in place (merged into contiguous runs).
-    fn flush_static_writes(&mut self, queue: &wgpu::Queue) {
+    fn flush_static_writes(&mut self, ctx: &ID3D11DeviceContext) {
         if self.st.writes.is_empty() {
             return;
         }
@@ -5275,7 +4716,7 @@ impl Renderer {
         let mut w = std::mem::take(&mut self.st.writes);
         w.sort_unstable();
         w.dedup();
-        let size = std::mem::size_of::<InstanceRaw>() as u64;
+        let size = std::mem::size_of::<InstanceRaw>() as u32;
         let mut i = 0;
         while i < w.len() {
             let start = w[i];
@@ -5286,11 +4727,18 @@ impl Renderer {
                 i += 1;
             }
             if (end as usize) <= self.st.raw.len() {
-                queue.write_buffer(
-                    &self.static_buf,
-                    start as u64 * size,
-                    bytemuck::cast_slice(&self.st.raw[start as usize..end as usize]),
-                );
+                let dst_box = D3D11_BOX {
+                    left: start * size,
+                    top: 0,
+                    front: 0,
+                    right: end * size,
+                    bottom: 1,
+                    back: 1,
+                };
+                let slice = &self.st.raw[start as usize..end as usize];
+                unsafe {
+                    ctx.UpdateSubresource(&self.static_buf, 0, Some(&dst_box), slice.as_ptr().cast(), 0, 0);
+                }
             }
         }
     }
@@ -5342,59 +4790,6 @@ fn to_raw(p: &PartDraw, bias: f32) -> InstanceRaw {
             None => [1.0, 1.0, 1.0, 0.0],
         },
     }
-}
-
-/// shader.wgsl with the measured constants from mech.rs put in front.
-fn shader_source() -> String {
-    let grass = format!("const GRASS_RADIUS: f32 = {:?};\nconst GRASS_FADE_LEN: f32 = {:?};\nconst GRASS_NEAR_RADIUS: f32 = {:?};\nconst GRASS_NEAR_FADE_LEN: f32 = {:?};\n", crate::mech::GRASS_RADIUS, crate::mech::GRASS_FADE_LEN, crate::mech::GRASS_NEAR_RADIUS, crate::mech::GRASS_NEAR_FADE_LEN);
-    use crate::mech as m;
-    let [a, b, c, d, e] = m::TONE_CURVE;
-    format!(
-        "const SUN_DIST: f32 = {:?};\nconst HYBRID_LERP_SLOPE: f32 = {:?};\nconst TONE_A: f32 = {a:?};\nconst TONE_B: f32 = {b:?};\nconst TONE_C: f32 = {c:?};\nconst TONE_D: f32 = {d:?};\nconst TONE_E: f32 = {e:?};\nconst BLOOM_SIGMA_NARROW: f32 = {:?};\nconst BLOOM_SIGMA_WIDE: f32 = {:?};\nconst BLOOM_WIDE_SHARE: f32 = {:?};\nconst BLOOM_GAIN: f32 = {:?};\nconst BLOOM_MAX_RADIUS: i32 = {};\nconst ATMOS_BAND_DEG: f32 = {:?};\nconst ATMOS_BAND_POW: f32 = {:?};\nconst ATMOS_BAND_FLOOR: f32 = {:?};\nconst ENV_SPEC_LOD_SPAN: f32 = {:?};\nconst LIGHTGRID_BORDER: f32 = {:?};\nconst LIGHTOCC_DENSITY: f32 = {:?};\nconst LIGHTOCC_START_VOXELS: f32 = {:?};\nconst LIGHTOCC_LIGHT_SKIP_VOXELS: f32 = {:?};\nconst LIGHTOCC_MAX_STEPS: f32 = {:?};\nconst ATMOS_T_EPS: f32 = {:?};\nconst ATMOS_FOG_MIP: f32 = {:?};\nconst ATMOS_ENV_CUBE_LEVELS: f32 = {:?};\nconst ENV_SPEC_FADE: f32 = {:?};\nconst ENV_ROUGH_BASE: f32 = {:?};\nconst ENV_ROUGH_SCALE: f32 = {:?};\nconst ENV_SPEC_MIP_PER_ROUGHNESS: f32 = {:?};\nconst ENV_REFLECT_UP_GAIN: f32 = {:?};\nconst SSAO_DEPTH_SCALE: f32 = {:?};\nconst SSAO_DEPTH_MAX: f32 = {:?};\nconst SSAO_RADIUS_K: f32 = {:?};\nconst SSAO_RADIUS_MIN_TEXELS: f32 = {:?};\nconst SSAO_RADIUS_MAX_TEXELS: f32 = {:?};\nconst SSAO_SAMPLES: u32 = {}u;\nconst SSAO_DEPTH_GAIN: f32 = {:?};\nconst SSAO_BLUR_K: f32 = {:?};\nconst SSAO_BLUR_DEPTH: f32 = {:?};\nconst SSAO_BLUR_DEPTH_MIN: f32 = {:?};\nconst SSAO_BLUR_DEPTH_MAX: f32 = {:?};\nconst SSAO_UPSAMPLE_DEPTH: f32 = {:?};\nconst EVSM_POS_EXP: f32 = {:?};\nconst EVSM_NEG_EXP: f32 = {:?};\nconst EVSM_SHADOW_BIAS: f32 = {:?};\nconst EVSM_BLEED_CUT: f32 = {:?};\nconst LSHADOW_COLS: u32 = {}u;\nconst LSHADOW_CELL: f32 = {:?};\n{}",
-        m::SUN_DIST,
-        m::HYBRID_LERP_SLOPE,
-        m::BLOOM_SIGMAS_PX[0],
-        m::BLOOM_SIGMAS_PX[1],
-        m::BLOOM_WIDE_SHARE,
-        m::BLOOM_GAIN,
-        m::BLOOM_MAX_RADIUS,
-        m::ATMOS_BAND_DEG,
-        m::ATMOS_BAND_POW,
-        m::ATMOS_BAND_FLOOR,
-        m::ENV_SPEC_LOD_SPAN,
-        m::LIGHTGRID_BORDER,
-        m::LIGHTOCC_DENSITY,
-        m::LIGHTOCC_START_VOXELS,
-        m::LIGHTOCC_LIGHT_SKIP_VOXELS,
-        m::LIGHTOCC_MAX_STEPS,
-        m::ATMOS_T_EPS,
-        m::ATMOS_FOG_MIP,
-        m::ATMOS_ENV_CUBE_LEVELS,
-        m::ENV_SPEC_FADE,
-        m::ENV_ROUGH_BASE,
-        m::ENV_ROUGH_SCALE,
-        m::ENV_SPEC_MIP_PER_ROUGHNESS,
-        m::ENV_REFLECT_UP_GAIN,
-        m::SSAO_DEPTH_SCALE,
-        m::SSAO_DEPTH_MAX,
-        m::SSAO_RADIUS_K,
-        m::SSAO_RADIUS_MIN_TEXELS,
-        m::SSAO_RADIUS_MAX_TEXELS,
-        m::SSAO_SAMPLES,
-        m::SSAO_DEPTH_GAIN,
-        m::SSAO_BLUR_K,
-        m::SSAO_BLUR_DEPTH,
-        m::SSAO_BLUR_DEPTH_MIN,
-        m::SSAO_BLUR_DEPTH_MAX,
-        m::SSAO_UPSAMPLE_DEPTH,
-        m::EVSM_POS_EXP,
-        m::EVSM_NEG_EXP,
-        m::EVSM_SHADOW_BIAS,
-        m::EVSM_BLEED_CUT,
-        m::LSHADOW_ATLAS / m::LSHADOW_FACE,
-        m::LSHADOW_FACE as f32 / m::LSHADOW_ATLAS as f32,
-        format!("const TERRAIN_CAPTURE_ID: bool = {};\nconst TERRAIN_CAPTURE_NO_AO: bool = {};\nconst DETILE_LEVELS: f32 = {:?};\nconst WANG_CELLS: f32 = {:?};\nconst MATERIAL_DIFFUSE_FADE_DEPTH: f32 = {:?};\nconst MATERIAL_LQ_DIFFUSE_CUTOFF: f32 = {:?};\n{}", std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_ID").is_some(), std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_NO_AO").is_some(), m::DETILE_LEVELS, m::WANG_CELLS, m::MATERIAL_DIFFUSE_FADE_DEPTH, m::MATERIAL_LQ_DIFFUSE_CUTOFF, format!("{grass}{}", include_str!("shader.wgsl")))
-    )
 }
 
 fn mip_levels(w: u32, h: u32) -> u32 {
