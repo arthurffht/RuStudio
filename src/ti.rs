@@ -7,9 +7,19 @@
 //! the content folder like the other Studio files (CREDITS.md), else egui's.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use egui::{Align2, Color32, FontFamily, FontId, Painter, Rect};
+
+fn tabler_family() -> FontFamily {
+    static F: OnceLock<FontFamily> = OnceLock::new();
+    F.get_or_init(|| FontFamily::Name(Arc::from("tabler"))).clone()
+}
+
+fn tabler_filled_family() -> FontFamily {
+    static F: OnceLock<FontFamily> = OnceLock::new();
+    F.get_or_init(|| FontFamily::Name(Arc::from("tabler-filled"))).clone()
+}
 
 const OUTLINE: &[u8] = include_bytes!("../assets/tabler/tabler-icons.ttf");
 const FILLED: &[u8] = include_bytes!("../assets/tabler/tabler-icons-filled.ttf");
@@ -75,12 +85,8 @@ pub fn has(name: &str) -> bool {
 /// The glyph and font family for an icon name ("cube", "player-play-filled").
 pub fn glyph(name: &str) -> Option<(char, FontFamily)> {
     match name.strip_suffix("-filled") {
-        Some(n) => filled()
-            .get(n)
-            .map(|c| (*c, FontFamily::Name("tabler-filled".into()))),
-        None => outline()
-            .get(name)
-            .map(|c| (*c, FontFamily::Name("tabler".into()))),
+        Some(n) => filled().get(n).map(|c| (*c, tabler_filled_family())),
+        None => outline().get(name).map(|c| (*c, tabler_family())),
     }
 }
 
@@ -97,25 +103,27 @@ pub fn paint(p: &Painter, r: Rect, name: &str, color: Color32) {
         return;
     };
     let size = r.width().min(r.height());
+    let mut buf = [0u8; 4];
+    let s = c.encode_utf8(&mut buf);
     p.text(
         r.center(),
         Align2::CENTER_CENTER,
-        c.to_string(),
+        s,
         FontId::new(size, family),
         color,
     );
 }
 
-/// Adds the icon fonts and Studio's Builder Sans to egui.
+/// Adds the icon fonts and Studio's Builder Sans / Windows fallback fonts to egui.
 pub fn install(ctx: &egui::Context) {
     let mut defs = egui::FontDefinitions::default();
     defs.font_data.insert(
         "tabler".into(),
-        std::sync::Arc::new(egui::FontData::from_static(OUTLINE)),
+        Arc::new(egui::FontData::from_static(OUTLINE)),
     );
     defs.font_data.insert(
         "tabler-filled".into(),
-        std::sync::Arc::new(egui::FontData::from_static(FILLED)),
+        Arc::new(egui::FontData::from_static(FILLED)),
     );
     defs.families
         .insert(FontFamily::Name("tabler".into()), vec!["tabler".into()]);
@@ -124,6 +132,18 @@ pub fn install(ctx: &egui::Context) {
         vec!["tabler-filled".into()],
     );
     let fonts = crate::assets::content_dir().join("fonts");
+    let win_fonts = std::path::Path::new(r"C:\Windows\Fonts");
+    // Promote Windows Segoe UI ahead of egui's Ubuntu-Light when BuilderSans isn't installed.
+    for (key, path, family) in [
+        ("segoe-ui", win_fonts.join("segoeui.ttf"), FontFamily::Proportional),
+        ("segoe-ui-bold", win_fonts.join("segoeuib.ttf"), FontFamily::Name("bold".into())),
+        ("segoe-ui-semibold", win_fonts.join("seguisb.ttf"), FontFamily::Name("medium".into())),
+    ] {
+        if let Ok(bytes) = std::fs::read(&path) {
+            defs.font_data.insert(key.into(), Arc::new(egui::FontData::from_owned(bytes)));
+            defs.families.entry(family).or_default().insert(0, key.into());
+        }
+    }
     for (key, file, family) in [
         ("builder-sans", "BuilderSans-Regular.otf", FontFamily::Proportional),
         ("builder-sans-bold", "BuilderSans-Bold.otf", FontFamily::Name("bold".into())),
@@ -133,30 +153,58 @@ pub fn install(ctx: &egui::Context) {
         if let Ok(bytes) = std::fs::read(fonts.join(file)) {
             defs.font_data.insert(
                 key.into(),
-                std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+                Arc::new(egui::FontData::from_owned(bytes)),
             );
             let list = defs.families.entry(family).or_default();
             list.insert(0, key.into());
         }
     }
-    // Studio's Output is monospace, warnings and errors in bold: Builder
-    // Mono from the content folder when it is there.
-    for (key, file, family) in [
-        ("builder-mono", "BuilderMono-Regular.otf", FontFamily::Monospace),
-        ("builder-mono-bold", "BuilderMono-Bold.otf", FontFamily::Name("mono-bold".into())),
-    ] {
-        if let Ok(bytes) = std::fs::read(fonts.join(file)) {
-            defs.font_data.insert(key.into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
-            defs.families.entry(family).or_default().insert(0, key.into());
+    // Studio's Output is monospace, warnings and errors in bold: BuilderMono,
+    // then FiraMono / RobotoMono / CascadiaMono / Consolas ahead of Hack.
+    let local_cascadia = std::env::var_os("LOCALAPPDATA")
+        .map(|d| std::path::PathBuf::from(d).join(r"Microsoft\Windows\Fonts\CascadiaMono.ttf"));
+    let mono_regular: &[(&str, std::path::PathBuf)] = &[
+        ("builder-mono", fonts.join("BuilderMono-Regular.otf")),
+        ("fira-mono", fonts.join("FiraMono-Regular.ttf")),
+        ("roboto-mono", fonts.join("RobotoMono-Regular.ttf")),
+        ("cascadia-mono", win_fonts.join("CascadiaMono.ttf")),
+        ("consolas", win_fonts.join("consola.ttf")),
+    ];
+    let mut picked_mono = None;
+    for (key, path) in mono_regular {
+        let bytes = std::fs::read(path).ok().or_else(|| {
+            (*key == "cascadia-mono")
+                .then(|| local_cascadia.as_ref().and_then(|p| std::fs::read(p).ok()))
+                .flatten()
+        });
+        if let Some(bytes) = bytes {
+            defs.font_data.insert((*key).into(), Arc::new(egui::FontData::from_owned(bytes)));
+            defs.families.entry(FontFamily::Monospace).or_default().insert(0, (*key).into());
+            picked_mono = Some(*key);
+            break;
         }
     }
+    let mono_bold: &[(&str, std::path::PathBuf)] = &[
+        ("builder-mono-bold", fonts.join("BuilderMono-Bold.otf")),
+        ("fira-mono-bold", fonts.join("FiraMono-Bold.ttf")),
+        ("roboto-mono-bold", fonts.join("RobotoMono-Bold.ttf")),
+        ("consolas-bold", win_fonts.join("consolab.ttf")),
+    ];
+    for (key, path) in mono_bold {
+        if let Ok(bytes) = std::fs::read(path) {
+            defs.font_data.insert((*key).into(), Arc::new(egui::FontData::from_owned(bytes)));
+            defs.families.entry(FontFamily::Name("mono-bold".into())).or_default().insert(0, (*key).into());
+            break;
+        }
+    }
+    let _ = picked_mono;
     let mono = defs.families[&FontFamily::Monospace].clone();
     defs.families.entry(FontFamily::Name("mono-bold".into())).or_default().extend(mono);
     // Symbols the faces lack (a game's text in egui's default font, "✓"):
     // the same fallback fonts as game fonts get.
     for (i, bytes) in crate::gui::fallback_fonts().iter().enumerate() {
         let key = format!("fallback{i}");
-        defs.font_data.insert(key.clone(), std::sync::Arc::new(egui::FontData::from_static(bytes)));
+        defs.font_data.insert(key.clone(), Arc::new(egui::FontData::from_static(bytes)));
         defs.families.entry(FontFamily::Proportional).or_default().push(key);
     }
     // Bold falls back to the regular face (and then egui's) when missing.

@@ -1967,7 +1967,17 @@ impl Editor {
 
     /// Terrain.Decoration grass on the Grass-topped chunks near the camera:
     /// one chunk's blades made per frame, far ones dropped (round 21).
-    fn sync_terrain_grass(&mut self) {
+    fn sync_terrain_grass(&mut self, quality_level: u8) {
+        if quality_level < mech::QUALITY_GRASS_MIN_LEVEL {
+            if !self.terrain_grass_built.is_empty() {
+                if let (Some(renderer), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
+                    for k in self.terrain_grass_built.drain() {
+                        renderer.set_terrain_grass(&rs.device, k, &[]);
+                    }
+                }
+            }
+            return;
+        }
         let Some((_, terrain, voxels)) = self.terrain_drawn.as_ref() else {
             return;
         };
@@ -1997,6 +2007,11 @@ impl Editor {
                 return;
             }
         }
+        let radius_scale = if quality_level <= mech::QUALITY_GRASS_MID_MAX_LEVEL {
+            mech::QUALITY_GRASS_MID_SCALE
+        } else {
+            1.0
+        };
         let chunk = crate::terrain::VOXEL * 32.0;
         let near = |k: &[i32; 3], r: f32| {
             let lo = Vec3::new(k[0] as f32, k[1] as f32, k[2] as f32) * chunk;
@@ -2006,7 +2021,7 @@ impl Editor {
         let far: Vec<[i32; 3]> = self
             .terrain_grass_built
             .iter()
-            .filter(|k| !near(k, mech::GRASS_EVICTION_RADIUS))
+            .filter(|k| !near(k, mech::GRASS_EVICTION_RADIUS * radius_scale))
             .copied()
             .collect();
         for k in far {
@@ -2016,7 +2031,7 @@ impl Editor {
         let mut pending: Vec<_> = self
             .terrain_grass_chunks
             .iter()
-            .filter(|k| !self.terrain_grass_built.contains(*k) && near(k, mech::GRASS_RADIUS))
+            .filter(|k| !self.terrain_grass_built.contains(*k) && near(k, mech::GRASS_RADIUS * radius_scale))
             .copied()
             .collect();
         // Complete the visible working set before drawing this camera. Building
@@ -2127,6 +2142,71 @@ impl Editor {
 
     /// The part (resolved to its top-level Model unless Alt is held) under a point.
     pub fn pick(&self, rect: Rect, p: Pos2, raw: bool) -> Option<Ref> {
+        #[derive(Clone, PartialEq)]
+        struct PickKey {
+            editor: usize,
+            doc_id: u64,
+            rev: u64,
+            journal: u64,
+            scene_doc_id: u64,
+            scene_parts: usize,
+            rect: [u32; 4],
+            pos: [u32; 2],
+            raw: bool,
+            cam_pos: [u32; 3],
+            cam_rot: [u32; 4],
+            cam_ortho: Option<(u32, u32)>,
+            cam_basis: Option<[u32; 9]>,
+        }
+        thread_local! {
+            static PICK_CACHE: std::cell::RefCell<[Option<(PickKey, Option<Ref>)>; 2]> =
+                const { std::cell::RefCell::new([None, None]) };
+        }
+        let key = (!self.is_playing()).then(|| PickKey {
+            editor: self as *const Editor as usize,
+            doc_id: self.doc.id,
+            rev: self.doc.revision,
+            journal: self.doc.journal_end(),
+            scene_doc_id: self.scene.doc_id,
+            scene_parts: self.scene.parts.len(),
+            rect: [
+                rect.min.x.to_bits(),
+                rect.min.y.to_bits(),
+                rect.max.x.to_bits(),
+                rect.max.y.to_bits(),
+            ],
+            pos: [p.x.to_bits(), p.y.to_bits()],
+            raw,
+            cam_pos: [
+                self.cam.pos.x.to_bits(),
+                self.cam.pos.y.to_bits(),
+                self.cam.pos.z.to_bits(),
+            ],
+            cam_rot: [
+                self.cam.yaw.to_bits(),
+                self.cam.pitch.to_bits(),
+                self.cam.fov_deg.to_bits(),
+                self.cam.stretch.to_bits(),
+            ],
+            cam_ortho: self.cam.ortho.map(|(s, m)| (s.to_bits(), m)),
+            cam_basis: self.cam.basis.map(|b| [
+                b.x_axis.x.to_bits(), b.x_axis.y.to_bits(), b.x_axis.z.to_bits(),
+                b.y_axis.x.to_bits(), b.y_axis.y.to_bits(), b.y_axis.z.to_bits(),
+                b.z_axis.x.to_bits(), b.z_axis.y.to_bits(), b.z_axis.z.to_bits(),
+            ]),
+        });
+        if let Some(k) = key.as_ref() {
+            let hit = PICK_CACHE.with(|c| {
+                let c = c.borrow();
+                c.iter()
+                    .flatten()
+                    .find(|(ck, _)| ck == k)
+                    .map(|(_, val)| *val)
+            });
+            if let Some(val) = hit {
+                return val;
+            }
+        }
         let ray = self.cam.ray(rect, p);
         let mut best: Option<(f32, Ref)> = None;
         let mut invisible_host: Option<(f32, Ref)> = None;
@@ -2155,8 +2235,15 @@ impl Editor {
                 }
             }
         }
-        let r = best.or(invisible_host)?.1;
-        Some(if raw { r } else { self.selection_target(r) })
+        let result = best.or(invisible_host).map(|(_, r)| if raw { r } else { self.selection_target(r) });
+        if let Some(k) = key {
+            PICK_CACHE.with(|c| {
+                let mut c = c.borrow_mut();
+                c[1] = c[0].take();
+                c[0] = Some((k, result));
+            });
+        }
+        result
     }
 
     /// Clicking a part inside a Model selects the outermost Model below Workspace.
@@ -2432,12 +2519,21 @@ impl Editor {
     }
 
     pub fn viewport_ui(&mut self, ui: &mut egui::Ui) {
-        let rect = ui.available_rect_before_wrap();
+        if crate::studio_content::take_fonts_ready() {
+            crate::ti::install(ui.ctx());
+        }
+        let raw_rect = ui.available_rect_before_wrap();
+        let ppp = ui.ctx().pixels_per_point();
+        let rect = if self.view_render_size.is_none() {
+            egui::emath::GuiRounding::round_to_pixels(raw_rect, ppp)
+        } else {
+            raw_rect
+        };
         self.viewport_rect = rect;
         crate::grass_temporal::tick(&mut self.cam, ui.ctx());
         let selector = Self::view_selector_rect(rect);
         let over_selector = !self.is_playing() && ui.input(|i| i.pointer.hover_pos().is_some_and(|p| selector.contains(p)));
-        let resp = ui.allocate_rect(rect, if over_selector { Sense::hover() } else { Sense::click_and_drag() });
+        let resp = ui.allocate_rect(raw_rect, if over_selector { Sense::hover() } else { Sense::click_and_drag() });
         let ctx = ui.ctx().clone();
         let context_menu_open = resp.context_menu_opened();
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
@@ -2588,6 +2684,34 @@ impl Editor {
             None
         };
 
+        let (focused, minimized) = ctx.input(|i| (i.focused, i.viewport().minimized.unwrap_or(false)));
+        let pause_cosmetic = self.harness.plain() && (!focused || minimized);
+        let skip_3d = self.harness.plain() && minimized;
+        let elapsed_ms = ctx.input(|i| i.unstable_dt) * 1000.0;
+        let frame_ms = if elapsed_ms > 0.0 && elapsed_ms <= crate::mech::FRM_FRAME_MS_MAX {
+            elapsed_ms.max(self.last_work_ms)
+        } else {
+            self.last_work_ms.max(crate::mech::FRM_TARGET_INITIAL_MS)
+        };
+        let deterministic = self.fixed_dt.is_some() || self.harness.selftest.is_some();
+        let playing_now = self.is_playing();
+        let mut quality_level = mech::QUALITY_LEVEL_MAX;
+        let mut quality_synced = false;
+        if !skip_3d {
+            if let (Some(r), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
+                quality_level = sync_quality(
+                    r,
+                    &rs.caps,
+                    self.frame_no,
+                    frame_ms,
+                    deterministic,
+                    playing_now,
+                )
+                .level;
+                quality_synced = true;
+            }
+        }
+
         {
             let _s = crate::bench::scope("vp_sync_draws");
             self.sync_draws();
@@ -2596,9 +2720,8 @@ impl Editor {
             self.sync_terrain();
         }
         self.sync_terrain_params();
-        self.sync_terrain_grass();
-        // Decoration sways in Edit mode too, even when input is idle.
-        if !self.terrain_grass_built.is_empty() {
+        self.sync_terrain_grass(quality_level);
+        if playing_now && !self.terrain_grass_built.is_empty() && !pause_cosmetic {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
         // Hover: the hovered part (or model's parts) drawn again, highlighted.
@@ -2625,7 +2748,6 @@ impl Editor {
         // WireframeHandleAdornments (domains/world_misc.rs).
         let (wire_lines, wire_texts) = crate::runtime::domains::world::misc::wire_geometry(&self.doc);
         lines.extend(wire_lines.into_iter().map(|(pos, color)| LineVertex { pos, color }));
-        let ppp = ctx.pixels_per_point();
         let mut size = [
             (rect.width() * ppp).round().max(1.0) as u32,
             (rect.height() * ppp).round().max(1.0) as u32,
@@ -2640,11 +2762,14 @@ impl Editor {
         };
         let (globals, lights, shadows, sun_cascades) = {
             let _l = crate::bench::scope("lighting");
-            self.frame_lighting(rrect)
+            self.frame_lighting_quality(rrect, quality_level)
         };
         // Studio's scene environment probe (env_probe.rs): the PBR
         // technologies' 128 px indoor reflection cube.
-        let probe = (globals.env_spec[2] > 0.5 && std::env::var_os("RUSTUDIO_NO_ENV_PROBE").is_none()).then(|| {
+        let probe = (quality_level >= mech::QUALITY_ENV_PROBE_MIN_LEVEL
+            && globals.env_spec[2] > 0.5
+            && std::env::var_os("RUSTUDIO_NO_ENV_PROBE").is_none())
+        .then(|| {
             let _p = crate::bench::scope("env_probe");
             let revision = self.renderer.as_ref().map_or(0, |r| r.static_gen());
             let now = crate::sim_clock::since(self.harness.started).as_secs_f64();
@@ -2654,23 +2779,9 @@ impl Editor {
             self.env_probe.update(self.cam.pos, self.cam.forward(), dt, now, revision, &ray)
         });
         let vp_render = crate::bench::scope("vp_render");
-        let tex = match (self.renderer.as_mut(), self.render_state.as_ref()) {
-            (Some(r), Some(rs)) => {
-                let elapsed_ms = ctx.input(|i| i.unstable_dt) * 1000.0;
-                let frame_ms = if elapsed_ms > 0.0 && elapsed_ms <= crate::mech::FRM_FRAME_MS_MAX {
-                    elapsed_ms.max(self.last_work_ms)
-                } else {
-                    self.last_work_ms.max(crate::mech::FRM_TARGET_INITIAL_MS)
-                };
-                let deterministic = self.fixed_dt.is_some() || self.harness.selftest.is_some();
-                sync_quality(
-                    r,
-                    &rs.caps,
-                    self.frame_no,
-                    frame_ms,
-                    deterministic,
-                );
-                r.render(
+        let tex = if !skip_3d {
+            match (self.renderer.as_mut(), self.render_state.as_ref()) {
+                (Some(r), Some(rs)) => r.render(
                     rs,
                     size,
                     &Frame {
@@ -2692,11 +2803,13 @@ impl Editor {
                         },
                         clouds: crate::clouds::look(&self.doc),
                         probe,
-                        defer_post: false,
+                        defer_post: true,
                     },
-                )
+                ),
+                _ => None,
             }
-            _ => None,
+        } else {
+            None
         };
         drop(vp_render);
         let painter = ui.painter_at(rect);
@@ -2836,13 +2949,25 @@ impl Editor {
         };
         // ViewportFrames the GUI drew: their parts through this renderer
         // (vf_render.rs), before the world GUI pass and egui composite them.
-        if let (Some(r), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
-            let _g = crate::bench::scope("vf_render");
-            let mut reqs = self.gui.vf_requests(&self.doc);
-            reqs.extend(self.toolbox_vf.iter().map(|(k, v)| (*k, *v)));
-            r.render_viewport_frames(rs, &reqs);
-            self.gui.set_vf_textures(|vf| r.vf_texture(vf));
-            self.toolbox.preview.set_texture(|vf| r.vf_texture(vf));
+        if !skip_3d {
+            if let (Some(r), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
+                if !quality_synced {
+                    sync_quality(
+                        r,
+                        &rs.caps,
+                        self.frame_no,
+                        frame_ms,
+                        deterministic,
+                        playing_now,
+                    );
+                }
+                let _g = crate::bench::scope("vf_render");
+                let mut reqs = self.gui.vf_requests(&self.doc);
+                reqs.extend(self.toolbox_vf.iter().map(|(k, v)| (*k, *v)));
+                r.render_viewport_frames(rs, &reqs);
+                self.gui.set_vf_textures(|vf| r.vf_texture(vf));
+                self.toolbox.preview.set_texture(|vf| r.vf_texture(vf));
+            }
         }
         // ParticleEmitters, Beams and Trails: triangles in the same pass, after
         // the GUIs (round 25).
@@ -2870,19 +2995,26 @@ impl Editor {
                     server: server.zip(s2c.as_ref()).map(|((id, _), f)| (id, f as &dyn Fn(Ref) -> Option<Ref>)),
                 },
             );
-            if live {
-                ctx.request_repaint();
+            if live && !pause_cosmetic {
+                if playing_now {
+                    ctx.request_repaint();
+                } else {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                }
             }
         }
         // SurfaceGuis / BillboardGuis behind the world stay behind it (round 23).
         let hl = self.highlight_draws();
-        if let (Some(r), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
-            let _g = crate::bench::scope("gui_world_pass");
-            // The same tone curve rule as the 3D view (lighting::tone_curve_on).
-            let curve = crate::lighting::tone_curve_on(&self.doc).then_some(mech::TONE_CURVE);
-            r.draw_world_gui(rs, &self.gui.world_batches, self.effects.drawn(), curve);
-            // Highlights last, over the finished image (highlight.rs).
-            r.draw_highlights(rs, &hl);
+        if !skip_3d {
+            if let (Some(r), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
+                let _g = crate::bench::scope("gui_world_pass");
+                // The same tone curve rule as the 3D view (lighting::tone_curve_on).
+                let curve = crate::lighting::tone_curve_on(&self.doc).then_some(mech::TONE_CURVE);
+                r.draw_world_gui(rs, &self.gui.world_batches, self.effects.drawn(), curve);
+                r.finalize_post(rs);
+                // Highlights last, over the finished image (highlight.rs).
+                r.draw_highlights(rs, &hl);
+            }
         }
         if let Some(s) = self
             .play
@@ -3144,10 +3276,6 @@ impl Editor {
                 painter.line_segment([pa, pb], stroke);
             }
         }
-    }
-
-    pub(crate) fn draw_outline(&self, painter: &egui::Painter, rect: Rect, sp: &ScenePart, stroke: Stroke) {
-        self.draw_outline_union(painter, rect, &[sp.r], stroke);
     }
 
     fn draw_outline_union(&self, painter: &egui::Painter, rect: Rect, refs: &[Ref], stroke: Stroke) {
@@ -4023,6 +4151,14 @@ impl Editor {
         &mut self,
         rect: Rect,
     ) -> (crate::render::Globals, Vec<crate::render::LightRaw>, bool, [crate::sun_shadow::Cascade; crate::sun_shadow::CASCADES]) {
+        self.frame_lighting_quality(rect, mech::QUALITY_LEVEL_MAX)
+    }
+
+    fn frame_lighting_quality(
+        &mut self,
+        rect: Rect,
+        quality_level: u8,
+    ) -> (crate::render::Globals, Vec<crate::render::LightRaw>, bool, [crate::sun_shadow::Cascade; crate::sun_shadow::CASCADES]) {
         {
             let _s = crate::bench::scope("lt_sky");
             self.sync_sky();
@@ -4050,9 +4186,11 @@ impl Editor {
             &self.lighting.indoor_irr,
         );
         fl.globals.lightgrid = self.sync_lightgrid(&lights, fl.sun_true, fl.shadows);
-        fl.globals.lightocc = {
+        fl.globals.lightocc = if quality_level >= mech::QUALITY_LIGHTOCC_MIN_LEVEL {
             let _s = crate::bench::scope("lt_occ");
             self.sync_lightocc(&lights)
+        } else {
+            [0.0; 4]
         };
 
         {
@@ -4244,17 +4382,26 @@ fn sync_quality(
     frame_no: u64,
     frame_ms: f32,
     deterministic: bool,
-) {
+    is_playing: bool,
+) -> crate::quality::QualityProfile {
     static FRM: std::sync::Mutex<
         Option<(
             crate::quality::FrameRateManager,
             Option<crate::quality::QualityProfile>,
             usize,
+            Option<u8>,
         )>,
     > = std::sync::Mutex::new(None);
-    let quality_setting = match crate::studio_settings::get("RenderSettings", "EditQualityLevel") {
-        Some(crate::studio_settings::Val::Enum(v)) => (v as u8).min(21),
-        _ => 21,
+    let quality_setting = if is_playing {
+        match crate::studio_settings::get("RenderSettings", "QualityLevel") {
+            Some(crate::studio_settings::Val::Enum(v)) if v > 0 => (v as u8).min(21),
+            _ => crate::quality::QualityProfile::saved_to_21(crate::game_settings::graphics_quality()),
+        }
+    } else {
+        match crate::studio_settings::get("RenderSettings", "EditQualityLevel") {
+            Some(crate::studio_settings::Val::Enum(v)) => (v as u8).min(21),
+            _ => 21,
+        }
     };
     let frm_mode = match crate::studio_settings::get("RenderSettings", "FrameRateManager") {
         Some(crate::studio_settings::Val::Enum(v)) => v,
@@ -4263,25 +4410,23 @@ fn sync_quality(
     let frm_enabled = match frm_mode {
         1 => true,
         2 => false,
-        _ => {
-            quality_setting == 0
-                || (!deterministic
-                    && (caps.is_uma || caps.dedicated_vram_mb <= crate::mech::QUALITY_LOW_VRAM_MB))
-        }
+        _ => quality_setting == 0,
     };
+    let effective_ms = frame_ms.max(crate::gpu_timing::last_gpu_frame_ms());
     let mut guard = FRM.lock().unwrap_or_else(|e| e.into_inner());
-    let (frm, last, last_ptr) = guard.get_or_insert_with(|| {
-        (crate::quality::FrameRateManager::new(caps), None, 0)
+    let (frm, last, last_ptr, last_auto_frm) = guard.get_or_insert_with(|| {
+        (crate::quality::FrameRateManager::new(caps), None, 0, None)
     });
     if quality_setting > 0 && !frm_enabled {
         frm.set_level(quality_setting);
     }
     let frm_level = if frm_enabled {
-        if frame_no > 0 && !deterministic {
-            Some(frm.observe_frame(frame_ms))
+        let lvl = if frame_no > 0 && !deterministic {
+            frm.observe_frame(effective_ms)
         } else {
-            Some(frm.level())
-        }
+            frm.level()
+        };
+        Some(if quality_setting > 0 { lvl.min(quality_setting) } else { lvl })
     } else {
         None
     };
@@ -4293,6 +4438,15 @@ fn sync_quality(
         *last_ptr = r_ptr;
         renderer.set_quality(profile);
     }
+    if *last_auto_frm != Some(profile.level) {
+        *last_auto_frm = Some(profile.level);
+        crate::studio_settings::set(
+            "RenderSettings",
+            "AutoFRMLevel",
+            crate::studio_settings::Val::Num(profile.level as f64),
+        );
+    }
+    profile
 }
 
 /// Turns a sky cube (+X, −X, +Y, −Y, +Z, −Z faces, D3D cube layout) by

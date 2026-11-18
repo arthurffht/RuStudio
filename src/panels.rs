@@ -412,18 +412,97 @@ fn topology(dock: &DockState<Tab>) -> String {
     node(dock.main_surface(), NodeIndex::root())
 }
 
-/// Notes where each panel in the main window sits (call every frame).
-pub fn record_homes(dock: &DockState<Tab>, homes: &mut HashMap<String, Home>) {
-    let keep = match homes.get("__topology") {
-        Some(Home::Topology(json)) => serde_json::from_str::<DockState<crate::layout_store::SavedTab>>(json)
-            .ok().is_some_and(|d| d.iter_all_tabs().any(|(_, t)| dock.find_tab(&t.tab()).is_none())),
-        _ => false,
-    };
-    if !keep {
-        if let Ok(json) = serde_json::to_string(&crate::layout_store::saved_dock(dock)) {
-            homes.insert("__topology".into(), Home::Topology(json));
+fn dock_layout_hash(dock: &DockState<Tab>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let tree = dock.main_surface();
+    tree.len().hash(&mut h);
+    for node in tree.iter() {
+        match node {
+            Node::Leaf(l) => {
+                0u8.hash(&mut h);
+                l.active.0.hash(&mut h);
+                for t in l.tabs() {
+                    if let Some(st) = crate::layout_store::SavedTab::from_tab(t) {
+                        std::mem::discriminant(&st).hash(&mut h);
+                    }
+                }
+            }
+            Node::Vertical(s) => {
+                1u8.hash(&mut h);
+                if s.fraction.is_finite() {
+                    s.fraction.to_bits().hash(&mut h);
+                }
+            }
+            Node::Horizontal(s) => {
+                2u8.hash(&mut h);
+                if s.fraction.is_finite() {
+                    s.fraction.to_bits().hash(&mut h);
+                }
+            }
+            Node::Empty => 3u8.hash(&mut h),
         }
     }
+    h.finish()
+}
+
+/// Notes where each panel in the main window sits (call every frame).
+pub fn record_homes(dock: &DockState<Tab>, homes: &mut HashMap<String, Home>) {
+    struct CachedHomes {
+        dock_hash: u64,
+        topo_ptr_len: (usize, usize),
+        topo_tabs: Vec<Tab>,
+    }
+    thread_local! {
+        static CACHE: std::cell::RefCell<HashMap<usize, CachedHomes>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    let homes_ptr = homes as *const HashMap<String, Home> as usize;
+    let dock_hash = dock_layout_hash(dock);
+    let cur_topo_ptr_len = match homes.get("__topology") {
+        Some(Home::Topology(json)) => (json.as_ptr() as usize, json.len()),
+        _ => (0, 0),
+    };
+    let mut cached_tabs: Option<Vec<Tab>> = None;
+    let hit = CACHE.with(|c| {
+        let c = c.borrow();
+        let entry = c.get(&homes_ptr)?;
+        if entry.topo_ptr_len == cur_topo_ptr_len && cur_topo_ptr_len != (0, 0) {
+            if entry.dock_hash == dock_hash {
+                return Some(true);
+            }
+            cached_tabs = Some(entry.topo_tabs.clone());
+        }
+        Some(false)
+    });
+    if hit == Some(true) {
+        return;
+    }
+
+    let topo_tabs = match cached_tabs {
+        Some(tabs) => Some(tabs),
+        None => match homes.get("__topology") {
+            Some(Home::Topology(json)) => {
+                serde_json::from_str::<DockState<crate::layout_store::SavedTab>>(json)
+                    .ok()
+                    .map(|d| d.iter_all_tabs().map(|(_, t)| t.tab()).collect())
+            }
+            _ => None,
+        },
+    };
+    let keep = topo_tabs
+        .as_ref()
+        .is_some_and(|tabs| tabs.iter().any(|t| dock.find_tab(t).is_none()));
+    let final_tabs = if !keep {
+        let saved = crate::layout_store::saved_dock(dock);
+        let tabs: Vec<Tab> = saved.iter_all_tabs().map(|(_, t)| t.tab()).collect();
+        if let Ok(json) = serde_json::to_string(&saved) {
+            homes.insert("__topology".into(), Home::Topology(json));
+        }
+        tabs
+    } else {
+        topo_tabs.unwrap_or_default()
+    };
 
     let tree = dock.main_surface();
     for (n, node) in tree.iter().enumerate().map(|(i, n)| (NodeIndex(i), n)) {
@@ -454,6 +533,21 @@ pub fn record_homes(dock: &DockState<Tab>, homes: &mut HashMap<String, Home>) {
             homes.insert(k.to_string(), home);
         }
     }
+
+    let new_topo_ptr_len = match homes.get("__topology") {
+        Some(Home::Topology(json)) => (json.as_ptr() as usize, json.len()),
+        _ => (0, 0),
+    };
+    CACHE.with(|c| {
+        c.borrow_mut().insert(
+            homes_ptr,
+            CachedHomes {
+                dock_hash,
+                topo_ptr_len: new_topo_ptr_len,
+                topo_tabs: final_tabs,
+            },
+        );
+    });
 }
 
 /// The panels in a subtree, nearest the split first.
@@ -529,6 +623,9 @@ impl Popped {
             .with_app_id(self.app_id())
             .with_inner_size(self.open_size)
             .with_min_inner_size([160.0, 100.0]);
+        if let Some(icon) = app_icon() {
+            b = b.with_icon(icon);
+        }
         if let Some(p) = self.open_pos {
             b = b.with_position(p);
         }

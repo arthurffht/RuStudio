@@ -11,16 +11,6 @@ use crate::render::MeshKind;
 use crate::studio_ui::{menu_rect_key, menu_shortcuts, RunType, MENUS, M};
 use crate::theme;
 
-/// Studio's File menu is 233 px wide (checks/ui/studio/menu-File.png);
-/// the account menu uses this width.
-pub const MENU_W: f32 = 228.0;
-
-/// One menu item as Studio draws it: a check column, the label, and the
-/// shortcut left-aligned in a column after the menu's longest label.
-pub fn menu_item(ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool, checked: Option<bool>) -> egui::Response {
-    menu_item_at(ui, label, shortcut, enabled, checked, MENU_W - 70.0, MENU_W)
-}
-
 pub(crate) fn menu_item_at(ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool, checked: Option<bool>, col: f32, w: f32) -> egui::Response {
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 22.0), sense);
@@ -454,10 +444,14 @@ impl Editor {
             return;
         }
         use crate::file_dialog::{Kind, Purpose};
+        let file_name = default
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("{name}.rbxmx"));
         let d = rfd::AsyncFileDialog::new()
             .add_filter("Roblox model", &["rbxmx", "rbxm"])
             .set_directory(&self.plugin_store.store.plugins_dir)
-            .set_file_name(default.file_name().unwrap().to_string_lossy());
+            .set_file_name(file_name);
         self.dialogs.start(Purpose::SaveLocalPlugin(self.doc.selection.clone()), d, Kind::SaveFile);
     }
 
@@ -606,7 +600,7 @@ impl Editor {
     pub fn menu_shortcut_actions(&mut self, ctx: &egui::Context) -> Vec<&'static str> {
         let mut out = Vec::new();
         ctx.input_mut(|i| {
-            for (k, a) in menu_shortcuts() {
+            for &(k, a) in menu_shortcuts() {
                 // Clipboard keys come as egui events; Del, F5, F8 and
                 // Shift+F5 go through the editor's own paths.
                 if matches!(a, "cut" | "copy" | "paste" | "test" | "run" | "stop" | "delete") {
@@ -650,7 +644,7 @@ impl Editor {
             .show(ctx, |ui| {
                 crate::icons::logo(ui, 32.0);
                 ui.label(RichText::new(format!("rustudio {}", env!("CARGO_PKG_VERSION"))).strong());
-                ui.label("A native Linux editor for Roblox places. Not made by Roblox.");
+                ui.label("A native Windows editor for Roblox places (Direct3D 11). Not made by Roblox.");
                 ui.label("Icons: Tabler Icons (MIT). See CREDITS.md.");
             });
         self.ui.about = open;

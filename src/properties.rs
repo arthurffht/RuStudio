@@ -51,7 +51,7 @@ pub struct PropertiesState {
     drag: Option<(u8, usize, usize)>,
     /// The edit box as last laid out: (row key, galley, text origin, rect).
     edit_layout: Option<(String, std::sync::Arc<egui::Galley>, Pos2, Rect)>,
-    cache: HashMap<(String, bool), Vec<Category>>,
+    cache: HashMap<(String, bool), std::rc::Rc<Vec<Category>>>,
     /// Row labels drawn last frame, in order (the self-test reads them).
     pub drawn: Vec<String>,
     /// Studio's BrickColor palette popup, when open.
@@ -182,11 +182,20 @@ pub(crate) fn nearest_brick(rgb: [u8; 3]) -> BrickColor {
 }
 
 /// The BrickColor whose colour this exactly is (Studio adds its name).
-fn brick_name(rgb: [u8; 3]) -> Option<String> {
-    (1..=1032u16)
-        .filter_map(BrickColor::from_number)
-        .find(|b| crate::scene::brick_rgb(*b) == rgb)
-        .map(|b| b.to_string())
+fn brick_name(rgb: [u8; 3]) -> Option<&'static str> {
+    static MAP: std::sync::OnceLock<HashMap<[u8; 3], &'static str>> = std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut map = HashMap::new();
+        for n in 1..=1032u16 {
+            if let Some(b) = BrickColor::from_number(n) {
+                let name: &'static str = Box::leak(b.to_string().into_boxed_str());
+                map.entry(crate::scene::brick_rgb(b)).or_insert(name);
+            }
+        }
+        map
+    })
+    .get(&rgb)
+    .copied()
 }
 
 fn mul(a: &Xform, b: &Xform) -> Xform {
@@ -247,6 +256,7 @@ struct Painter<'a> {
     ui: &'a mut egui::Ui,
     width: f32,
     x0: f32,
+    selftest: bool,
 }
 
 impl Painter<'_> {
@@ -255,18 +265,62 @@ impl Painter<'_> {
         let _ = key;
         (r, resp)
     }
+
+    fn is_visible(&self, y: f32, h: f32) -> bool {
+        if self.selftest {
+            return true;
+        }
+        let clip = self.ui.clip_rect();
+        y + h >= clip.min.y - ROW_H && y <= clip.max.y + ROW_H
+    }
 }
 
 impl Editor {
     pub fn properties_ui(&mut self, ui: &mut egui::Ui) {
         // Studio: the filter field always, its shortcut in the hint; the
         // selection's class and name are in the panel's title.
-        ui.add(
-            egui::TextEdit::singleline(&mut self.props.filter)
-                .id(egui::Id::new(PROPS_FILTER_ID))
+        ui.horizontal(|ui| {
+            let w = ui.available_width();
+            let (r, _) = ui.allocate_exact_size(Vec2::new(w, 26.0), Sense::hover());
+            let fid = egui::Id::new(PROPS_FILTER_ID);
+            let focused = ui.memory(|m| m.has_focus(fid));
+            ui.painter().rect(
+                r,
+                5.0,
+                crate::theme::PANEL_DARK,
+                Stroke::new(1.0, if focused { crate::theme::SELECT } else { crate::theme::DIVIDER }),
+                egui::StrokeKind::Inside,
+            );
+            crate::ti::paint(
+                ui.painter(),
+                Rect::from_center_size(Pos2::new(r.min.x + 13.0, r.center().y), Vec2::splat(14.0)),
+                "filter",
+                crate::theme::TEXT_DIM,
+            );
+            let right_pad = if self.props.filter.is_empty() { 6.0 } else { 22.0 };
+            let text_r = Rect::from_min_max(
+                Pos2::new(r.min.x + 24.0, r.min.y + 2.0),
+                Pos2::new(r.max.x - right_pad, r.max.y - 2.0),
+            );
+            let te = egui::TextEdit::singleline(&mut self.props.filter)
+                .id(fid)
                 .hint_text(format!("Filter Properties ({})", crate::studio_ui::shortcut_label("Ctrl+Shift+P")))
-                .desired_width(f32::INFINITY),
-        );
+                .frame(egui::Frame::NONE)
+                .desired_width(text_r.width())
+                .vertical_align(egui::Align::Center);
+            let resp = ui.put(text_r, te);
+            if !self.props.filter.is_empty() {
+                let xr = Rect::from_center_size(Pos2::new(r.max.x - 11.0, r.center().y), Vec2::splat(14.0));
+                let x = ui.interact(xr, egui::Id::new("props_filter_clear"), Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Clear filter");
+                crate::ti::paint(ui.painter(), xr, "x", if x.hovered() { Color32::WHITE } else { crate::theme::TEXT_DIM });
+                if x.clicked() {
+                    self.props.filter.clear();
+                    resp.request_focus();
+                }
+            }
+        });
         ui.add_space(2.0);
         self.props.drawn.clear();
         self.ui_rects.insert("props.panel", ui.max_rect());
@@ -287,9 +341,10 @@ impl Editor {
             .props
             .cache
             .entry((class.clone(), can_collide))
-            .or_insert_with(|| crate::props_layout::rows(&class, can_collide))
+            .or_insert_with(|| std::rc::Rc::new(crate::props_layout::rows(&class, can_collide)))
             .clone();
         let filter = self.props.filter.trim().to_lowercase();
+        let selftest = crate::selftest::running() || self.harness.selftest.is_some();
         let mut edits: Vec<Edit> = Vec::new();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -298,8 +353,8 @@ impl Editor {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 let width = ui.available_width();
                 let x0 = ui.cursor().min.x;
-                let mut p = Painter { ui, width, x0 };
-                for cat in &cats {
+                let mut p = Painter { ui, width, x0, selftest };
+                for cat in cats.iter() {
                     let rows: Vec<&Row> = cat
                         .rows
                         .iter()
@@ -356,6 +411,11 @@ impl Editor {
     /// `plus`: draw Studio's "+" at the right (Tags, Attributes) and report
     /// its click through the returned flag's second meaning via `plus_hit`.
     fn band(&mut self, p: &mut Painter, name: &str, folded: bool, plus_hit: Option<&mut bool>) -> bool {
+        let y = p.ui.cursor().min.y;
+        if !p.is_visible(y, CAT_H) {
+            p.ui.allocate_space(Vec2::new(p.width, CAT_H));
+            return false;
+        }
         let (r, resp) = p.row(name, CAT_H);
         let painter = p.ui.painter();
         painter.rect_filled(r, 0.0, BAND);
@@ -516,6 +576,20 @@ impl Editor {
     }
 
     fn prop_row(&mut self, p: &mut Painter, first: Ref, class: &str, name: &str, ro_api: bool, edits: &mut Vec<Edit>) {
+        self.props.drawn.push(name.to_string());
+        let y = p.ui.cursor().min.y;
+        let row_h = ROW_H + 1.0;
+        let open = self.props.open_rows.contains(name);
+        let editing_this = self.props.editing.as_ref().is_some_and(|(k, _)| {
+            k == name || k.strip_prefix(name).is_some_and(|rest| rest.starts_with('.'))
+        });
+        let dragging_this = self.props.slider_drag.as_ref().is_some_and(|d| d.prop == name);
+        let enum_id = egui::Id::new(("enum_popup", name));
+        let popup_open = egui::Popup::is_id_open(p.ui.ctx(), enum_id);
+        if !p.is_visible(y, row_h) && !open && !editing_this && !dragging_this && !popup_open {
+            p.ui.allocate_space(Vec2::new(p.width, row_h));
+            return;
+        }
         // ClassName / Parent aren't stored properties.
         let parent_is_root = self.doc.dom.get_by_ref(first).is_some_and(|i| i.parent() == self.doc.dom.root_ref());
         let value = match name {
@@ -605,7 +679,6 @@ impl Editor {
             .then_some(open)
             .or((matches!(value, Some(Variant::Faces(_))) || matches!(name, "ResizeableFaces" | "CurrentPhysicalProperties") || custom_set).then_some(false));
         Self::name_text(p, r, 0.0, name, color, arrow);
-        self.props.drawn.push(name.to_string());
         let on_name = resp.interact_pointer_pos().is_some_and(|q| q.x < v.min.x);
         if resp.clicked() && on_name && vec_like {
             if !self.props.open_rows.remove(name) {
@@ -695,16 +768,11 @@ impl Editor {
                     Variant::EnumItem(e) => (Some(e.ty.clone()), e.value),
                     _ => unreachable!(),
                 };
-                let items: Vec<(String, u32)> = ty
+                let cur_name = ty
                     .as_deref()
                     .and_then(|t| doc::db().enums.get(t))
-                    .map(|e| {
-                        let mut v: Vec<(String, u32)> = e.items.iter().map(|(k, v)| (k.to_string(), *v)).collect();
-                        v.sort_by_key(|(_, n)| *n);
-                        v
-                    })
-                    .unwrap_or_default();
-                let cur_name = items.iter().find(|(_, n)| *n == cur).map(|(k, _)| k.clone()).unwrap_or_else(|| cur.to_string());
+                    .and_then(|e| e.items.iter().find(|(_, v)| **v == cur).map(|(k, _)| k.to_string()))
+                    .unwrap_or_else(|| cur.to_string());
                 Self::value_label(p, v, &cur_name, color);
                 if !ro {
                     let id = egui::Id::new(("enum_popup", name));
@@ -723,6 +791,15 @@ impl Editor {
                         .width(width)
                         .frame(egui::Frame::popup(p.ui.style()).inner_margin(egui::Margin::same(2)).corner_radius(0))
                         .show(|ui| {
+                            let items: Vec<(String, u32)> = ty
+                                .as_deref()
+                                .and_then(|t| doc::db().enums.get(t))
+                                .map(|e| {
+                                    let mut v: Vec<(String, u32)> = e.items.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+                                    v.sort_by_key(|(_, n)| *n);
+                                    v
+                                })
+                                .unwrap_or_default();
                             ui.set_width(width - 4.0);
                             ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
                             egui::ScrollArea::vertical()
@@ -964,11 +1041,20 @@ impl Editor {
 
     /// A CFrame row with Position and Orientation under it (Studio's Transform / Pivot rows).
     fn frame_rows(&mut self, p: &mut Painter, first: Ref, label: &str, f: Frame, edits: &mut Vec<Edit>) {
+        self.props.drawn.push(label.to_string());
+        let folded = self.props.open_rows.contains(&format!("fold:{label}"));
+        let y = p.ui.cursor().min.y;
+        let total_h = if folded { ROW_H + 1.0 } else { (ROW_H + 1.0) * 3.0 };
+        let editing_this = self.props.editing.as_ref().is_some_and(|(k, _)| {
+            k == label || k.strip_prefix(label).is_some_and(|rest| rest.starts_with('.'))
+        });
+        if !p.is_visible(y, total_h) && !editing_this {
+            p.ui.allocate_space(Vec2::new(p.width, total_h));
+            return;
+        }
         let xf = self.frame_value(first, f).unwrap_or(Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY });
         let (r, _, resp) = Self::cells(p, label);
-        let folded = self.props.open_rows.contains(&format!("fold:{label}"));
         Self::name_text(p, r, 0.0, label, TEXT, Some(!folded));
-        self.props.drawn.push(label.to_string());
         if resp.clicked() {
             let k = format!("fold:{label}");
             if !self.props.open_rows.remove(&k) {

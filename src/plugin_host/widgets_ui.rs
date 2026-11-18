@@ -939,7 +939,7 @@ impl Editor {
         }
         // (UserInputService hears nothing of input inside a widget: Studio
         // 0.747, captures/studio-widgets.txt)
-        if slot.gui.layout.len() > 0 || plugin_ui.drag_over.is_some() || xd {
+        if plugin_ui.drag_over.is_some() || xd {
             ctx.request_repaint();
         }
         plugin_ui.q(at).extend(q);

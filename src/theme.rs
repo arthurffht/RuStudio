@@ -39,8 +39,17 @@ pub fn apply(ctx: &egui::Context) {
     v.selection.bg_fill = SELECT_BG;
     v.selection.stroke = Stroke::new(1.0, SELECT);
     v.hyperlink_color = ACCENT;
-    v.window_corner_radius = CornerRadius::same(3);
-    v.menu_corner_radius = CornerRadius::same(3);
+    v.window_corner_radius = CornerRadius::same(7);
+    v.menu_corner_radius = CornerRadius::same(7);
+    let popup_shadow = egui::Shadow {
+        offset: [0, 4],
+        blur: 14,
+        spread: 0,
+        color: Color32::from_black_alpha(110),
+    };
+    v.window_shadow = popup_shadow;
+    v.popup_shadow = popup_shadow;
+    v.window_stroke = Stroke::new(1.0, Color32::from_rgb(0x32, 0x35, 0x40));
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, DIVIDER);
     v.widgets.inactive.weak_bg_fill = PANEL_ALT;
     v.widgets.inactive.bg_fill = PANEL_ALT;
@@ -53,7 +62,7 @@ pub fn apply(ctx: &egui::Context) {
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        w.corner_radius = CornerRadius::same(2);
+        w.corner_radius = CornerRadius::same(5);
     }
     style.spacing.item_spacing = egui::vec2(6.0, 4.0);
     // Studio's menus and panels appear at once (no fades).
@@ -64,22 +73,36 @@ pub fn apply(ctx: &egui::Context) {
 
 pub fn dock_style(style: &egui::Style) -> egui_dock::Style {
     let mut s = egui_dock::Style::from_egui(style);
-    s.tab_bar.bg_fill = PANEL_DARK;
-    s.tab_bar.hline_color = DIVIDER;
+    let hairline = Color32::from_rgb(0x24, 0x26, 0x2e);
+    let tab_radius = CornerRadius { nw: 5, ne: 5, sw: 0, se: 0 };
+    s.tab_bar.bg_fill = Color32::from_rgb(0x13, 0x14, 0x18);
+    s.tab_bar.hline_color = hairline;
     s.tab_bar.height = 24.0;
     // Studio's panels have a full-width title bar with the name centred.
     s.tab_bar.fill_tab_bar = true;
-    s.tab.active.bg_fill = PANEL_DARK;
+    s.tab.active.bg_fill = PANEL;
     s.tab.active.text_color = TEXT;
-    s.tab.focused.bg_fill = PANEL_DARK;
-    s.tab.focused.text_color = TEXT;
-    s.tab.inactive.bg_fill = PANEL_DARK;
+    s.tab.active.outline_color = ACCENT.gamma_multiply(0.75);
+    s.tab.active.corner_radius = tab_radius;
+    s.tab.focused.bg_fill = PANEL;
+    s.tab.focused.text_color = Color32::WHITE;
+    s.tab.focused.outline_color = ACCENT;
+    s.tab.focused.corner_radius = tab_radius;
+    s.tab.active_with_kb_focus = s.tab.focused.clone();
+    s.tab.focused_with_kb_focus = s.tab.focused.clone();
+    s.tab.inactive.bg_fill = Color32::from_rgb(0x17, 0x18, 0x1d);
     s.tab.inactive.text_color = TEXT_DIM;
-    s.tab.hovered.bg_fill = HOVER_BG;
+    s.tab.inactive.outline_color = Color32::from_rgb(0x1f, 0x21, 0x28);
+    s.tab.inactive.corner_radius = tab_radius;
+    s.tab.hovered.bg_fill = Color32::from_rgb(0x22, 0x24, 0x2d);
+    s.tab.hovered.text_color = TEXT;
+    s.tab.hovered.outline_color = Color32::from_rgb(0x32, 0x35, 0x40);
+    s.tab.hovered.corner_radius = tab_radius;
     s.tab.tab_body.bg_fill = PANEL;
     s.tab.tab_body.inner_margin = egui::Margin::same(4);
+    s.tab.tab_body.stroke = Stroke::new(1.0, hairline);
     s.separator.width = 2.0;
-    s.separator.color_idle = DIVIDER;
+    s.separator.color_idle = hairline;
     s.separator.color_hovered = ACCENT;
     s.separator.color_dragged = SELECT;
     s.overlay.selection_color = ACCENT.gamma_multiply(0.4);

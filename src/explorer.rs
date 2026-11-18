@@ -222,16 +222,40 @@ impl Editor {
             }
         }
         ui.horizontal(|ui| {
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut self.explorer.filter)
-                    .hint_text("Search")
-                    .desired_width(f32::INFINITY),
+            let w = ui.available_width();
+            let (r, _) = ui.allocate_exact_size(Vec2::new(w, 26.0), Sense::hover());
+            let edit_id = egui::Id::new("explorer_search_edit");
+            let focused = ui.memory(|m| m.has_focus(edit_id));
+            ui.painter().rect(
+                r,
+                5.0,
+                theme::PANEL_DARK,
+                Stroke::new(1.0, if focused { theme::SELECT } else { theme::DIVIDER }),
+                egui::StrokeKind::Inside,
             );
-            self.ui_rects.insert("explorer.search", r.rect);
+            crate::ti::paint(
+                ui.painter(),
+                Rect::from_center_size(Pos2::new(r.min.x + 13.0, r.center().y), Vec2::splat(14.0)),
+                "search",
+                theme::TEXT_DIM,
+            );
+            let right_pad = if self.explorer.filter.is_empty() { 6.0 } else { 22.0 };
+            let text_r = Rect::from_min_max(
+                Pos2::new(r.min.x + 24.0, r.min.y + 2.0),
+                Pos2::new(r.max.x - right_pad, r.max.y - 2.0),
+            );
+            let te = egui::TextEdit::singleline(&mut self.explorer.filter)
+                .id(edit_id)
+                .hint_text("Search")
+                .frame(egui::Frame::NONE)
+                .desired_width(text_r.width())
+                .vertical_align(egui::Align::Center);
+            let resp = ui.put(text_r, te);
+            self.ui_rects.insert("explorer.search", r);
             // An "x" inside the box's right end clears the search.
             if !self.explorer.filter.is_empty() {
                 let x_rect = Rect::from_center_size(
-                    Pos2::new(r.rect.max.x - 10.0, r.rect.center().y),
+                    Pos2::new(r.max.x - 11.0, r.center().y),
                     Vec2::splat(14.0),
                 );
                 let x = ui.interact(x_rect, egui::Id::new("explorer_search_clear"), Sense::click());
@@ -241,6 +265,7 @@ impl Editor {
                 self.ui_rects.insert("explorer.search_clear", x_rect);
                 if x.clicked() {
                     self.explorer.filter.clear();
+                    resp.request_focus();
                 }
             }
         });
@@ -448,10 +473,18 @@ impl Editor {
                 Drop::Into
             })
         });
+        let hl_rect = rect.shrink2(Vec2::new(2.0, 1.0));
         if selected {
-            painter.rect_filled(rect, 0.0, theme::SELECT_BG);
+            painter.rect_filled(hl_rect, 3.0, theme::SELECT_BG);
         } else if resp.hovered() || drop.is_some() {
-            painter.rect_filled(rect, 0.0, theme::HOVER_BG);
+            painter.rect_filled(hl_rect, 3.0, theme::HOVER_BG);
+        }
+        for d in 0..depth {
+            let gx = rect.min.x + 4.0 + d as f32 * INDENT + 6.0;
+            painter.line_segment(
+                [Pos2::new(gx, rect.min.y), Pos2::new(gx, rect.max.y)],
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 14)),
+            );
         }
         let x0 = rect.min.x + 4.0 + depth as f32 * INDENT;
         match drop {
@@ -488,8 +521,13 @@ impl Editor {
         }
         let text_pos = Pos2::new(x0 + 34.0, rect.center().y);
         // The "+" just right of the name while the row is hovered (Studio's quick insert).
-        let label = if name.is_empty() { format!("({class})") } else { name.clone() };
-        let name_w = ui.fonts_mut(|f| f.layout_no_wrap(label, egui::FontId::proportional(13.0), theme::TEXT).size().x);
+        let (label, text_col) = if name.is_empty() {
+            (format!("({class})"), theme::TEXT_DIM)
+        } else {
+            (name.clone(), if selected { Color32::WHITE } else { theme::TEXT })
+        };
+        let galley = ui.fonts_mut(|f| f.layout_no_wrap(label, egui::FontId::proportional(13.0), text_col));
+        let name_w = galley.size().x;
         let plus_x = (text_pos.x + name_w + 6.0 + 8.0).min(rect.max.x - 10.0);
         let plus_rect = Rect::from_center_size(Pos2::new(plus_x, rect.center().y), Vec2::splat(16.0));
         let row_hot = ui.rect_contains_pointer(rect) && !egui::DragAndDrop::has_any_payload(ui.ctx());
@@ -524,9 +562,11 @@ impl Editor {
                 self.explorer.renaming = Some((r, text));
             }
         } else {
-            let color = if selected { Color32::WHITE } else { theme::TEXT };
-            let (label, col) = if name.is_empty() { (format!("({class})"), theme::TEXT_DIM) } else { (name.clone(), color) };
-            painter.text(text_pos, egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(13.0), col);
+            painter.galley(
+                Pos2::new(text_pos.x, rect.center().y - galley.size().y * 0.5),
+                galley,
+                text_col,
+            );
         }
 
         // Interaction.
