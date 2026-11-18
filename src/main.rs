@@ -9,6 +9,8 @@ mod plugin_store;
 mod toolbox;
 mod ui_pointer;
 mod offscreen;
+mod d3d11;
+mod quality;
 mod sim_clock;
 mod bytecode_cache;
 mod heap;

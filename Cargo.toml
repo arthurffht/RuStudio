@@ -31,9 +31,10 @@ skip-physics-tests = []
 [dependencies]
 rustudio-account = { path = "crates/rustudio-account" }
 rustudio-net = { path = "crates/rustudio-net" }
-eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "links"] }
-egui = "0.36"
-egui-wgpu = "0.36"
+egui = { version = "0.36", features = ["default_fonts"] }
+egui-winit = { version = "0.36", default-features = false, features = ["links", "clipboard"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+raw-window-handle = "0.6"
 egui_dock = { version = "0.21", features = ["serde"] }
 rbx_dom_weak = "4"
 rbx_binary = "3"
@@ -86,6 +87,7 @@ debug = "line-tables-only"
 # The Recycle Bin (platform.rs); thread/process CPU time, cycles, memory,
 # console attachment, SEH crash handler, and MCP instance liveness.
 windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_System_ProcessStatus", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_System_LibraryLoader"] }
 
 [dev-dependencies]
 draco-core = { version = "2.3", default-features = false, features = ["decoder", "encoder"] }
@@ -138,3 +140,4 @@ codegen-units = 256
 
 [build-dependencies]
 winresource = "0.1.34"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D_Fxc"] }

@@ -9,7 +9,8 @@
 //!   it didn't happen in a run.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::ffi::CString;
+use std::path::{Path, PathBuf};
 
 /// The first capitalised identifier-like string literal in `window`.
 fn first_name(window: &str) -> Option<String> {
@@ -133,6 +134,7 @@ fn main() {
     let out = Path::new(&std::env::var("OUT_DIR").unwrap()).join("engine_reads.rs");
     std::fs::write(out, code).unwrap();
     member_claims();
+    compile_d3d11_shaders();
     println!("cargo:rerun-if-changed=build.rs");
 }
 
@@ -665,4 +667,399 @@ fn member_claims() {
     println!("cargo:rerun-if-changed=src/plugin_host");
     println!("cargo:rerun-if-changed=src/runtime_ext.rs");
     println!("cargo:rerun-if-changed=src/editable.rs");
+}
+
+fn parse_mech_scalar(mech: &str, name: &str) -> String {
+    let needle = format!("pub const {name}:");
+    let line = mech
+        .lines()
+        .find(|l| l.trim_start().starts_with(&needle))
+        .unwrap_or_else(|| panic!("build.rs: missing constant {name} in src/mech.rs"));
+    let rhs = line
+        .split_once('=')
+        .unwrap_or_else(|| panic!("build.rs: missing '=' in {name}: {line}"))
+        .1;
+    let val = rhs.split(';').next().unwrap().trim().replace('_', "");
+    val
+}
+
+fn parse_mech_array<const N: usize>(mech: &str, name: &str) -> [String; N] {
+    let needle = format!("pub const {name}:");
+    let line = mech
+        .lines()
+        .find(|l| l.trim_start().starts_with(&needle))
+        .unwrap_or_else(|| panic!("build.rs: missing array {name} in src/mech.rs"));
+    let rhs = line
+        .split_once('=')
+        .unwrap_or_else(|| panic!("build.rs: missing '=' in {name}"))
+        .1;
+    let inner = rhs
+        .split_once('[')
+        .and_then(|(_, r)| r.split_once(']'))
+        .unwrap_or_else(|| panic!("build.rs: expected [...] in {name}"))
+        .0;
+    let parts: Vec<String> = inner
+        .split(',')
+        .map(|p| p.trim().replace('_', ""))
+        .collect();
+    assert_eq!(parts.len(), N, "build.rs: wrong length for {name}");
+    parts.try_into().unwrap()
+}
+
+fn fmt_hlsl_float(raw: &str) -> String {
+    let mut s = raw.trim().to_string();
+    if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+        s.push_str(".0");
+    }
+    if !s.ends_with('f') {
+        s.push('f');
+    }
+    s
+}
+
+fn write_mech_constants_hlsli(out_shader_dir: &Path) {
+    let mech = std::fs::read_to_string("src/mech.rs").expect("read src/mech.rs");
+    println!("cargo:rerun-if-changed=src/mech.rs");
+    println!("cargo:rerun-if-env-changed=RUSTUDIO_TERRAIN_CAPTURE_ID");
+    println!("cargo:rerun-if-env-changed=RUSTUDIO_TERRAIN_CAPTURE_NO_AO");
+
+    let mut h = String::from("// Auto-generated from src/mech.rs by build.rs.\n#ifndef RUSTUDIO_MECH_CONSTANTS_HLSLI\n#define RUSTUDIO_MECH_CONSTANTS_HLSLI\n\n");
+    let scalars = [
+        "GRASS_RADIUS",
+        "GRASS_FADE_LEN",
+        "GRASS_NEAR_RADIUS",
+        "GRASS_NEAR_FADE_LEN",
+        "SUN_DIST",
+        "HYBRID_LERP_SLOPE",
+        "BLOOM_WIDE_SHARE",
+        "BLOOM_GAIN",
+        "ATMOS_BAND_DEG",
+        "ATMOS_BAND_POW",
+        "ATMOS_BAND_FLOOR",
+        "ATMOS_T_EPS",
+        "ATMOS_FOG_MIP",
+        "ATMOS_ENV_CUBE_LEVELS",
+        "ENV_SPEC_LOD_SPAN",
+        "ENV_SPEC_FADE",
+        "ENV_ROUGH_BASE",
+        "ENV_ROUGH_SCALE",
+        "ENV_SPEC_MIP_PER_ROUGHNESS",
+        "ENV_REFLECT_UP_GAIN",
+        "LIGHTGRID_BORDER",
+        "LIGHTOCC_DENSITY",
+        "LIGHTOCC_START_VOXELS",
+        "LIGHTOCC_LIGHT_SKIP_VOXELS",
+        "LIGHTOCC_MAX_STEPS",
+        "LIGHT_INTENSITY",
+        "SSAO_DEPTH_SCALE",
+        "SSAO_DEPTH_MAX",
+        "SSAO_RADIUS_K",
+        "SSAO_RADIUS_MIN_TEXELS",
+        "SSAO_RADIUS_MAX_TEXELS",
+        "SSAO_DEPTH_GAIN",
+        "SSAO_BLUR_K",
+        "SSAO_BLUR_DEPTH",
+        "SSAO_BLUR_DEPTH_MIN",
+        "SSAO_BLUR_DEPTH_MAX",
+        "SSAO_UPSAMPLE_DEPTH",
+        "EVSM_POS_EXP",
+        "EVSM_NEG_EXP",
+        "EVSM_SHADOW_BIAS",
+        "EVSM_BLEED_CUT",
+        "DETILE_LEVELS",
+        "WANG_CELLS",
+        "MATERIAL_DIFFUSE_FADE_DEPTH",
+        "MATERIAL_LQ_DIFFUSE_CUTOFF",
+        "FX_LOCAL_REACH",
+        "FX_LOCAL_SLOPE",
+        "FX_LIGHT_CAP",
+        "FX_LIGHT_TOWARD_CAMERA",
+        "FX_LIGHT_CLAMP",
+    ];
+    for name in scalars {
+        let v = fmt_hlsl_float(&parse_mech_scalar(&mech, name));
+        h.push_str(&format!("static const float {name} = {v};\n"));
+    }
+
+    let near = fmt_hlsl_float(&parse_mech_scalar(&mech, "NEAR"));
+    let far = fmt_hlsl_float(&parse_mech_scalar(&mech, "FAR"));
+    h.push_str(&format!("static const float NEAR_PLANE = {near};\n"));
+    h.push_str(&format!("static const float FAR_PLANE = {far};\n"));
+
+    let [ta, tb, tc, td, te] = parse_mech_array::<5>(&mech, "TONE_CURVE");
+    for (suf, v) in [("A", ta), ("B", tb), ("C", tc), ("D", td), ("E", te)] {
+        h.push_str(&format!("static const float TONE_{suf} = {};\n", fmt_hlsl_float(&v)));
+    }
+
+    let [bs_n, bs_w] = parse_mech_array::<2>(&mech, "BLOOM_SIGMAS_PX");
+    h.push_str(&format!("static const float BLOOM_SIGMA_NARROW = {};\n", fmt_hlsl_float(&bs_n)));
+    h.push_str(&format!("static const float BLOOM_SIGMA_WIDE = {};\n", fmt_hlsl_float(&bs_w)));
+
+    let max_rad: i32 = parse_mech_scalar(&mech, "BLOOM_MAX_RADIUS").parse().unwrap();
+    let ssao_samples: u32 = parse_mech_scalar(&mech, "SSAO_SAMPLES").parse().unwrap();
+    let lshadow_atlas: u32 = parse_mech_scalar(&mech, "LSHADOW_ATLAS").parse().unwrap();
+    let lshadow_face: u32 = parse_mech_scalar(&mech, "LSHADOW_FACE").parse().unwrap();
+    let lshadow_cols = lshadow_atlas / lshadow_face;
+    let lshadow_cell = lshadow_face as f32 / lshadow_atlas as f32;
+    let cap_id = std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_ID").is_some();
+    let cap_no_ao = std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_NO_AO").is_some();
+
+    h.push_str(&format!("static const int BLOOM_MAX_RADIUS = {max_rad};\n"));
+    h.push_str(&format!("static const uint SSAO_SAMPLES = {ssao_samples}u;\n"));
+    h.push_str(&format!("static const uint LSHADOW_COLS = {lshadow_cols}u;\n"));
+    h.push_str(&format!("static const float LSHADOW_CELL = {lshadow_cell:?}f;\n"));
+    h.push_str(&format!("static const bool TERRAIN_CAPTURE_ID = {cap_id};\n"));
+    h.push_str(&format!("static const bool TERRAIN_CAPTURE_NO_AO = {cap_no_ao};\n"));
+    h.push_str("\n#endif\n");
+
+    std::fs::write(out_shader_dir.join("mech_constants.hlsli"), h)
+        .expect("write mech_constants.hlsli");
+}
+
+fn expand_hlsl_includes(
+    path: &Path,
+    src_dir: &Path,
+    gen_dir: &Path,
+    depth: usize,
+) -> String {
+    assert!(depth < 16, "HLSL include cycle or too deep at {}", path.display());
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("build.rs: cannot read HLSL file {}: {e}", path.display()));
+    let norm = path.to_string_lossy().replace('\\', "/");
+    let mut out = format!("#line 1 \"{norm}\"\n");
+    for (idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("#include") {
+            let rest = rest.trim();
+            if let Some(quoted) = rest.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                let gen_candidate = gen_dir.join(quoted);
+                let src_candidate = path.parent().unwrap_or(src_dir).join(quoted);
+                let fallback = src_dir.join(quoted);
+                let target = if gen_candidate.exists() {
+                    gen_candidate
+                } else if src_candidate.exists() {
+                    src_candidate
+                } else {
+                    fallback
+                };
+                out.push_str(&expand_hlsl_includes(&target, src_dir, gen_dir, depth + 1));
+                out.push_str(&format!("\n#line {} \"{norm}\"\n", idx + 2));
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+struct ShaderJob {
+    const_name: &'static str,
+    file: &'static str,
+    entry: &'static str,
+    target: &'static str,
+    msaa_samples: Option<&'static str>,
+}
+
+const SHADER_JOBS: &[ShaderJob] = &[
+    // egui
+    ShaderJob { const_name: "VS_EGUI", file: "egui.hlsl", entry: "vs_main", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_EGUI", file: "egui.hlsl", entry: "ps_main", target: "ps_5_0", msaa_samples: None },
+    // scene
+    ShaderJob { const_name: "VS_SKY", file: "scene.hlsl", entry: "vs_sky", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_SKY", file: "scene.hlsl", entry: "fs_sky", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "VS_PART", file: "scene.hlsl", entry: "vs_part", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_PART", file: "scene.hlsl", entry: "fs_part", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_PART_ENC", file: "scene.hlsl", entry: "fs_part_enc", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_DECAL_DEPTH", file: "scene.hlsl", entry: "fs_decal_depth", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_SEE_ENCODE_1X", file: "scene.hlsl", entry: "fs_see_encode", target: "ps_5_0", msaa_samples: Some("1") },
+    ShaderJob { const_name: "PS_SEE_ENCODE_MSAA", file: "scene.hlsl", entry: "fs_see_encode", target: "ps_5_0", msaa_samples: Some("4") },
+    ShaderJob { const_name: "PS_SEE_DECODE_1X", file: "scene.hlsl", entry: "fs_see_decode", target: "ps_5_0", msaa_samples: Some("1") },
+    ShaderJob { const_name: "PS_SEE_DECODE_MSAA", file: "scene.hlsl", entry: "fs_see_decode", target: "ps_5_0", msaa_samples: Some("4") },
+    ShaderJob { const_name: "VS_LIGHT_SHADOW", file: "scene.hlsl", entry: "vs_light_shadow", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_LIGHT_SHADOW", file: "scene.hlsl", entry: "fs_light_shadow", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "VS_SHADOW", file: "scene.hlsl", entry: "vs_shadow", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "VS_TERRAIN", file: "scene.hlsl", entry: "vs_terrain", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_TERRAIN", file: "scene.hlsl", entry: "fs_terrain", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "VS_TERRAIN_SHADOW", file: "scene.hlsl", entry: "vs_terrain_shadow", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "VS_LINE", file: "scene.hlsl", entry: "vs_line", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_LINE", file: "scene.hlsl", entry: "fs_line", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_GLASS_DEPTH_1X", file: "scene.hlsl", entry: "fs_glass_depth", target: "ps_5_0", msaa_samples: Some("1") },
+    ShaderJob { const_name: "PS_GLASS_DEPTH_MSAA", file: "scene.hlsl", entry: "fs_glass_depth", target: "ps_5_0", msaa_samples: Some("4") },
+    // post
+    ShaderJob { const_name: "VS_POST", file: "post.hlsl", entry: "vs_post", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_BLOOM_BRIGHT", file: "post.hlsl", entry: "fs_bloom_bright", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_BLOOM_DOWN", file: "post.hlsl", entry: "fs_bloom_down", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_BLOOM_UP", file: "post.hlsl", entry: "fs_bloom_up", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_DOF_H_1X", file: "post.hlsl", entry: "fs_dof_h", target: "ps_5_0", msaa_samples: Some("1") },
+    ShaderJob { const_name: "PS_DOF_H_MSAA", file: "post.hlsl", entry: "fs_dof_h", target: "ps_5_0", msaa_samples: Some("4") },
+    ShaderJob { const_name: "PS_NEAR_H_1X", file: "post.hlsl", entry: "fs_near_h", target: "ps_5_0", msaa_samples: Some("1") },
+    ShaderJob { const_name: "PS_NEAR_H_MSAA", file: "post.hlsl", entry: "fs_near_h", target: "ps_5_0", msaa_samples: Some("4") },
+    ShaderJob { const_name: "PS_NEAR_V_1X", file: "post.hlsl", entry: "fs_near_v", target: "ps_5_0", msaa_samples: Some("1") },
+    ShaderJob { const_name: "PS_NEAR_V_MSAA", file: "post.hlsl", entry: "fs_near_v", target: "ps_5_0", msaa_samples: Some("4") },
+    ShaderJob { const_name: "PS_NEAR_MASK0", file: "post.hlsl", entry: "fs_near_mask0", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_NEAR_MASK1", file: "post.hlsl", entry: "fs_near_mask1", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_NEAR_MASK2", file: "post.hlsl", entry: "fs_near_mask2", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_NEAR_MASK3", file: "post.hlsl", entry: "fs_near_mask3", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_NEAR_MASK4", file: "post.hlsl", entry: "fs_near_mask4", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_NEAR_MASK5", file: "post.hlsl", entry: "fs_near_mask5", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_NEAR_EDGE", file: "post.hlsl", entry: "fs_near_edge", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_NEAR_BOKEH", file: "post.hlsl", entry: "fs_near_bokeh", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_NEAR_TENT", file: "post.hlsl", entry: "fs_near_tent", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_DOF_V_1X", file: "post.hlsl", entry: "fs_dof_v", target: "ps_5_0", msaa_samples: Some("1") },
+    ShaderJob { const_name: "PS_DOF_V_MSAA", file: "post.hlsl", entry: "fs_dof_v", target: "ps_5_0", msaa_samples: Some("4") },
+    ShaderJob { const_name: "PS_POST_1X", file: "post.hlsl", entry: "fs_post", target: "ps_5_0", msaa_samples: Some("1") },
+    ShaderJob { const_name: "PS_POST_MSAA", file: "post.hlsl", entry: "fs_post", target: "ps_5_0", msaa_samples: Some("4") },
+    ShaderJob { const_name: "PS_SSAO_DOWN_1X", file: "post.hlsl", entry: "fs_ssao_down", target: "ps_5_0", msaa_samples: Some("1") },
+    ShaderJob { const_name: "PS_SSAO_DOWN_MSAA", file: "post.hlsl", entry: "fs_ssao_down", target: "ps_5_0", msaa_samples: Some("4") },
+    ShaderJob { const_name: "PS_SSAO", file: "post.hlsl", entry: "fs_ssao", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_SSAO_BLUR_X", file: "post.hlsl", entry: "fs_ssao_blur_x", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_SSAO_BLUR_Y", file: "post.hlsl", entry: "fs_ssao_blur_y", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_SSAO_APPLY", file: "post.hlsl", entry: "fs_ssao_apply", target: "ps_5_0", msaa_samples: None },
+    // water
+    ShaderJob { const_name: "VS_WATER", file: "water.hlsl", entry: "vs_water", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_WATER_1X", file: "water.hlsl", entry: "fs_water", target: "ps_5_0", msaa_samples: Some("1") },
+    ShaderJob { const_name: "PS_WATER_MSAA", file: "water.hlsl", entry: "fs_water", target: "ps_5_0", msaa_samples: Some("4") },
+    // clouds
+    ShaderJob { const_name: "VS_CLOUDS", file: "clouds.hlsl", entry: "vs_clouds", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_CLOUDS_BSM", file: "clouds.hlsl", entry: "fs_clouds_bsm", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_CLOUDS_COVER", file: "clouds.hlsl", entry: "fs_clouds_cover", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_CLOUDS_WIND", file: "clouds.hlsl", entry: "fs_clouds_wind", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_CLOUDS_UP_1X", file: "clouds.hlsl", entry: "fs_clouds_up", target: "ps_5_0", msaa_samples: Some("1") },
+    ShaderJob { const_name: "PS_CLOUDS_UP_MSAA", file: "clouds.hlsl", entry: "fs_clouds_up", target: "ps_5_0", msaa_samples: Some("4") },
+    ShaderJob { const_name: "PS_CLOUDS_COMP", file: "clouds.hlsl", entry: "fs_clouds_comp", target: "ps_5_0", msaa_samples: None },
+    // world_gui + fx + glass + mip
+    ShaderJob { const_name: "VS_GUI", file: "world_gui.hlsl", entry: "vs_gui", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_GUI_1X", file: "world_gui.hlsl", entry: "fs_gui", target: "ps_5_0", msaa_samples: Some("1") },
+    ShaderJob { const_name: "PS_GUI_MSAA", file: "world_gui.hlsl", entry: "fs_gui", target: "ps_5_0", msaa_samples: Some("4") },
+    ShaderJob { const_name: "VS_MIP", file: "world_gui.hlsl", entry: "vs_mip", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_MIP", file: "world_gui.hlsl", entry: "fs_mip", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "VS_FX_STRIP", file: "world_gui.hlsl", entry: "vs_strip", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "VS_FX_PARTICLE", file: "world_gui.hlsl", entry: "vs_particle", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_FX_1X", file: "world_gui.hlsl", entry: "fs_fx", target: "ps_5_0", msaa_samples: Some("1") },
+    ShaderJob { const_name: "PS_FX_MSAA", file: "world_gui.hlsl", entry: "fs_fx", target: "ps_5_0", msaa_samples: Some("4") },
+    ShaderJob { const_name: "VS_GLASS_MASK", file: "world_gui.hlsl", entry: "vs_glass_mask", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_GLASS_IN", file: "world_gui.hlsl", entry: "fs_in", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_GLASS_OUT", file: "world_gui.hlsl", entry: "fs_out", target: "ps_5_0", msaa_samples: None },
+    // env_probe
+    ShaderJob { const_name: "VS_PROBE", file: "env_probe.hlsl", entry: "vs_probe", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_PROBE_DEFAULT", file: "env_probe.hlsl", entry: "fs_probe_default", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_PROBE_BLIT", file: "env_probe.hlsl", entry: "fs_probe_blit", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_PROBE_DOWN", file: "env_probe.hlsl", entry: "fs_probe_down", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_PROBE_CONV", file: "env_probe.hlsl", entry: "fs_probe_conv", target: "ps_5_0", msaa_samples: None },
+    // sun_shadow blur
+    ShaderJob { const_name: "VS_SUN_BLUR", file: "sun_shadow.hlsl", entry: "vs", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_SUN_BLUR_H", file: "sun_shadow.hlsl", entry: "fs_h", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_SUN_BLUR_V", file: "sun_shadow.hlsl", entry: "fs_v", target: "ps_5_0", msaa_samples: None },
+    // highlight
+    ShaderJob { const_name: "VS_HL_MASK", file: "highlight.hlsl", entry: "vs_mask", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_HL_MASK", file: "highlight.hlsl", entry: "fs_mask", target: "ps_5_0", msaa_samples: None },
+    ShaderJob { const_name: "VS_HL_FULL", file: "highlight.hlsl", entry: "vs_full", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_HL_COMP", file: "highlight.hlsl", entry: "fs_comp", target: "ps_5_0", msaa_samples: None },
+    // skin compute
+    ShaderJob { const_name: "CS_SKIN", file: "skin.hlsl", entry: "main", target: "cs_5_0", msaa_samples: None },
+    // viewport frame blit
+    ShaderJob { const_name: "VS_VF_BLIT", file: "vf_blit.hlsl", entry: "vs", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_VF_BLIT", file: "vf_blit.hlsl", entry: "fs", target: "ps_5_0", msaa_samples: None },
+];
+
+fn compile_d3d11_shaders() {
+    use windows::Win32::Graphics::Direct3D::Fxc::{
+        D3DCompile, D3DCOMPILE_ENABLE_STRICTNESS, D3DCOMPILE_OPTIMIZATION_LEVEL3,
+        D3DCOMPILE_PACK_MATRIX_COLUMN_MAJOR,
+    };
+    use windows::Win32::Graphics::Direct3D::{ID3DBlob, D3D_SHADER_MACRO};
+    use windows::core::PCSTR;
+
+    let src_dir = Path::new("src/shaders");
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("shaders");
+    std::fs::create_dir_all(&out_dir).expect("create OUT_DIR/shaders");
+    println!("cargo:rerun-if-changed=src/shaders");
+
+    write_mech_constants_hlsli(&out_dir);
+
+    let flags = D3DCOMPILE_OPTIMIZATION_LEVEL3
+        | D3DCOMPILE_ENABLE_STRICTNESS
+        | D3DCOMPILE_PACK_MATRIX_COLUMN_MAJOR;
+
+    let mut cached_sources: std::collections::BTreeMap<&'static str, String> =
+        std::collections::BTreeMap::new();
+    let mut mod_rs = String::from("// Auto-generated DXBC shader modules by build.rs.\n");
+
+    for job in SHADER_JOBS {
+        let src = cached_sources
+            .entry(job.file)
+            .or_insert_with(|| expand_hlsl_includes(&src_dir.join(job.file), src_dir, &out_dir, 0));
+
+        let src_name_c = CString::new(format!("src/shaders/{}", job.file)).unwrap();
+        let entry_c = CString::new(job.entry).unwrap();
+        let target_c = CString::new(job.target).unwrap();
+
+        let macro_name = CString::new("MSAA_SAMPLES").unwrap();
+        let macro_val = job.msaa_samples.map(|v| CString::new(v).unwrap());
+        let macros: Vec<D3D_SHADER_MACRO> = match &macro_val {
+            Some(v) => vec![
+                D3D_SHADER_MACRO {
+                    Name: PCSTR(macro_name.as_ptr() as _),
+                    Definition: PCSTR(v.as_ptr() as _),
+                },
+                D3D_SHADER_MACRO { Name: PCSTR::null(), Definition: PCSTR::null() },
+            ],
+            None => vec![D3D_SHADER_MACRO { Name: PCSTR::null(), Definition: PCSTR::null() }],
+        };
+
+        let mut code_blob: Option<ID3DBlob> = None;
+        let mut err_blob: Option<ID3DBlob> = None;
+        let res = unsafe {
+            D3DCompile(
+                src.as_ptr() as *const core::ffi::c_void,
+                src.len(),
+                PCSTR(src_name_c.as_ptr() as _),
+                Some(macros.as_ptr()),
+                None,
+                PCSTR(entry_c.as_ptr() as _),
+                PCSTR(target_c.as_ptr() as _),
+                flags,
+                0,
+                &mut code_blob,
+                Some(&mut err_blob),
+            )
+        };
+
+        let msgs = err_blob
+            .as_ref()
+            .map(|b| unsafe {
+                let ptr = b.GetBufferPointer() as *const u8;
+                let len = b.GetBufferSize();
+                String::from_utf8_lossy(std::slice::from_raw_parts(ptr, len)).into_owned()
+            })
+            .unwrap_or_default();
+
+        if let Err(e) = res {
+            panic!(
+                "D3DCompile failed for {} ({}:{} [{}], msaa={:?}): {e}\n{msgs}",
+                job.const_name, job.file, job.entry, job.target, job.msaa_samples
+            );
+        }
+        if !msgs.trim().is_empty() {
+            for line in msgs.lines() {
+                println!("cargo:warning=HLSL[{}]: {line}", job.const_name);
+            }
+        }
+
+        let blob = code_blob.expect("D3DCompile succeeded without bytecode blob");
+        let bytes = unsafe {
+            let ptr = blob.GetBufferPointer() as *const u8;
+            let len = blob.GetBufferSize();
+            std::slice::from_raw_parts(ptr, len)
+        };
+        let dxbc_name = format!("{}.dxbc", job.const_name);
+        std::fs::write(out_dir.join(&dxbc_name), bytes).expect("write dxbc");
+        mod_rs.push_str(&format!(
+            "pub const {}: &[u8] = include_bytes!({dxbc_name:?});\n",
+            job.const_name
+        ));
+    }
+
+    std::fs::write(out_dir.join("mod.rs"), mod_rs).expect("write OUT_DIR/shaders/mod.rs");
 }
