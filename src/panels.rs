@@ -11,7 +11,7 @@
 //!
 //! Pop-out: each tab has a button next to its close × (vendor/egui_dock,
 //! `TabViewer::show_pop_out_button`) that moves it into its own OS window
-//! (an egui immediate viewport: its own surface on the wgpu renderer, so it
+//! (an egui immediate viewport: its own DXGI swapchain on the D3D11 device, so it
 //! can sit on another monitor). Inside such a window the same button docks
 //! the tab back, and closing the window docks all of its tabs back. A
 //! popped window holds its own `DockState`, so several tabs can share one

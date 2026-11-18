@@ -969,3 +969,36 @@ pub const GRASS_NEAR_SAMPLE_POINTS: [[f32; 2]; 32] = [
 /// A panel window (src/panels.rs) eframe couldn't show this many frames in
 /// a row is docked back into the main window (app.rs panel_windows).
 pub const PANEL_WINDOW_MAX_FAILS: u32 = 30;
+
+// D3D11 quality profile and Frame Rate Manager (src/quality.rs, estimated)
+pub const QUALITY_LEVEL_MIN: u8 = 1;
+pub const QUALITY_LEVEL_MAX: u8 = 21;
+pub const QUALITY_UMA_DEFAULT_LEVEL: u8 = 5;
+pub const QUALITY_LOW_VRAM_MB: u64 = 512;
+pub const QUALITY_MID_VRAM_MB: u64 = 2048;
+pub const QUALITY_MID_DEFAULT_LEVEL: u8 = 12;
+pub const QUALITY_SHADOWS_MIN_LEVEL: u8 = 4;
+pub const QUALITY_BLOOM_MIN_LEVEL: u8 = 6;
+pub const QUALITY_LOCAL_SHADOWS_MIN_LEVEL: u8 = 8;
+pub const QUALITY_CASCADES_3_MIN_LEVEL: u8 = 10;
+pub const QUALITY_SSAO_MIN_LEVEL: u8 = 12;
+pub const QUALITY_HIGH_SHADOW_MIN_LEVEL: u8 = 14;
+pub const QUALITY_DOF_MIN_LEVEL: u8 = 14;
+pub const QUALITY_LOD_FULL_MIN_LEVEL: u8 = 14;
+pub const QUALITY_MSAA_MIN_LEVEL: u8 = 16;
+pub const QUALITY_CASCADES_4_MIN_LEVEL: u8 = 16;
+pub const QUALITY_MSAA_SAMPLES: u32 = 4;
+pub const QUALITY_SHADOW_ATLAS_LOW: u32 = 512;
+pub const QUALITY_SHADOW_ATLAS_MID: u32 = 1024;
+pub const QUALITY_SHADOW_ATLAS_HIGH: u32 = 2048;
+pub const QUALITY_MAX_LOCAL_SHADOWS_MID: usize = 4;
+pub const QUALITY_MAX_LOCAL_SHADOWS_HIGH: usize = 16;
+pub const FRM_TARGET_INITIAL_MS: f32 = 16.6;
+pub const FRM_EMA_ALPHA: f32 = 0.1;
+pub const FRM_FRAME_MS_MIN: f32 = 0.5;
+pub const FRM_FRAME_MS_MAX: f32 = 500.0;
+pub const FRM_HYSTERESIS_FRAMES: u32 = 45;
+pub const FRM_DOWNGRADE_MS: f32 = 22.0;
+pub const FRM_UPGRADE_MS: f32 = 10.5;
+pub const FRM_DOWNGRADE_STEP: u8 = 2;
+pub const FRM_UPGRADE_STEP: u8 = 1;

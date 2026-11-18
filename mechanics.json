@@ -2280,6 +2280,47 @@
    "group": "terrain",
    "value": "surfaces over the camera only (normal y >= 0.5, seen from below)",
    "source": "offline Studio: terrain Place A (surface drawn) and Place B F4 (no water walls)"
+  },
+  {
+   "name": "quality level range",
+   "group": "performance",
+   "value": "1..=21 (Automatic = 0)",
+   "source": "Roblox Enum.QualityLevel"
+  },
+  {
+   "name": "UMA default quality level",
+   "group": "performance",
+   "value": 5,
+   "estimated": true,
+   "source": "D3D11 Automatic quality preset for integrated/UMA GPUs (<= 512 MB dedicated VRAM or no 4x FP16 MSAA)"
+  },
+  {
+   "name": "mid-VRAM quality level",
+   "group": "performance",
+   "value": 12,
+   "estimated": true,
+   "source": "D3D11 Automatic quality preset for discrete GPUs with < 2048 MB VRAM"
+  },
+  {
+   "name": "D3D11 quality feature thresholds",
+   "group": "performance",
+   "value": "shadows/clouds >= 4, bloom >= 6, local shadows >= 8, 3-cascade >= 10, SSAO >= 12, DoF/high-shadow/LOD-1.0 >= 14, 4x MSAA/4-cascade >= 16 (UMA caps MSAA at 1x, atlas at 1024, local shadows at 4, and auto SSAO/DoF off)",
+   "estimated": true
+  },
+  {
+   "name": "FRM hysteresis frames",
+   "group": "performance",
+   "value": 45,
+   "unit": "frames",
+   "estimated": true,
+   "source": "FrameRateManager cooldown between automatic quality steps (EMA alpha 0.1, initial 16.6 ms, clamp 0.5..500 ms)"
+  },
+  {
+   "name": "FRM downgrade / upgrade thresholds",
+   "group": "performance",
+   "value": "> 22.0 ms steps down by 2; < 10.5 ms steps up by 1",
+   "unit": "ms",
+   "estimated": true
   }
  ]
 }

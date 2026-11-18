@@ -255,7 +255,11 @@ pub fn create_device() -> Result<RenderState, String> {
         is_uma,
         msaa_fp16_max_samples: if fp16_4x > 0 { 4 } else { 1 },
         msaa_rgba8_max_samples: if rgba8_4x > 0 { 4 } else { 1 },
-        max_texture_dim: 16384,
+        max_texture_dim: if fl.0 >= D3D_FEATURE_LEVEL_11_0.0 {
+            16384
+        } else {
+            8192
+        },
         max_anisotropy: 16,
     };
 
@@ -859,15 +863,15 @@ pub fn create_input_layout(
 }
 
 pub fn unbind_ps_srvs(ctx: &ID3D11DeviceContext, start: u32, count: u32) {
-    let mut slots: [Option<ID3D11ShaderResourceView>; 32] = std::array::from_fn(|_| None);
+    let slots: [Option<ID3D11ShaderResourceView>; 32] = std::array::from_fn(|_| None);
     let n = (count as usize).min(slots.len());
     unsafe { ctx.PSSetShaderResources(start, Some(&slots[..n])) };
 }
 
 pub fn unbind_cs_uavs(ctx: &ID3D11DeviceContext, start: u32, count: u32) {
-    let mut slots: [Option<ID3D11UnorderedAccessView>; 8] = std::array::from_fn(|_| None);
+    let slots: [Option<ID3D11UnorderedAccessView>; 8] = std::array::from_fn(|_| None);
     let n = (count as usize).min(slots.len());
-    unsafe { ctx.CSSetUnorderedAccessViews(start, Some(&slots[..n]), None) };
+    unsafe { ctx.CSSetUnorderedAccessViews(start, n as u32, Some(slots.as_ptr()), None) };
 }
 
 pub fn set_viewport(ctx: &ID3D11DeviceContext, x: f32, y: f32, w: f32, h: f32) {
@@ -892,13 +896,17 @@ pub fn set_scissor(ctx: &ID3D11DeviceContext, x: i32, y: i32, w: i32, h: i32) {
     unsafe { ctx.RSSetScissorRects(Some(&[rect])) };
 }
 
-pub fn read_tex2d_rgba8(
+fn read_tex2d_bytes(
     device: &ID3D11Device,
     ctx: &ID3D11DeviceContext,
     tex: &ID3D11Texture2D,
     width: u32,
     height: u32,
+    bytes_per_pixel: u32,
 ) -> Vec<u8> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     unsafe { tex.GetDesc(&mut desc) };
     desc.Width = width;
@@ -921,7 +929,7 @@ pub fn read_tex2d_rgba8(
         ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
             .expect("Map readback");
     }
-    let row_bytes = (width * 4) as usize;
+    let row_bytes = (width * bytes_per_pixel) as usize;
     let pitch = mapped.RowPitch as usize;
     let mut out = vec![0u8; row_bytes * height as usize];
     for y in 0..height as usize {
@@ -934,6 +942,16 @@ pub fn read_tex2d_rgba8(
     out
 }
 
+pub fn read_tex2d_rgba8(
+    device: &ID3D11Device,
+    ctx: &ID3D11DeviceContext,
+    tex: &ID3D11Texture2D,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    read_tex2d_bytes(device, ctx, tex, width, height, 4)
+}
+
 pub fn read_tex2d_rgba16f(
     device: &ID3D11Device,
     ctx: &ID3D11DeviceContext,
@@ -941,37 +959,60 @@ pub fn read_tex2d_rgba16f(
     width: u32,
     height: u32,
 ) -> Vec<u8> {
-    let mut desc = D3D11_TEXTURE2D_DESC::default();
-    unsafe { tex.GetDesc(&mut desc) };
-    desc.Width = width;
-    desc.Height = height;
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.SampleDesc = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
-    desc.Usage = D3D11_USAGE_STAGING;
-    desc.BindFlags = 0;
-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
-    desc.MiscFlags = 0;
+    read_tex2d_bytes(device, ctx, tex, width, height, 8)
+}
 
-    let mut staging = None;
-    unsafe { device.CreateTexture2D(&desc, None, Some(&mut staging)) }.expect("staging hdr tex");
-    let staging = staging.unwrap();
-    unsafe { ctx.CopyResource(&staging, tex) };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-    unsafe {
-        ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-            .expect("Map hdr readback");
+    #[test]
+    fn create_device_reports_valid_caps() {
+        let Ok(rs) = create_device() else {
+            // Headless VM / CI without a D3D11 adapter: skip hardware assertions.
+            return;
+        };
+        assert!(!rs.caps.adapter_name.is_empty());
+        assert!(rs.caps.feature_level.0 >= D3D_FEATURE_LEVEL_10_0.0);
+        let expected_dim = if rs.caps.feature_level.0 >= D3D_FEATURE_LEVEL_11_0.0 {
+            16384
+        } else {
+            8192
+        };
+        assert_eq!(rs.caps.max_texture_dim, expected_dim);
+        assert!(rs.caps.msaa_rgba8_max_samples >= 1);
+        assert!(rs.caps.msaa_fp16_max_samples >= 1);
     }
-    let row_bytes = (width * 8) as usize;
-    let pitch = mapped.RowPitch as usize;
-    let mut out = vec![0u8; row_bytes * height as usize];
-    for y in 0..height as usize {
-        unsafe {
-            let src = (mapped.pData as *const u8).add(y * pitch);
-            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr().add(y * row_bytes), row_bytes);
-        }
+
+    #[test]
+    fn create_cb_rounds_up_to_16_bytes() {
+        let Ok(rs) = create_device() else {
+            return;
+        };
+        let cb = create_cb(&rs.device, 20);
+        let mut desc = D3D11_BUFFER_DESC::default();
+        unsafe { cb.GetDesc(&mut desc) };
+        assert_eq!(desc.ByteWidth, 32);
+        assert_eq!(desc.BindFlags, D3D11_BIND_CONSTANT_BUFFER.0 as u32);
     }
-    unsafe { ctx.Unmap(&staging, 0) };
-    out
+
+    #[test]
+    fn read_tex2d_zero_size_returns_empty() {
+        let Ok(rs) = create_device() else {
+            return;
+        };
+        let tex = create_tex2d(
+            &rs.device,
+            &Tex2dSpec {
+                width: 4,
+                height: 4,
+                format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                bind_flags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                ..Tex2dSpec::default()
+            },
+            None,
+        );
+        assert!(read_tex2d_rgba8(&rs.device, &rs.context, &tex, 0, 4).is_empty());
+        assert!(read_tex2d_rgba16f(&rs.device, &rs.context, &tex, 4, 0).is_empty());
+    }
 }

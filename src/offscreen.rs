@@ -1,23 +1,19 @@
 //! `--headless` / `--no-render`: run the app with no window, no compositor
-//! and no display server (no gamescope or Xvfb wrapper).
+//! and no display server.
 //!
-//! `--headless` makes a wgpu device without a surface and paints each egui
-//! frame into an offscreen Rgba8Unorm texture the size of `--window WxH`;
-//! `ViewportCommand::Screenshot` reads that texture back and answers with an
-//! `Event::Screenshot` the next frame, as eframe does for a window, so the
-//! harness (--shots, --screenshot) is the same code. `--no-render` makes no
-//! device at all: simulation, scripts, physics and audio state run, egui
-//! lays the frame out, nothing is drawn, and screenshots come back empty
-//! (the harness writes no picture, only the log and frame times).
-//!
-//! Frames are paced at 60 Hz (a display's vsync, which a windowed test run
-//! gets from gamescope) except under --bench, which measures unpaced.
+//! `--headless` creates a headless Direct3D 11 device without a swapchain and
+//! paints each egui frame into an offscreen `R8G8B8A8_UNORM` texture the size
+//! of `--window WxH`; `ViewportCommand::Screenshot` reads that texture back
+//! and answers with an `Event::Screenshot` the next frame, just like the
+//! native window host, so the harness (`--shots`, `--screenshot`) shares one
+//! code path. `--no-render` makes no GPU device at all: simulation, scripts,
+//! physics and audio state run, egui lays the frame out, nothing is drawn,
+//! and screenshots come back empty.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use eframe::App as _;
-use egui_wgpu::wgpu;
+use crate::d3d11::{self, OffscreenTarget, RenderState, WindowApp as _};
 
 pub struct Options {
     pub size: [u32; 2],
@@ -25,97 +21,26 @@ pub struct Options {
     pub paced: bool,
 }
 
-/// The wgpu device as eframe would make it (rustudio's limits and
-/// features: main.rs), without a surface.
-fn render_state(config: &egui_wgpu::WgpuConfiguration) -> Result<egui_wgpu::RenderState, String> {
-    pollster::block_on(async {
-        let instance = config.wgpu_setup.new_instance().await;
-        egui_wgpu::RenderState::create(config, &instance, None, egui_wgpu::RendererOptions::default())
-            .await
-            .map_err(|e| e.to_string())
-    })
-}
-
-struct Target {
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
-}
-
-fn target(rs: &egui_wgpu::RenderState, size: [u32; 2]) -> Target {
-    let texture = rs.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("offscreen frame"),
-        size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: rs.target_format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let view = texture.create_view(&Default::default());
-    Target { texture, view }
-}
-
-/// The frame's pixels (the same conversion as egui_wgpu's window capture).
-fn read_back(rs: &egui_wgpu::RenderState, t: &Target, size: [u32; 2]) -> egui::ColorImage {
-    let [w, h] = size;
-    let row = (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-    let buffer = rs.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("offscreen readback"),
-        size: (row * h) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let mut enc = rs.device.create_command_encoder(&Default::default());
-    enc.copy_texture_to_buffer(
-        t.texture.as_image_copy(),
-        wgpu::TexelCopyBufferInfo {
-            buffer: &buffer,
-            layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) },
-        },
-        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-    );
-    rs.queue.submit([enc.finish()]);
-    let slice = buffer.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| {
-        let _ = tx.send(r);
-    });
-    let _ = rs.device.poll(wgpu::PollType::wait_indefinitely());
-    if !matches!(rx.recv(), Ok(Ok(()))) {
+fn read_back(rs: &RenderState, t: &OffscreenTarget, size: [u32; 2]) -> egui::ColorImage {
+    let rgba = t.read_rgba8(&rs.device, &rs.context);
+    let expected = (size[0] as usize) * (size[1] as usize) * 4;
+    if rgba.len() != expected {
         return egui::ColorImage::new([0, 0], Vec::new());
     }
-    let order = match rs.target_format {
-        wgpu::TextureFormat::Bgra8Unorm => [2, 1, 0, 3],
-        _ => [0, 1, 2, 3],
-    };
-    let Ok(data) = slice.get_mapped_range() else {
-        return egui::ColorImage::new([0, 0], Vec::new());
-    };
-    let mut pixels = Vec::with_capacity((w * h) as usize);
-    for y in 0..h as usize {
-        let r = &data[y * row as usize..][..w as usize * 4];
-        for p in r.chunks_exact(4) {
-            pixels.push(egui::Color32::from_rgba_premultiplied(p[order[0]], p[order[1]], p[order[2]], p[order[3]]));
-        }
-    }
-    drop(data);
-    buffer.unmap();
-    egui::ColorImage::new([w as usize, h as usize], pixels)
+    egui::ColorImage::from_rgba_premultiplied([size[0] as usize, size[1] as usize], &rgba)
 }
 
 /// Runs the app until it asks to close; returns the exit code.
 pub fn run(
-    config: egui_wgpu::WgpuConfiguration,
     opts: Options,
-    make: impl FnOnce(&egui::Context, Option<egui_wgpu::RenderState>) -> crate::app::RustudioApp,
+    make: impl FnOnce(&egui::Context, Option<RenderState>) -> crate::app::RustudioApp,
 ) -> i32 {
     let ctx = egui::Context::default();
     let rs = if opts.render {
-        match render_state(&config) {
+        match d3d11::create_device() {
             Ok(rs) => Some(rs),
             Err(e) => {
-                eprintln!("--headless: no GPU device without a window: {e}");
+                eprintln!("--headless: no D3D11 device without a window: {e}");
                 return 1;
             }
         }
@@ -123,7 +48,9 @@ pub fn run(
         None
     };
     let size = [opts.size[0].max(1), opts.size[1].max(1)];
-    let frame = rs.as_ref().map(|rs| target(rs, size));
+    let frame = rs
+        .as_ref()
+        .map(|rs| OffscreenTarget::new(&rs.device, size[0], size[1]));
     let mut app = make(&ctx, rs.clone());
     let start = Instant::now();
     let period = Duration::from_secs_f64(1.0 / 60.0);
@@ -150,7 +77,7 @@ pub fn run(
             v.monitor_size = Some(egui::vec2(size[0] as f32, size[1] as f32));
         }
         app.raw_input_hook(&ctx, &mut raw);
-        let out = ctx.run_ui(raw, |ui| app.frame(ui));
+        let mut out = ctx.run_ui(raw, |ui| app.frame(ui));
         let mut close = false;
         let mut shots = Vec::new();
         for (_, v) in out.viewport_output.iter() {
@@ -165,36 +92,16 @@ pub fn run(
         let ppp = out.pixels_per_point;
         if let (Some(rs), Some(t)) = (rs.as_ref(), frame.as_ref()) {
             let jobs = ctx.tessellate(out.shapes, ppp);
-            let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: size, pixels_per_point: ppp };
-            let mut renderer = rs.renderer.write();
-            for (id, deltas) in &out.textures_delta.set {
-                for delta in deltas {
-                    renderer.update_texture(&rs.device, &rs.queue, *id, delta);
-                }
-            }
-            let mut enc = rs.device.create_command_encoder(&Default::default());
-            let extra = renderer.update_buffers(&rs.device, &rs.queue, &mut enc, &jobs, &screen);
-            {
-                let pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("offscreen egui"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &t.view,
-                        resolve_target: None,
-                        depth_slice: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    ..Default::default()
-                });
-                renderer.render(&mut pass.forget_lifetime(), &jobs, &screen);
-            }
-            crate::gpu_timing::submit(&rs.device, &rs.queue, "gpu: egui (offscreen)", extra.into_iter().chain([enc.finish()]));
-            for id in &out.textures_delta.free {
-                renderer.free_texture(id);
-            }
-            drop(renderer);
+            let mut deltas = std::mem::take(&mut out.textures_delta);
+            crate::gpu_timing::scope(&rs.device, &rs.context, "gpu: egui (offscreen)", || {
+                let mut renderer = rs.renderer.write().expect("egui renderer lock");
+                renderer.update_textures(&rs.device, &rs.context, &deltas);
+                let clear = [0.0f32, 0.0, 0.0, 1.0];
+                unsafe { rs.context.ClearRenderTargetView(t.rtv(), &clear) };
+                renderer.paint(&rs.device, &rs.context, t.rtv(), size, ppp, &jobs);
+                renderer.free_textures(&deltas);
+            });
+            deltas.clear();
             if !shots.is_empty() {
                 let image = Arc::new(read_back(rs, t, size));
                 for user_data in shots {
@@ -205,10 +112,11 @@ pub fn run(
                     });
                 }
             } else {
-                // (one frame in flight at most, as a presenting window)
-                let _ = rs.device.poll(wgpu::PollType::wait_indefinitely());
+                unsafe { rs.context.Flush() };
             }
         } else {
+            // Avoid debug assertion when dropping unconsumed texture deltas in `--no-render` mode.
+            out.textures_delta.clear();
             // No GPU: the harness gets an empty picture (it writes none).
             for user_data in shots {
                 events.push(egui::Event::Screenshot {
