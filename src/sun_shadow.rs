@@ -9,14 +9,16 @@
 //! blur for the shader), blur width and level, blur passes and their kernel
 //! weights, Globals and matrices.
 
+use crate::d3d11::{self, shaders, BlendMode, Tex2dSpec};
 use crate::mech;
-use egui_wgpu::wgpu;
 use glam::{DVec3, Mat4, Vec3, Vec4};
+use windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+use windows::Win32::Graphics::Direct3D11::*;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
 
 pub const CASCADES: usize = 4;
-/// Uniform bytes per pass (a dynamic offset each).
-const PASS_STRIDE: u64 = 256;
-const ATLAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+const ATLAS_FORMAT: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT =
+    DXGI_FORMAT_R16G16B16A16_FLOAT;
 
 /// Kernel tables by blur level − 1 (levels 1..24). Across: the centre weight
 /// and one per texel either side (9 floats a row; Studio's horizontal EVSM
@@ -219,66 +221,6 @@ pub fn uniforms(c: &[Cascade; CASCADES]) -> ([[[f32; 4]; 4]; CASCADES], [[f32; 4
     )
 }
 
-const BLUR_WGSL: &str = r#"
-struct SunPass {
-    vp: mat4x4<f32>,
-    rect: vec4<f32>,            // x tile texels, zw the tile's corner in the atlas
-    hw: array<vec4<f32>, 3>,    // across: centre weight, then one per texel out
-    vw: array<vec4<f32>, 2>,    // down: centre weight, then one per tap pair
-    vo: vec4<f32>,              // down: the tap pairs' texel offsets
-    centre: vec4<f32>,          // the cascade's sphere centre (grass sink)
-};
-@group(0) @binding(0) var<uniform> u: SunPass;
-@group(0) @binding(1) var depth_tex: texture_depth_2d;
-@group(1) @binding(0) var moments_tex: texture_2d<f32>;
-@group(1) @binding(1) var moments_sampler: sampler;
-
-@vertex
-fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
-    return vec4<f32>(f32(i32(i & 1u) * 4 - 1), f32(i32(i >> 1u) * 4 - 1), 0.0, 1.0);
-}
-
-fn moments(px: vec2<i32>) -> vec4<f32> {
-    let hi = i32(u.rect.x) - 1;
-    let z = 2.0 * textureLoad(depth_tex, clamp(px, vec2<i32>(0), vec2<i32>(hi)), 0) - 1.0;
-    let ep = exp(EVSM_POS_EXP * z);
-    let en = -exp(-EVSM_NEG_EXP * z);
-    return vec4<f32>(ep, ep * ep, en, en * en);
-}
-
-// ShadowEvsmHBlurDFS_N: depth to moments, blurred across.
-@fragment
-fn fs_h(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
-    let px = vec2<i32>(floor(p.xy));
-    var sum = moments(px) * u.hw[0].x;
-    for (var i = 1; i < 9; i++) {
-        let w = u.hw[i / 4][i % 4];
-        if (w <= 0.0) { break; }
-        sum += (moments(px + vec2<i32>(i, 0)) + moments(px - vec2<i32>(i, 0))) * w;
-    }
-    return sum;
-}
-
-// ShadowEvsmVBlurLFS_N: blurred down with bilinear tap pairs, into the atlas.
-@fragment
-fn fs_v(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
-    let size = vec2<f32>(textureDimensions(moments_tex));
-    let at = p.xy - u.rect.zw;
-    let lo = 0.5;
-    let hi = u.rect.x - 0.5;
-    var sum = textureSampleLevel(moments_tex, moments_sampler, at / size, 0.0) * u.vw[0].x;
-    for (var i = 1; i < 5; i++) {
-        let w = u.vw[i / 4][i % 4];
-        if (w <= 0.0) { break; }
-        let o = u.vo[i - 1];
-        let a = vec2<f32>(at.x, clamp(at.y + o, lo, hi)) / size;
-        let b = vec2<f32>(at.x, clamp(at.y - o, lo, hi)) / size;
-        sum += (textureSampleLevel(moments_tex, moments_sampler, a, 0.0) + textureSampleLevel(moments_tex, moments_sampler, b, 0.0)) * w;
-    }
-    return sum;
-}
-"#;
-
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct PassRaw {
@@ -303,172 +245,93 @@ struct Drawn {
 
 /// The atlas, its passes and which tiles are current.
 pub struct SunShadows {
-    pub atlas_view: wgpu::TextureView,
-    temp_view: wgpu::TextureView,
-    pass_buf: wgpu::Buffer,
-    /// Group 1 of the depth pipelines: the cascade's SunPass.
-    pub pass_layout: wgpu::BindGroupLayout,
-    pass_bg: wgpu::BindGroup,
-    h_bg: wgpu::BindGroup,
-    v_bg: wgpu::BindGroup,
-    h_pipe: wgpu::RenderPipeline,
-    v_pipe: wgpu::RenderPipeline,
+    pub atlas_srv: ID3D11ShaderResourceView,
+    atlas_tex: ID3D11Texture2D,
+    atlas_rtv: ID3D11RenderTargetView,
+    temp_tex: ID3D11Texture2D,
+    temp_srv: ID3D11ShaderResourceView,
+    temp_rtv: ID3D11RenderTargetView,
+    depth_srv: ID3D11ShaderResourceView,
+    pass_cbs: [ID3D11Buffer; CASCADES],
+    vs_blur: ID3D11VertexShader,
+    ps_h: ID3D11PixelShader,
+    ps_v: ID3D11PixelShader,
+    sampler: ID3D11SamplerState,
+    rast: ID3D11RasterizerState,
+    depth_state: ID3D11DepthStencilState,
+    blend: ID3D11BlendState,
     drawn: [Option<Drawn>; CASCADES],
     frame: u64,
 }
 
 impl SunShadows {
-    /// `depth`: the square depth map the cascades are drawn into one at a
-    /// time (at least the largest tile across).
-    pub fn new(device: &wgpu::Device, depth: &wgpu::TextureView) -> Self {
-        let tex = |label: &str, [w, h]: [u32; 2]| {
-            device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some(label),
-                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
+    /// `depth_srv`: SRV (`R32_FLOAT`) over the square depth map the cascades are
+    /// drawn into one at a time (at least the largest tile across).
+    pub fn new(device: &ID3D11Device, depth_srv: &ID3D11ShaderResourceView) -> Self {
+        let make_rt = |[w, h]: [u32; 2]| {
+            let tex = d3d11::create_tex2d(
+                device,
+                &Tex2dSpec {
+                    width: w,
+                    height: h,
+                    mips: 1,
+                    array_size: 1,
                     format: ATLAS_FORMAT,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                })
-                .create_view(&Default::default())
+                    samples: 1,
+                    bind_flags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+                    misc_flags: 0,
+                },
+                None,
+            );
+            let srv = d3d11::create_srv_2d(device, &tex, ATLAS_FORMAT, false, 0, 1);
+            let rtv = d3d11::create_rtv(device, &tex, ATLAS_FORMAT, 0, false);
+            (tex, srv, rtv)
         };
         let side = mech::SUN_CASCADE_TILES.iter().copied().max().unwrap_or(1);
-        let atlas_view = tex("sun shadow atlas", mech::SUN_SHADOW_ATLAS);
-        let temp_view = tex("sun shadow blur", [side, side]);
-        let pass_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sun shadow passes"),
-            size: CASCADES as u64 * PASS_STRIDE,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let pass_entry = wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: true,
-                min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<PassRaw>() as u64),
-            },
-            count: None,
-        };
-        let pass_binding = wgpu::BindGroupEntry {
-            binding: 0,
-            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer: &pass_buf,
-                offset: 0,
-                size: wgpu::BufferSize::new(std::mem::size_of::<PassRaw>() as u64),
-            }),
-        };
-        let pass_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("sun shadow pass"),
-            entries: &[pass_entry],
-        });
-        let pass_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sun shadow pass"),
-            layout: &pass_layout,
-            entries: &[pass_binding.clone()],
-        });
-        let h_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("sun shadow blur across"),
-            entries: &[
-                pass_entry,
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-            ],
-        });
-        let h_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sun shadow blur across"),
-            layout: &h_layout,
-            entries: &[pass_binding, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth) }],
-        });
-        let v_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("sun shadow blur down"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("sun shadow blur"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let v_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sun shadow blur down"),
-            layout: &v_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&temp_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
-            ],
-        });
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("sun shadow blur"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!(
-                    "const EVSM_POS_EXP: f32 = {:?};\nconst EVSM_NEG_EXP: f32 = {:?};\n{BLUR_WGSL}",
-                    mech::EVSM_POS_EXP,
-                    mech::EVSM_NEG_EXP
-                )
-                .into(),
-            ),
-        });
-        let pipe = |label: &str, entry: &str, layouts: &[Option<&wgpu::BindGroupLayout>]| {
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some(label),
-                bind_group_layouts: layouts,
-                immediate_size: 0,
-            });
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &module,
-                    entry_point: Some("vs"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: Default::default(),
-                depth_stencil: None,
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some(entry),
-                    compilation_options: Default::default(),
-                    targets: &[Some(ATLAS_FORMAT.into())],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let h_pipe = pipe("sun shadow blur across", "fs_h", &[Some(&h_layout)]);
-        let v_pipe = pipe("sun shadow blur down", "fs_v", &[Some(&pass_layout), Some(&v_layout)]);
-        SunShadows { atlas_view, temp_view, pass_buf, pass_layout, pass_bg, h_bg, v_bg, h_pipe, v_pipe, drawn: [None; CASCADES], frame: 0 }
+        let (atlas_tex, atlas_srv, atlas_rtv) = make_rt(mech::SUN_SHADOW_ATLAS);
+        let (temp_tex, temp_srv, temp_rtv) = make_rt([side, side]);
+        let pass_cbs = std::array::from_fn(|_| d3d11::create_cb(device, std::mem::size_of::<PassRaw>()));
+        let sampler = d3d11::create_sampler(
+            device,
+            D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            1,
+        );
+        let vs_blur = d3d11::create_vs(device, shaders::VS_SUN_BLUR);
+        let ps_h = d3d11::create_ps(device, shaders::PS_SUN_BLUR_H);
+        let ps_v = d3d11::create_ps(device, shaders::PS_SUN_BLUR_V);
+        let rast = d3d11::create_raster_state(device, D3D11_CULL_NONE, false, true, 0, 0.0);
+        let depth_state = d3d11::create_depth_state(device, false, false, D3D11_COMPARISON_ALWAYS);
+        let blend = d3d11::create_blend_state(device, BlendMode::Opaque);
+        SunShadows {
+            atlas_srv,
+            atlas_tex,
+            atlas_rtv,
+            temp_tex,
+            temp_srv,
+            temp_rtv,
+            depth_srv: depth_srv.clone(),
+            pass_cbs,
+            vs_blur,
+            ps_h,
+            ps_v,
+            sampler,
+            rast,
+            depth_state,
+            blend,
+            drawn: [None; CASCADES],
+            frame: 0,
+        }
+    }
+
+    /// Clears the full EVSM atlas to unshadowed far-depth moments.
+    pub fn clear_atlas(&self, ctx: &ID3D11DeviceContext) {
+        let far_p = mech::EVSM_POS_EXP.exp();
+        let far_n = -(-mech::EVSM_NEG_EXP).exp();
+        let clear = [far_p, far_p * far_p, far_n, far_n * far_n];
+        unsafe { ctx.ClearRenderTargetView(&self.atlas_rtv, &clear) };
     }
 
     /// The cascades to redraw this frame. Cascade 0 follows the camera, so
@@ -495,9 +358,8 @@ impl SunShadows {
         self.drawn = [None; CASCADES];
     }
 
-    /// Uploads the passes' constants; before any of them is encoded.
-    pub fn upload(&self, queue: &wgpu::Queue, cascades: &[Cascade; CASCADES]) {
-        let mut data = vec![0u8; (CASCADES as u64 * PASS_STRIDE) as usize];
+    /// Uploads the passes' constants; before any of them is drawn.
+    pub fn upload(&self, ctx: &ID3D11DeviceContext, cascades: &[Cascade; CASCADES]) {
         for (i, c) in cascades.iter().enumerate() {
             let k = (c.level as usize).clamp(1, EVSM_H_WEIGHTS.len()) - 1;
             let mut raw = PassRaw {
@@ -510,52 +372,60 @@ impl SunShadows {
             };
             raw.hw[..9].copy_from_slice(&EVSM_H_WEIGHTS[k]);
             raw.vw[..5].copy_from_slice(&EVSM_V_WEIGHTS[k]);
-            let o = i * PASS_STRIDE as usize;
-            data[o..o + std::mem::size_of::<PassRaw>()].copy_from_slice(bytemuck::bytes_of(&raw));
+            d3d11::upload_cb(ctx, &self.pass_cbs[i], &raw);
         }
-        queue.write_buffer(&self.pass_buf, 0, &data);
     }
 
-    /// Binds cascade `i`'s constants as group 1 of a depth pass.
-    pub fn bind(&self, pass: &mut wgpu::RenderPass, i: usize) {
-        pass.set_bind_group(1, &self.pass_bg, &[(i as u64 * PASS_STRIDE) as u32]);
+    /// Binds cascade `i`'s constants at `b2` (scene.hlsl `SunPass`) for VS + PS.
+    pub fn bind(&self, ctx: &ID3D11DeviceContext, i: usize) {
+        let cb = [Some(self.pass_cbs[i].clone())];
+        unsafe {
+            ctx.VSSetConstantBuffers(2, Some(&cb));
+            ctx.PSSetConstantBuffers(2, Some(&cb));
+        }
     }
 
     /// Cascade `i`'s depth (in the depth map's corner) to blurred moments
     /// in its atlas tile.
-    pub fn blur(&self, encoder: &mut wgpu::CommandEncoder, c: &Cascade, i: usize) {
-        let offset = [(i as u64 * PASS_STRIDE) as u32];
+    pub fn blur(&self, ctx: &ID3D11DeviceContext, c: &Cascade, i: usize) {
         let t = c.tile as f32;
-        fn begin<'a>(encoder: &'a mut wgpu::CommandEncoder, view: &wgpu::TextureView) -> wgpu::RenderPass<'a> {
-            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("sun shadow blur"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            })
+        let cb = [Some(self.pass_cbs[i].clone())];
+
+        d3d11::unbind_ps_srvs(ctx, 0, 32);
+        unsafe {
+            ctx.OMSetRenderTargets(Some(&[Some(self.temp_rtv.clone())]), None);
+            ctx.IASetInputLayout(None);
+            ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx.RSSetState(&self.rast);
+            ctx.OMSetDepthStencilState(&self.depth_state, 0);
+            ctx.OMSetBlendState(&self.blend, None, !0);
         }
-        {
-            let mut pass = begin(encoder, &self.temp_view);
-            pass.set_viewport(0.0, 0.0, t, t, 0.0, 1.0);
-            pass.set_scissor_rect(0, 0, c.tile, c.tile);
-            pass.set_pipeline(&self.h_pipe);
-            pass.set_bind_group(0, &self.h_bg, &offset);
-            pass.draw(0..3, 0..1);
+        d3d11::set_viewport(ctx, 0.0, 0.0, t, t);
+        d3d11::set_scissor(ctx, 0, 0, c.tile as i32, c.tile as i32);
+        unsafe {
+            ctx.VSSetShader(&self.vs_blur, None);
+            ctx.PSSetShader(&self.ps_h, None);
+            ctx.PSSetConstantBuffers(0, Some(&cb));
+            ctx.PSSetShaderResources(0, Some(&[Some(self.depth_srv.clone())]));
+            ctx.Draw(3, 0);
         }
-        let mut pass = begin(encoder, &self.atlas_view);
-        pass.set_viewport(c.origin[0] as f32, c.origin[1] as f32, t, t, 0.0, 1.0);
-        pass.set_scissor_rect(c.origin[0], c.origin[1], c.tile, c.tile);
-        pass.set_pipeline(&self.v_pipe);
-        pass.set_bind_group(0, &self.pass_bg, &offset);
-        pass.set_bind_group(1, &self.v_bg, &[]);
-        pass.draw(0..3, 0..1);
+
+        d3d11::unbind_ps_srvs(ctx, 0, 2);
+        unsafe {
+            ctx.OMSetRenderTargets(Some(&[Some(self.atlas_rtv.clone())]), None);
+        }
+        d3d11::set_viewport(ctx, c.origin[0] as f32, c.origin[1] as f32, t, t);
+        d3d11::set_scissor(ctx, c.origin[0] as i32, c.origin[1] as i32, c.tile as i32, c.tile as i32);
+        unsafe {
+            ctx.PSSetShader(&self.ps_v, None);
+            ctx.PSSetConstantBuffers(0, Some(&cb));
+            ctx.PSSetShaderResources(1, Some(&[Some(self.temp_srv.clone())]));
+            ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+            ctx.Draw(3, 0);
+        }
+
+        d3d11::unbind_ps_srvs(ctx, 0, 2);
+        unsafe { ctx.OMSetRenderTargets(None, None) };
     }
 }
 

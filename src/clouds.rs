@@ -34,7 +34,22 @@ use glam::Vec3;
 use rbx_dom_weak::types::Variant;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
-use egui_wgpu::wgpu;
+use windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11BlendState, ID3D11Buffer, ID3D11DepthStencilState, ID3D11Device, ID3D11DeviceContext,
+    ID3D11PixelShader, ID3D11RasterizerState, ID3D11RenderTargetView, ID3D11SamplerState,
+    ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader, D3D11_BIND_RENDER_TARGET,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_COMPARISON_ALWAYS, D3D11_CPU_ACCESS_READ, D3D11_CULL_NONE,
+    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_FLAG_DO_NOT_WAIT,
+    D3D11_MAP_READ, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP,
+    D3D11_TEXTURE_ADDRESS_WRAP, D3D11_USAGE_STAGING,
+};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UNORM,
+    DXGI_SAMPLE_DESC,
+};
+
+use crate::d3d11::{self, BlendMode, Tex2dSpec};
 
 /// What the place asks for: the active Clouds (the first under Terrain).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -235,7 +250,7 @@ fn decode_bc1(src: &[u8], w: u32, h: u32) -> Vec<u8> {
 
 /// A texture from Studio's content (`rbxasset://sky/…`), all its mips; a
 /// 1-texel stand-in when missing.
-fn content_texture(device: &wgpu::Device, queue: &wgpu::Queue, id: &str, three_d: bool) -> wgpu::TextureView {
+fn content_texture(device: &ID3D11Device, id: &str, three_d: bool) -> ID3D11ShaderResourceView {
     let parsed = crate::assets::resolve(id, None)
         .and_then(|p| std::fs::read(p).ok())
         .and_then(|b| read_dds(&b));
@@ -244,70 +259,95 @@ fn content_texture(device: &wgpu::Device, queue: &wgpu::Queue, id: &str, three_d
     }
     let (dds, rgba) = parsed.unwrap_or_else(|| (Dds { mips: vec![(1, 1, 1, vec![255; 4])] }, true));
     let (w, h, d, _) = dds.mips[0];
-    let format = if rgba { wgpu::TextureFormat::Rgba8Unorm } else { wgpu::TextureFormat::R8Unorm };
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(id),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: d },
-        mip_level_count: dds.mips.len() as u32,
-        sample_count: 1,
-        dimension: if three_d { wgpu::TextureDimension::D3 } else { wgpu::TextureDimension::D2 },
-        format,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
+    let format: DXGI_FORMAT = if rgba {
+        DXGI_FORMAT_R8G8B8A8_UNORM
+    } else {
+        DXGI_FORMAT_R8_UNORM
+    };
     let bpp = if rgba { 4 } else { 1 };
-    for (level, (mw, mh, md, data)) in dds.mips.iter().enumerate() {
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: level as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            data,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(mw * bpp), rows_per_image: Some(*mh) },
-            wgpu::Extent3d { width: *mw, height: *mh, depth_or_array_layers: *md },
+    let mips = dds.mips.len() as u32;
+    let subresources: Vec<D3D11_SUBRESOURCE_DATA> = dds
+        .mips
+        .iter()
+        .map(|(mw, mh, _md, data)| D3D11_SUBRESOURCE_DATA {
+            pSysMem: data.as_ptr().cast(),
+            SysMemPitch: mw * bpp,
+            SysMemSlicePitch: if three_d { mw * mh * bpp } else { 0 },
+        })
+        .collect();
+    if three_d {
+        let tex = d3d11::create_tex3d(
+            device,
+            w,
+            h,
+            d,
+            mips,
+            format,
+            D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            Some(&subresources),
         );
+        d3d11::create_srv_3d(device, &tex, format, mips)
+    } else {
+        let tex = d3d11::create_tex2d(
+            device,
+            &Tex2dSpec {
+                width: w,
+                height: h,
+                mips,
+                array_size: 1,
+                format,
+                samples: 1,
+                bind_flags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                misc_flags: 0,
+            },
+            Some(&subresources),
+        );
+        d3d11::create_srv_2d(device, &tex, format, false, 0, mips)
     }
-    tex.create_view(&wgpu::TextureViewDescriptor {
-        dimension: Some(if three_d { wgpu::TextureViewDimension::D3 } else { wgpu::TextureViewDimension::D2 }),
-        ..Default::default()
-    })
 }
 
 struct Sized {
     full: [u32; 2],
     quarter: [u32; 2],
     half: [u32; 2],
-    quarter_view: wgpu::TextureView,
-    half_view: wgpu::TextureView,
+    quarter_rtv: ID3D11RenderTargetView,
+    quarter_srv: ID3D11ShaderResourceView,
+    half_rtv: ID3D11RenderTargetView,
+    half_srv: ID3D11ShaderResourceView,
 }
 
 pub struct CloudsGpu {
-    buf: wgpu::Buffer,
-    layout: wgpu::BindGroupLayout,
-    dist: wgpu::TextureView,
-    adv: wgpu::TextureView,
-    detail: wgpu::TextureView,
-    noise: wgpu::TextureView,
-    bsm: wgpu::TextureView,
-    cover_tex: wgpu::Texture,
-    cover_view: wgpu::TextureView,
-    cover_buf: wgpu::Buffer,
-    dummy2d: wgpu::TextureView,
-    dummy_depth: wgpu::TextureView,
-    rep: wgpu::Sampler,
-    dist_s: wgpu::Sampler,
-    clamp: wgpu::Sampler,
-    bsm_pipe: wgpu::RenderPipeline,
-    cover_pipe: wgpu::RenderPipeline,
-    wind_pipe: wgpu::RenderPipeline,
-    up_pipe: wgpu::RenderPipeline,
-    comp_pipe: wgpu::RenderPipeline,
+    cb: ID3D11Buffer,
+    dist: ID3D11ShaderResourceView,
+    adv: ID3D11ShaderResourceView,
+    detail: ID3D11ShaderResourceView,
+    noise: ID3D11ShaderResourceView,
+    bsm_rtv: ID3D11RenderTargetView,
+    bsm_srv: ID3D11ShaderResourceView,
+    cover_tex: ID3D11Texture2D,
+    cover_rtv: ID3D11RenderTargetView,
+    cover_staging: [ID3D11Texture2D; 2],
+    cover_pending: [bool; 2],
+    cover_write: usize,
+    rep: ID3D11SamplerState,
+    dist_s: ID3D11SamplerState,
+    clamp: ID3D11SamplerState,
+    vs: ID3D11VertexShader,
+    ps_bsm: ID3D11PixelShader,
+    ps_cover: ID3D11PixelShader,
+    ps_wind: ID3D11PixelShader,
+    ps_up_1x: ID3D11PixelShader,
+    ps_up_msaa: ID3D11PixelShader,
+    ps_comp: ID3D11PixelShader,
+    rast_state: ID3D11RasterizerState,
+    depth_off: ID3D11DepthStencilState,
+    blend_opaque: ID3D11BlendState,
     sized: Option<Sized>,
     /// What the BSM was last drawn for: (Cover², Density, steps, Lamp0Dir.y).
     bsm_key: Option<[f32; 4]>,
     started: Instant,
     last: Instant,
     offset: Vec3,
-    /// The sun cover read back: 0 idle, 1 copy recorded (map after submit), 2 mapping.
-    readback: u8,
-    mapped: std::sync::Arc<std::sync::atomic::AtomicU8>,
     target: f32,
     cover: f32,
     have_cover: bool,
@@ -315,142 +355,129 @@ pub struct CloudsGpu {
     active: bool,
 }
 
+fn create_staging_r8(device: &ID3D11Device) -> ID3D11Texture2D {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: 1,
+        Height: 1,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_R8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+    };
+    let mut out = None;
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut out)) }.expect("CreateTexture2D staging");
+    out.unwrap()
+}
+
 impl CloudsGpu {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, globals: &wgpu::BindGroupLayout, shader_source: &str, hdr: wgpu::TextureFormat) -> Self {
-        let src = format!("{shader_source}\n{}", include_str!("clouds.wgsl"));
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("clouds"),
-            source: wgpu::ShaderSource::Wgsl(src.into()),
-        });
-        use wgpu::{BindGroupLayoutEntry as E, BindingType as T, ShaderStages as S};
-        let tex = |binding: u32, dim: wgpu::TextureViewDimension| E {
-            binding,
-            visibility: S::FRAGMENT,
-            ty: T::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: dim, multisampled: false },
-            count: None,
-        };
-        let samp = |binding: u32| E { binding, visibility: S::FRAGMENT, ty: T::Sampler(wgpu::SamplerBindingType::Filtering), count: None };
-        let d2 = wgpu::TextureViewDimension::D2;
-        let d3 = wgpu::TextureViewDimension::D3;
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("clouds"),
-            entries: &[
-                E { binding: 0, visibility: S::FRAGMENT, ty: T::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
-                tex(1, d3),
-                tex(2, d2),
-                tex(3, d3),
-                tex(4, d2),
-                tex(5, d2),
-                samp(6),
-                samp(7),
-                tex(8, d2),
-                samp(9),
-                tex(10, d2),
-                E { binding: 11, visibility: S::FRAGMENT, ty: T::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: d2, multisampled: true }, count: None },
-            ],
-        });
-        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("clouds"),
-            bind_group_layouts: &[Some(globals), None, None, Some(&layout)],
-            immediate_size: 0,
-        });
-        let pipe = |label: &str, entry: &str, format: wgpu::TextureFormat| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&pl),
-                vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_clouds"), compilation_options: Default::default(), buffers: &[] },
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some(entry),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let f16 = wgpu::TextureFormat::Rgba16Float;
-        let bsm_pipe = pipe("clouds bsm", "fs_clouds_bsm", f16);
-        let cover_pipe = pipe("clouds sun cover", "fs_clouds_cover", wgpu::TextureFormat::R8Unorm);
-        let wind_pipe = pipe("clouds wind", "fs_clouds_wind", f16);
-        let up_pipe = pipe("clouds upsample", "fs_clouds_up", f16);
-        let comp_pipe = pipe("clouds comp", "fs_clouds_comp", hdr);
-        let target = |label: &str, w: u32, h: u32, format: wgpu::TextureFormat, samples: u32, usage: wgpu::TextureUsages| {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: samples,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage,
-                view_formats: &[],
-            })
-        };
-        let rt = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
-        let bsm = target("clouds bsm", BSM_SIZE, BSM_SIZE, f16, 1, rt).create_view(&Default::default());
-        let cover_tex = target("clouds sun cover", 1, 1, wgpu::TextureFormat::R8Unorm, 1, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
-        let cover_view = cover_tex.create_view(&Default::default());
-        let dummy2d = target("clouds none", 1, 1, f16, 1, rt).create_view(&Default::default());
-        let dummy_depth = target("clouds no depth", 1, 1, wgpu::TextureFormat::Depth32Float, 4, rt).create_view(&Default::default());
-        let sampler = |label: &str, w: wgpu::AddressMode, uv: wgpu::AddressMode| {
-            device.create_sampler(&wgpu::SamplerDescriptor {
-                label: Some(label),
-                address_mode_u: uv,
-                address_mode_v: uv,
-                address_mode_w: w,
-                mag_filter: wgpu::FilterMode::Linear,
-                min_filter: wgpu::FilterMode::Linear,
-                mipmap_filter: wgpu::MipmapFilterMode::Linear,
-                ..Default::default()
-            })
-        };
-        let rep = sampler("clouds repeat", wgpu::AddressMode::Repeat, wgpu::AddressMode::Repeat);
-        let dist_s = sampler("clouds field", wgpu::AddressMode::ClampToEdge, wgpu::AddressMode::Repeat);
-        let clamp = sampler("clouds clamp", wgpu::AddressMode::ClampToEdge, wgpu::AddressMode::ClampToEdge);
-        let buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("clouds"),
-            size: std::mem::size_of::<CloudsRaw>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let cover_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("clouds sun cover"),
-            size: 256,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+    pub fn new(device: &ID3D11Device, _ctx: &ID3D11DeviceContext) -> Self {
+        let vs = d3d11::create_vs(device, crate::d3d11::shaders::VS_CLOUDS);
+        let ps_bsm = d3d11::create_ps(device, crate::d3d11::shaders::PS_CLOUDS_BSM);
+        let ps_cover = d3d11::create_ps(device, crate::d3d11::shaders::PS_CLOUDS_COVER);
+        let ps_wind = d3d11::create_ps(device, crate::d3d11::shaders::PS_CLOUDS_WIND);
+        let ps_up_1x = d3d11::create_ps(device, crate::d3d11::shaders::PS_CLOUDS_UP_1X);
+        let ps_up_msaa = d3d11::create_ps(device, crate::d3d11::shaders::PS_CLOUDS_UP_MSAA);
+        let ps_comp = d3d11::create_ps(device, crate::d3d11::shaders::PS_CLOUDS_COMP);
+
+        let rt_flags = (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32;
+        let bsm_tex = d3d11::create_tex2d(
+            device,
+            &Tex2dSpec {
+                width: BSM_SIZE,
+                height: BSM_SIZE,
+                mips: 1,
+                array_size: 1,
+                format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                samples: 1,
+                bind_flags: rt_flags,
+                misc_flags: 0,
+            },
+            None,
+        );
+        let bsm_rtv = d3d11::create_rtv(device, &bsm_tex, DXGI_FORMAT_R16G16B16A16_FLOAT, 0, false);
+        let bsm_srv = d3d11::create_srv_2d(device, &bsm_tex, DXGI_FORMAT_R16G16B16A16_FLOAT, false, 0, 1);
+
+        let cover_tex = d3d11::create_tex2d(
+            device,
+            &Tex2dSpec {
+                width: 1,
+                height: 1,
+                mips: 1,
+                array_size: 1,
+                format: DXGI_FORMAT_R8_UNORM,
+                samples: 1,
+                bind_flags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                misc_flags: 0,
+            },
+            None,
+        );
+        let cover_rtv = d3d11::create_rtv(device, &cover_tex, DXGI_FORMAT_R8_UNORM, 0, false);
+        let cover_staging = [create_staging_r8(device), create_staging_r8(device)];
+
+        let rep = d3d11::create_sampler(
+            device,
+            D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            1,
+        );
+        let dist_s = d3d11::create_sampler(
+            device,
+            D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            1,
+        );
+        let clamp = d3d11::create_sampler(
+            device,
+            D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            1,
+        );
+        let cb = d3d11::create_cb(device, std::mem::size_of::<CloudsRaw>());
+        let rast_state = d3d11::create_raster_state(device, D3D11_CULL_NONE, false, false, 0, 0.0);
+        let depth_off = d3d11::create_depth_state(device, false, false, D3D11_COMPARISON_ALWAYS);
+        let blend_opaque = d3d11::create_blend_state(device, BlendMode::Opaque);
+
         Self {
-            buf,
-            layout,
-            dist: content_texture(device, queue, "rbxasset://sky/clouds.dds", true),
-            adv: content_texture(device, queue, "rbxasset://sky/cloudAdvection.dds", false),
-            detail: content_texture(device, queue, "rbxasset://sky/cloudDetail3D.dds", true),
-            noise: content_texture(device, queue, "rbxasset://sky/bn.dds", false),
-            bsm,
+            cb,
+            dist: content_texture(device, "rbxasset://sky/clouds.dds", true),
+            adv: content_texture(device, "rbxasset://sky/cloudAdvection.dds", false),
+            detail: content_texture(device, "rbxasset://sky/cloudDetail3D.dds", true),
+            noise: content_texture(device, "rbxasset://sky/bn.dds", false),
+            bsm_rtv,
+            bsm_srv,
             cover_tex,
-            cover_view,
-            cover_buf,
-            dummy2d,
-            dummy_depth,
+            cover_rtv,
+            cover_staging,
+            cover_pending: [false, false],
+            cover_write: 0,
             rep,
             dist_s,
             clamp,
-            bsm_pipe,
-            cover_pipe,
-            wind_pipe,
-            up_pipe,
-            comp_pipe,
+            vs,
+            ps_bsm,
+            ps_cover,
+            ps_wind,
+            ps_up_1x,
+            ps_up_msaa,
+            ps_comp,
+            rast_state,
+            depth_off,
+            blend_opaque,
             sized: None,
             bsm_key: None,
             started: crate::sim_clock::now(),
             last: crate::sim_clock::now(),
             offset: Vec3::ZERO,
-            readback: 0,
-            mapped: Default::default(),
             target: 1.0,
             cover: 1.0,
             have_cover: false,
@@ -458,76 +485,75 @@ impl CloudsGpu {
         }
     }
 
-    fn group(&self, device: &wgpu::Device, bsm: &wgpu::TextureView, input: &wgpu::TextureView, scene: &wgpu::TextureView, depth: &wgpu::TextureView) -> wgpu::BindGroup {
-        use wgpu::BindingResource as R;
-        fn e(binding: u32, resource: R<'_>) -> wgpu::BindGroupEntry<'_> {
-            wgpu::BindGroupEntry { binding, resource }
-        }
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("clouds"),
-            layout: &self.layout,
-            entries: &[
-                e(0, self.buf.as_entire_binding()),
-                e(1, R::TextureView(&self.dist)),
-                e(2, R::TextureView(&self.adv)),
-                e(3, R::TextureView(&self.detail)),
-                e(4, R::TextureView(&self.noise)),
-                e(5, R::TextureView(bsm)),
-                e(6, R::Sampler(&self.rep)),
-                e(7, R::Sampler(&self.dist_s)),
-                e(8, R::TextureView(input)),
-                e(9, R::Sampler(&self.clamp)),
-                e(10, R::TextureView(scene)),
-                e(11, R::TextureView(depth)),
-            ],
-        })
-    }
-
-    fn ensure_size(&mut self, device: &wgpu::Device, full: [u32; 2]) {
+    fn ensure_size(&mut self, device: &ID3D11Device, full: [u32; 2]) {
         if self.sized.as_ref().is_some_and(|s| s.full == full) {
             return;
         }
         // (W + 1) >> 2 and >> 1, as Studio sizes them.
         let quarter = [((full[0] + 1) >> 2).max(1), ((full[1] + 1) >> 2).max(1)];
         let half = [((full[0] + 1) >> 1).max(1), ((full[1] + 1) >> 1).max(1)];
-        let make = |label: &str, s: [u32; 2]| {
-            device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some(label),
-                    size: wgpu::Extent3d { width: s[0], height: s[1], depth_or_array_layers: 1 },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                })
-                .create_view(&Default::default())
+        let rt_flags = (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32;
+        let make = |s: [u32; 2]| {
+            let tex = d3d11::create_tex2d(
+                device,
+                &Tex2dSpec {
+                    width: s[0],
+                    height: s[1],
+                    mips: 1,
+                    array_size: 1,
+                    format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    samples: 1,
+                    bind_flags: rt_flags,
+                    misc_flags: 0,
+                },
+                None,
+            );
+            let rtv = d3d11::create_rtv(device, &tex, DXGI_FORMAT_R16G16B16A16_FLOAT, 0, false);
+            let srv = d3d11::create_srv_2d(device, &tex, DXGI_FORMAT_R16G16B16A16_FLOAT, false, 0, 1);
+            (rtv, srv)
         };
-        self.sized = Some(Sized { full, quarter, half, quarter_view: make("clouds quarter", quarter), half_view: make("clouds half", half) });
+        let (quarter_rtv, quarter_srv) = make(quarter);
+        let (half_rtv, half_srv) = make(half);
+        self.sized = Some(Sized {
+            full,
+            quarter,
+            half,
+            quarter_rtv,
+            quarter_srv,
+            half_rtv,
+            half_srv,
+        });
     }
 
-    /// The sun cover read back (if it has arrived), smoothed by dt.
-    fn update_cover(&mut self, device: &wgpu::Device, dt: f32) {
-        if self.readback == 2 {
-            let _ = device.poll(wgpu::PollType::Poll);
-            match self.mapped.load(Ordering::Acquire) {
-                1 => {
-                    let byte = self.cover_buf.slice(..).get_mapped_range().ok().map(|d| d[0]);
-                    self.cover_buf.unmap();
-                    if let Some(b) = byte {
-                        self.target = (b as f32 / 255.0).max(COVER_FLOOR);
-                        self.have_cover = true;
-                        if std::env::var_os("RUSTUDIO_CLOUDS_DEBUG").is_some() {
-                            eprintln!("[clouds] sun cover texel {b} target {:.4} smoothed {:.4}", self.target, self.cover);
-                        }
-                    }
-                    self.readback = 0;
+    /// The sun cover read back non-blockingly from our 2-frame staging ring, smoothed by dt.
+    fn update_cover(&mut self, ctx: &ID3D11DeviceContext, dt: f32) {
+        let other = 1 - self.cover_write;
+        for idx in [other, self.cover_write] {
+            if !self.cover_pending[idx] {
+                continue;
+            }
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            let hr = unsafe {
+                ctx.Map(
+                    &self.cover_staging[idx],
+                    0,
+                    D3D11_MAP_READ,
+                    D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
+                    Some(&mut mapped),
+                )
+            };
+            if hr.is_ok() {
+                let b = unsafe { *(mapped.pData as *const u8) };
+                unsafe { ctx.Unmap(&self.cover_staging[idx], 0) };
+                self.cover_pending[idx] = false;
+                self.target = (b as f32 / 255.0).max(COVER_FLOOR);
+                self.have_cover = true;
+                if std::env::var_os("RUSTUDIO_CLOUDS_DEBUG").is_some() {
+                    eprintln!(
+                        "[clouds] sun cover texel {b} target {:.4} smoothed {:.4}",
+                        self.target, self.cover
+                    );
                 }
-                2 => {
-                    self.readback = 0;
-                }
-                _ => {}
             }
         }
         if self.have_cover {
@@ -537,28 +563,88 @@ impl CloudsGpu {
         COVER.store(shown.to_bits(), Ordering::Relaxed);
     }
 
+    fn bind_common(&self, ctx: &ID3D11DeviceContext) {
+        unsafe {
+            ctx.IASetInputLayout(None);
+            ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx.VSSetShader(&self.vs, None);
+            ctx.RSSetState(&self.rast_state);
+            ctx.OMSetDepthStencilState(&self.depth_off, 0);
+            ctx.OMSetBlendState(&self.blend_opaque, None, 0xffff_ffff);
+            let cbs = [Some(self.cb.clone())];
+            ctx.PSSetConstantBuffers(4, Some(&cbs));
+            let samplers = [
+                Some(self.rep.clone()),
+                Some(self.dist_s.clone()),
+                Some(self.clamp.clone()),
+            ];
+            ctx.PSSetSamplers(5, Some(&samplers));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_pass(
+        &self,
+        ctx: &ID3D11DeviceContext,
+        rtv: &ID3D11RenderTargetView,
+        clear: bool,
+        size: [u32; 2],
+        ps: &ID3D11PixelShader,
+        bsm: Option<&ID3D11ShaderResourceView>,
+        input: Option<&ID3D11ShaderResourceView>,
+        scene: Option<&ID3D11ShaderResourceView>,
+        depth: Option<&ID3D11ShaderResourceView>,
+    ) {
+        d3d11::set_viewport(ctx, 0.0, 0.0, size[0] as f32, size[1] as f32);
+        unsafe {
+            if clear {
+                ctx.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 0.0]);
+            }
+            ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+            ctx.PSSetShader(ps, None);
+            let srvs = [
+                Some(self.dist.clone()),
+                Some(self.adv.clone()),
+                Some(self.detail.clone()),
+                Some(self.noise.clone()),
+                bsm.cloned(),
+                input.cloned(),
+                scene.cloned(),
+                depth.cloned(),
+            ];
+            ctx.PSSetShaderResources(24, Some(&srvs));
+            ctx.Draw(3, 0);
+            ctx.OMSetRenderTargets(None, None);
+        }
+        d3d11::unbind_ps_srvs(ctx, 24, 8);
+    }
+
     /// Records the cloud passes up to the half-resolution layer (before the
     /// scene); `composite` lays it over the scene later.
     pub fn encode(
         &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        globals_bg: &wgpu::BindGroup,
+        device: &ID3D11Device,
+        ctx: &ID3D11DeviceContext,
         look: &CloudsLook,
         sun_y: f32,
         full: [u32; 2],
+        depth_srv: &ID3D11ShaderResourceView,
+        msaa: bool,
     ) {
         let now = crate::sim_clock::now();
         let dt = now.duration_since(self.last).as_secs_f32().min(1.0);
         self.last = now;
         self.active = true;
-        self.update_cover(device, dt);
+        self.update_cover(ctx, dt);
         let time = std::env::var("RUSTUDIO_CLOUDS_TIME")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
             .unwrap_or_else(|| crate::sim_clock::since(self.started).as_secs_f32());
-        let wind = if look.wind.length() > WIND_MAX { look.wind.normalize() * WIND_MAX } else { look.wind };
+        let wind = if look.wind.length() > WIND_MAX {
+            look.wind.normalize() * WIND_MAX
+        } else {
+            look.wind
+        };
         // fmodf: the sign follows the dividend.
         self.offset.x = (self.offset.x - WIND_KM * wind.x * dt) % WIND_WRAP;
         self.offset.z = (self.offset.z - WIND_KM * wind.z * dt) % WIND_WRAP;
@@ -577,97 +663,98 @@ impl CloudsGpu {
             full: v(s.full),
             cover: [COVER_K, COVER_DISK_TEXELS, 1.0 / BSM_SIZE as f32, 0.0],
         };
-        queue.write_buffer(&self.buf, 0, bytemuck::bytes_of(&raw));
-        let pass = |encoder: &mut wgpu::CommandEncoder, label: &str, view: &wgpu::TextureView, pipe: &wgpu::RenderPipeline, bg: &wgpu::BindGroup| {
-            let mut p = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(label),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            p.set_pipeline(pipe);
-            p.set_bind_group(0, globals_bg, &[]);
-            p.set_bind_group(3, bg, &[]);
-            p.draw(0..3, 0..1);
-        };
+        d3d11::upload_cb(ctx, &self.cb, &raw);
+        self.bind_common(ctx);
+
         // The Beer shadow map, when what it depends on changed (Studio:
         // CoverDensityQuality, Lamp0Dir.y).
         let key = [cdq[0], cdq[1], cdq[2], sun_y];
         if self.bsm_key != Some(key) {
             self.bsm_key = Some(key);
-            let bg = self.group(device, &self.dummy2d, &self.dummy2d, &self.dummy2d, &self.dummy_depth);
-            pass(encoder, "clouds bsm", &self.bsm, &self.bsm_pipe, &bg);
-        }
-        let quarter_bg = self.group(device, &self.bsm, &self.dummy2d, &self.dummy2d, &self.dummy_depth);
-        if self.readback == 0 {
-            pass(encoder, "clouds sun cover", &self.cover_view, &self.cover_pipe, &quarter_bg);
-            encoder.copy_texture_to_buffer(
-                self.cover_tex.as_image_copy(),
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &self.cover_buf,
-                    layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(1) },
-                },
-                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            self.draw_pass(
+                ctx,
+                &self.bsm_rtv,
+                true,
+                [BSM_SIZE, BSM_SIZE],
+                &self.ps_bsm,
+                None,
+                None,
+                None,
+                None,
             );
-            self.readback = 1;
         }
-        pass(encoder, "clouds wind", &s.quarter_view, &self.wind_pipe, &quarter_bg);
-        let half_bg = self.group(device, &self.bsm, &s.quarter_view, &self.dummy2d, &self.dummy_depth);
-        pass(encoder, "clouds upsample", &s.half_view, &self.up_pipe, &half_bg);
+        if !self.cover_pending[self.cover_write] {
+            self.draw_pass(
+                ctx,
+                &self.cover_rtv,
+                true,
+                [1, 1],
+                &self.ps_cover,
+                Some(&self.bsm_srv),
+                None,
+                None,
+                None,
+            );
+            unsafe {
+                ctx.CopyResource(&self.cover_staging[self.cover_write], &self.cover_tex);
+            }
+            self.cover_pending[self.cover_write] = true;
+            self.cover_write = 1 - self.cover_write;
+        }
+        self.draw_pass(
+            ctx,
+            &s.quarter_rtv,
+            true,
+            s.quarter,
+            &self.ps_wind,
+            Some(&self.bsm_srv),
+            None,
+            None,
+            None,
+        );
+        let ps_up = if msaa { &self.ps_up_msaa } else { &self.ps_up_1x };
+        self.draw_pass(
+            ctx,
+            &s.half_rtv,
+            true,
+            s.half,
+            ps_up,
+            Some(&self.bsm_srv),
+            Some(&s.quarter_srv),
+            None,
+            Some(depth_srv),
+        );
     }
 
-    /// Lays the clouds over the scene (`hdr`, whose copy is `scene`) where
-    /// the depth shows nothing was drawn.
+    /// Lays the clouds over the scene (`hdr_rtv`, whose copy is `scene_srv`)
+    /// where the 1x depth (`depth_1x_srv`) shows nothing was drawn.
     pub fn composite(
         &mut self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-        globals_bg: &wgpu::BindGroup,
-        hdr: &wgpu::TextureView,
-        scene: &wgpu::TextureView,
-        depth: &wgpu::TextureView,
+        ctx: &ID3D11DeviceContext,
+        hdr_rtv: &ID3D11RenderTargetView,
+        scene_srv: &ID3D11ShaderResourceView,
+        depth_1x_srv: &ID3D11ShaderResourceView,
     ) {
         if !self.active {
             return;
         }
         let Some(s) = self.sized.as_ref() else { return };
-        let bg = self.group(device, &self.bsm, &s.half_view, scene, depth);
-        let mut p = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("clouds comp"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: hdr,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        p.set_pipeline(&self.comp_pipe);
-        p.set_bind_group(0, globals_bg, &[]);
-        p.set_bind_group(3, &bg, &[]);
-        p.draw(0..3, 0..1);
+        self.bind_common(ctx);
+        self.draw_pass(
+            ctx,
+            hdr_rtv,
+            false,
+            s.full,
+            &self.ps_comp,
+            Some(&self.bsm_srv),
+            Some(&s.half_srv),
+            Some(scene_srv),
+            Some(depth_1x_srv),
+        );
     }
 
-    /// After the frame's submit: start mapping the sun cover copied this frame.
+    /// After the frame's submit: clears active flag for the next frame.
     pub fn after_submit(&mut self) {
-        if self.readback == 1 {
-            self.readback = 2;
-            self.mapped.store(0, Ordering::Release);
-            let m = self.mapped.clone();
-            self.cover_buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-                m.store(if r.is_ok() { 1 } else { 2 }, Ordering::Release);
-            });
-        }
         self.active = false;
     }
 

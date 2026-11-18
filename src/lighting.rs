@@ -921,7 +921,7 @@ pub fn sky_irradiance(faces: &[Vec<u8>; 6], size: u32) -> [Vec3; 6] {
             for x in (0..size).step_by(step as usize) {
                 let u = (x as f32 + 0.5) / size as f32 * 2.0 - 1.0;
                 let v = (y as f32 + 0.5) / size as f32 * 2.0 - 1.0;
-                // Face texel → direction (wgpu / D3D cube convention).
+                // Face texel → direction (D3D cube convention).
                 let d = match f {
                     0 => Vec3::new(1.0, -v, -u),
                     1 => Vec3::new(-1.0, -v, u),
