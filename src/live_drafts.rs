@@ -190,15 +190,7 @@ impl DraftStore {
             return Ok(());
         }
         use std::io::Write;
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder
-            .create(&self.root)
+        std::fs::create_dir_all(&self.root)
             .map_err(|_| "Could not create the private script draft folder")?;
         for id in self.dirty.iter().copied().collect::<Vec<_>>() {
             let Some(path) = self.path(id) else {
@@ -208,14 +200,10 @@ impl DraftStore {
                 let temp = path.with_extension("json.tmp");
                 let data =
                     serde_json::to_vec(draft).map_err(|_| "Could not encode a script draft")?;
-                let mut options = std::fs::OpenOptions::new();
-                options.create(true).truncate(true).write(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
-                }
-                let mut file = options
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
                     .open(&temp)
                     .map_err(|_| "Could not write a script draft")?;
                 file.write_all(&data)
@@ -274,18 +262,6 @@ mod tests {
             assert!(d.conflict(1));
             assert!(d.commit_text(1, false).is_err());
             d.flush().unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                assert_eq!(
-                    std::fs::metadata(root.join("abc-123.json"))
-                        .unwrap()
-                        .permissions()
-                        .mode()
-                        & 0o777,
-                    0o600
-                );
-            }
         }
         {
             let mut d = DraftStore::new(root.clone());

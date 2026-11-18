@@ -26,7 +26,7 @@ use rbx_dom_weak::types::Ref;
 use rustc_hash::FxHashMap;
 
 use super::body::{self, BodySet, NONE};
-use super::dual::{ctype, BodyRec, ConnSrc, DualBatch, LevelCfg, MassRec};
+use super::dual::{BodyRec, ConnSrc, DualBatch, LevelCfg, MassRec};
 use super::island::Islands;
 use super::rows::LocalIndex;
 

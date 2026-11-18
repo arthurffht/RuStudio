@@ -1,7 +1,17 @@
 //! RuStudio: a Windows-native Roblox Studio editor with OmniMCP AI control.
 
 // Launch as a GUI application on Windows without opening a console window.
-#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+#![windows_subsystem = "windows"]
+
+// Hint hybrid-GPU drivers (NVIDIA Optimus / AMD Switchable Graphics) to select
+// the high-performance discrete GPU by default.
+#[allow(non_upper_case_globals)]
+#[unsafe(no_mangle)]
+pub static NvOptimusEnablement: u32 = 0x0000_0001;
+
+#[allow(non_upper_case_globals)]
+#[unsafe(no_mangle)]
+pub static AmdPowerXpressRequestHighPerformance: i32 = 1;
 
 mod grass_stream;
 mod mcp;
@@ -13,7 +23,6 @@ mod d3d11;
 mod quality;
 mod sim_clock;
 mod bytecode_cache;
-mod heap;
 mod load_trace;
 mod update;
 mod env_probe;
@@ -322,7 +331,6 @@ fn parse_frm_arg(s: &str) -> Option<u32> {
 fn main() -> Result<(), String> {
     // When invoked from cmd/PowerShell with CLI arguments, attach to the
     // launching console so stdout/stderr output appears despite windows_subsystem.
-    #[cfg(windows)]
     if std::env::args_os().nth(1).is_some() {
         // SAFETY: attaching to parent console if one exists; harmless if none or redirected.
         unsafe {
@@ -380,7 +388,7 @@ fn main() -> Result<(), String> {
         }
     }
     // `--install-studio-content`: download Studio's built-in content from
-    // Roblox's CDN into ~/.local/share/rustudio/studio, then exit.
+    // Roblox's CDN into %LOCALAPPDATA%\rustudio\studio, then exit.
     if std::env::args().any(|a| a == "--install-studio-content") {
         match studio_content::install(&|s| eprintln!("studio content: {s}")) {
             Ok(_) => std::process::exit(0),
@@ -1006,7 +1014,7 @@ fn main() -> Result<(), String> {
     // (window host clamps the first size to the monitor: an 800x600 session
     // desktop made `--window 1024x768` an 800x600 editor, its docked
     // widgets too short for the checks).
-    if cfg!(windows) && is_test_run(&argv) {
+    if is_test_run(&argv) {
         viewport = viewport.with_clamp_size_to_monitor_size(false);
     }
     if let Some(l) = &saved_layout {
@@ -1014,7 +1022,7 @@ fn main() -> Result<(), String> {
     }
     // Driven for comparison captures (src/control.rs): open without taking
     // focus and stay below other windows, so it never covers the person's
-    // work (X11 keeps drawing covered windows, and shots read the frame back).
+    // work, and shots read the frame back.
     if std::env::var_os("RUSTUDIO_CONTROL").is_some() {
         viewport = viewport.with_active(false).with_window_level(egui::WindowLevel::AlwaysOnBottom);
     }
@@ -1024,7 +1032,7 @@ fn main() -> Result<(), String> {
         let px = [size[0].round() as u32, size[1].round() as u32];
         let code = offscreen::run(
             offscreen::Options { size: px, render: !no_render, paced: !bench_mode },
-            move |ctx, rs| app::RustudioApp::new_in(ctx, rs, None, open, harness, demo),
+            move |ctx, rs| app::RustudioApp::new_in(ctx, rs, open, harness, demo),
         );
         crate::telemetry::flush();
         std::process::exit(code.max(app::EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed)));
@@ -1037,7 +1045,6 @@ fn main() -> Result<(), String> {
             Box::new(app::RustudioApp::new_in(
                 &ctx,
                 Some(rs),
-                Some(false),
                 open,
                 harness,
                 demo,

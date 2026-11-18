@@ -165,7 +165,7 @@ impl LiveSession {
     }
     pub fn allocate_id(&self) -> Result<u64> {
         self.next_id
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |id| {
                 (id != 0 && id as u32 != u32::MAX).then_some(id + 1)
             })
             .map_err(|_| NetError::Other("Team Create instance namespace is unavailable".into()))
@@ -353,14 +353,12 @@ async fn receive_lane(
             .ok()
             .and_then(|path| {
                 use std::io::Write;
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true).create(true).truncate(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
-                }
-                let mut f = options.open(path).ok()?;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(path)
+                    .ok()?;
                 f.write_all(&[6, 1, 4, 0, 0, 0, 1]).ok()?;
                 Some(f)
             })
@@ -418,14 +416,12 @@ async fn receive_lane(
             eprintln!("Team Create decode error: {:?}", decoder.errors.last());
             if let Ok(path) = std::env::var("RUSTUDIO_TC_BAD_FRAME") {
                 use std::io::Write;
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true).create(true).truncate(true);
-                #[cfg(unix)]
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(path)
                 {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
-                }
-                if let Ok(mut file) = options.open(path) {
                     let _ = file.write_all(&[6, 1, 4, 0, 0, 0, 1]);
                     let _ = file.write_all(&rtcio::frame(&schema_frame));
                     let _ = file.write_all(&rtcio::frame(&frame));

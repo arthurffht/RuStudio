@@ -17,7 +17,7 @@
 //!   (`lua_setpointerencodekey`, as Roblox does) with a random key per VM.
 //! * collectgarbage/loadstring/version/require/task.cancel… as measured.
 
-use mlua::{ffi, Function, Lua, Table, Thread, Value};
+use mlua::{ffi, Function, Lua, Table, Value};
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 

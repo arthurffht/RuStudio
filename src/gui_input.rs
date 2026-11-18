@@ -824,7 +824,7 @@ impl Gui {
                 s.is_positive() && holds(s.min.x, s.max.x) && holds(s.min.y, s.max.y)
             };
             let (out_from, hits_from) = (out.len(), self.hits.len());
-            let (mut t_tess, mut t_clip, mut t_split, mut t_map, mut n_in, mut n_out) =
+            let (mut t_tess, t_clip, mut t_split, mut t_map, mut n_in, mut n_out) =
                 (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0u64, 0u64);
             // The walk and the canvas triangles (or the kept ones).
             let (citems, lhits) = match reuse.as_mut() {

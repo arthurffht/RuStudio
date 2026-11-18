@@ -5,7 +5,6 @@ use glam::{Mat3, Vec3};
 
 use super::instance::{Class, Desc, End, Inst};
 use super::*;
-use super::RowExt;
 use crate::solver::linsys::{ldl_eps, DualLdl, LdlRow};
 
 /// A sim body for the tests: inverse mass and world inverse inertia.

@@ -19,7 +19,6 @@ use mlua::{Lua, MetaMethod, MultiValue, ObjectLike, UserData, UserDataFields, Us
 use rbx_dom_weak::types::Ref;
 use std::collections::HashMap;
 
-use crate::ltypes::*;
 use crate::runtime::*;
 use glam::Vec2;
 

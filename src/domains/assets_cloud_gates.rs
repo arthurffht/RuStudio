@@ -1,43 +1,6 @@
 //! Studio Play feature gates and script capability checks, verified in an
 //! ordinary Script/LocalScript in the shipped Studio; see parity notes.
 use super::*;
-pub const LUA_METHODS:&[(&str,&str)]=&[
-    ("CreateAssetAsync","AssetService"),("CreateAssetVersionAsync","AssetService"),("PromptImportAnimationClipFromVideoAsync","AssetService"),
-    ("CreateSessionAsync","MLService"),("LoadPostProcessModelAsync","MLService"),
-    ("SetPostProcessEnabled","MLService"),("IsPostProcessReady","MLService"),("ForwardAsync","MLSession"),
-    ("GetSchema","FeatureMatchingTable"),
-    ("SegmentMeshAsync","GenerationService"),("LoadGeneratedMeshAsync","GenerationService"),
-    ("GetVideoGenSessionAsync","GenerationService"),("GetVideoGenTriggersAsync","GenerationService"),
-    ("StartVideoGenSessionAsync","GenerationService"),("UpdateVideoGenSessionPromptAsync","GenerationService"),("UpdateVideoGenSessionTriggersAsync","GenerationService"),
-    ("GetExecutingPlayer","RemoteCommandService"),("GetReceivedUpdateSignal","RemoteCommandService"),
-    ("GetStoppingSignal","RemoteCommandService"),("SendUpdate","RemoteCommandService"),
-    ("Call","AppHandle"),("Close","AppHandle"),("ExecuteLuau","AppHandle"),("RunTest","AppHandle"),
-    ("Click","ParticipantHandle"),("InputText","ParticipantHandle"),("Launch","ParticipantHandle"),
-    ("Screenshot","ParticipantHandle"),("Scroll","ParticipantHandle"),("Shutdown","ParticipantHandle"),
-    ("GetChannels","FeatureMatchingSession"),
-    ("GetDimensionCount","FeatureMatchingSession"),
-    ("GetFeatureRow","FeatureMatchingSession"),
-    ("GetFeatureRows","FeatureMatchingSession"),
-    ("GetMetadataRow","FeatureMatchingSession"),
-    ("GetRowCount","FeatureMatchingSession"),
-    ("GetSchemaName","FeatureMatchingSession"),
-    ("GetTagColumns","FeatureMatchingSession"),
-    ("StandardizeQuery","FeatureMatchingSession"),
-    ("GetDeviceInfo","CaptureService"),
-    ("InternalCheckPlayabilityAsync","CaptureService"),
-    ("InternalGetStartPlaceIdAsync","CaptureService"),
-    ("Load","FeatureMatchingService"),
-    ("LoadAsync","FeatureMatchingService"),
-    ("ConnectAsync","GenerationService"),
-    ("DisconnectAsync","GenerationService"),
-    ("Disconnect","RealtimeMedia"),
-    ("GetConnectedWires","RealtimeMedia"),
-    ("GetInputPins","RealtimeMedia"),
-    ("GetOutputPins","RealtimeMedia"),
-    ("SendMessage","RealtimeMedia"),
-    ("ConnectAsync","RealtimeMedia"),
-    ("GetApiV1","OpenCloudService"),("InvokeAsync","OpenCloudService"),
-];
 pub fn install(lua:&Lua)->mlua::Result<()> {
     lua.globals().set("__ac_is_server",lua.create_function(|lua,()|Ok(world(lua)?.side != Side::Client))?)?;
     lua.load(r#"

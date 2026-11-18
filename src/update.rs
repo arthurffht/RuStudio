@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const FEED: &str = "https://api.github.com/repos/arthurffht/RuStudio/releases/latest";
 const SNOOZE: Duration = Duration::from_secs(12 * 3600);
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Release {
     pub version: String,
     pub page: String,
@@ -71,7 +71,7 @@ fn progress_text(p: &Progress) -> String {
 static INSTALLED_EXE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 pub fn installed_exe() -> Option<PathBuf> {
-    INSTALLED_EXE.lock().ok()?.clone()
+    INSTALLED_EXE.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 pub enum Action {
@@ -85,7 +85,7 @@ impl Updater {
         // RUSTUDIO_NO_UPDATE_CHECK / RUSTUDIO_UI_SHOTS, or the rustudio option.
         let off = !crate::rustudio_settings::update_check();
         if off {
-            *stage.lock().unwrap() = Stage::Current;
+            *stage.lock().unwrap_or_else(|e| e.into_inner()) = Stage::Current;
         } else {
             let s = stage.clone();
             std::thread::Builder::new()
@@ -100,7 +100,7 @@ impl Updater {
                             Stage::Current
                         }
                     };
-                    *s.lock().unwrap() = next;
+                    *s.lock().unwrap_or_else(|e| e.into_inner()) = next;
                 })
                 .ok();
         }
@@ -109,7 +109,7 @@ impl Updater {
 
     /// The notice, if there is something to show. Call once per frame.
     pub fn show(&mut self, ctx: &egui::Context) -> Action {
-        let stage = self.stage.lock().unwrap().clone();
+        let stage = self.stage.lock().unwrap_or_else(|e| e.into_inner()).clone();
         match &stage {
             Stage::Checking | Stage::Current => return Action::None,
             Stage::Available(_) if self.hidden => return Action::None,
@@ -234,14 +234,14 @@ impl Updater {
                     self.hidden = true;
                     snooze();
                 }
-                _ => *self.stage.lock().unwrap() = Stage::Current,
+                _ => *self.stage.lock().unwrap_or_else(|e| e.into_inner()) = Stage::Current,
             }
         }
         action
     }
 
     fn install(&self, r: Release) {
-        *self.stage.lock().unwrap() = Stage::Downloading(r.clone());
+        *self.stage.lock().unwrap_or_else(|e| e.into_inner()) = Stage::Downloading(r.clone());
         let s = self.stage.clone();
         let progress = self.progress.clone();
         std::thread::Builder::new()
@@ -249,12 +249,12 @@ impl Updater {
             .spawn(move || {
                 let next = match install(&r, &progress) {
                     Ok(exe) => {
-                        *INSTALLED_EXE.lock().unwrap() = Some(exe);
+                        *INSTALLED_EXE.lock().unwrap_or_else(|e| e.into_inner()) = Some(exe);
                         Stage::Installed(r)
                     }
                     Err(e) => Stage::Failed(r, e),
                 };
-                *s.lock().unwrap() = next;
+                *s.lock().unwrap_or_else(|e| e.into_inner()) = next;
             })
             .ok();
     }
@@ -300,17 +300,32 @@ fn version_of(tag: &str) -> Option<[u64; 3]> {
     Some([it.next()??, it.next()??, it.next()??])
 }
 
-fn asset_suffix() -> Option<&'static str> {
-    if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        Some("RuStudio-windows-x64.zip")
-    } else {
-        None
-    }
+const fn asset_name() -> &'static str {
+    "RuStudio-windows-x64.zip"
 }
 
 fn check() -> Result<Option<Release>, String> {
     let url = std::env::var("RUSTUDIO_UPDATE_URL").unwrap_or_else(|_| FEED.into());
-    let feed: serde_json::Value = serde_json::from_slice(&get(&url)?).map_err(|e| format!("{url}: {e}"))?;
+    check_url(&url)
+}
+
+fn check_url(url: &str) -> Result<Option<Release>, String> {
+    let client: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(8)))
+        .http_status_as_error(false)
+        .user_agent(concat!("rustudio/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .into();
+    let mut resp = client.get(url).call().map_err(|e| format!("{url}: {e}"))?;
+    let status = resp.status().as_u16();
+    if matches!(status, 403 | 404) {
+        return Ok(None);
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!("{url}: http status: {status}"));
+    }
+    let bytes = resp.body_mut().with_config().limit(16 << 20).read_to_vec().map_err(|e| format!("{url}: {e}"))?;
+    let feed: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| format!("{url}: {e}"))?;
     let tag = feed["tag_name"].as_str().ok_or("release without tag_name")?;
     let (Some(latest), Some(ours)) = (version_of(tag), version_of(env!("CARGO_PKG_VERSION"))) else {
         return Err(format!("can't compare versions {tag} and {}", env!("CARGO_PKG_VERSION")));
@@ -326,7 +341,7 @@ fn check() -> Result<Option<Release>, String> {
                 .collect()
         })
         .unwrap_or_default();
-    let asset = asset_suffix().and_then(|suf| assets.iter().find(|(n, _)| n.ends_with(suf)).cloned());
+    let asset = assets.iter().find(|(n, _)| n.ends_with(asset_name())).cloned();
     let sums = assets.iter().find(|(n, _)| n == "SHA256SUMS").map(|(_, u)| u.clone());
     Ok(Some(Release {
         version: tag.trim_start_matches('v').to_string(),
@@ -463,5 +478,26 @@ mod tests {
         assert!(version_of("v0.2.0") > version_of("v0.1.9"));
         assert!(version_of("v0.10.0") > version_of("v0.9.0"));
         assert_eq!(version_of("latest"), None);
+    }
+
+    #[test]
+    fn windows_asset_and_quiet_403_404() {
+        use std::io::{Read, Write};
+        assert_eq!(asset_name(), "RuStudio-windows-x64.zip");
+        for status in ["403 Forbidden", "404 Not Found"] {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let handle = std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 512];
+                    let _ = stream.read(&mut buf);
+                    let reply = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    let _ = stream.write_all(reply.as_bytes());
+                }
+            });
+            let res = check_url(&format!("http://127.0.0.1:{port}/latest"));
+            handle.join().unwrap();
+            assert!(res.as_ref().is_ok_and(|v| v.is_none()), "{status}: {res:?}");
+        }
     }
 }

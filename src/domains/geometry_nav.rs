@@ -1186,14 +1186,6 @@ pub const METHODS: &[(&str, &str)] = &[
     ("GetPointCoordinates", "Path"),
 ];
 
-pub const LUA_METHODS: &[(&str, &str)] = &[
-    ("FindPathAsync", "PathfindingService"),
-    ("ComputeRawPathAsync", "PathfindingService"),
-    ("ComputeSmoothPathAsync", "PathfindingService"),
-    ("ComputeAsync", "Path"),
-    ("CheckOcclusionAsync", "Path"),
-];
-
 pub const EVENTS: &[(&str, &str)] = &[("Blocked", "Path"), ("Unblocked", "Path")];
 
 fn arg(args: &MultiValue, i: usize) -> Value {

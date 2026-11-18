@@ -209,8 +209,6 @@ pub fn thumbnails(kind: Thumb, ids: &[u64]) -> Result<Vec<(u64, Vec<u8>)>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn outfit_scale_reads_as_scales() {
         let mut v: serde_json::Value = serde_json::from_str(

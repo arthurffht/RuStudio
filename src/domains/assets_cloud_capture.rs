@@ -8,8 +8,6 @@ static NEXT:AtomicU64=AtomicU64::new(1);
 #[derive(Default)]
 struct Captures { pending:HashMap<u64,(Ref,Receiver<Result<Vec<u8>,String>>)>, objects:HashMap<Ref,Info>, prompts:Vec<mlua::Function> }
 struct Info {time:i64,id:String,place:i64,universe:i64}
-pub const LUA_METHODS:&[(&str,&str)]=&[("CaptureScreenshot","CaptureService"),("TakeScreenshotCaptureAsync","CaptureService"),("StartVideoCaptureAsync","CaptureService"),("StopVideoCapture","CaptureService"),("ReadCapturesFromGalleryAsync","CaptureService"),("PromptSaveCapturesToGallery","CaptureService"),("PromptShareCapture","CaptureService")];
-pub const EVENTS:&[(&str,&str)]=&[];
 fn capture_type(lua:&Lua)->mlua::Result<Value>{Ok(Value::UserData(lua.create_userdata(LEnumItem::from_name("CaptureType","Screenshot").unwrap())?))}
 /// Called by the editor after drawing the viewport; captures only its own GPU frame.
 pub fn frame_tick(ctx:&egui::Context, rect:egui::Rect) {

@@ -337,8 +337,6 @@ pub struct Editor {
     /// matpack::generation() and wrap::generation() last seen.
     pub material_gen: u64,
     pub wrap_gen: u64,
-    /// Uploaded layered-clothing pieces: (fitting, piece) → (mesh, centre, extent).
-    pub wrap_meshes: HashMap<(usize, usize), (u32, glam::Vec3, glam::Vec3)>,
     /// Fitting failures already reported.
     pub wrap_warned: std::collections::HashSet<String>,
     /// Triangles in the drawn voxel terrain.
@@ -400,7 +398,7 @@ pub struct Editor {
     pub last_selection: Vec<Ref>,
     /// Active right-drag camera look with the cursor grabbed.
     pub look_grab: Option<crate::viewport::LookGrab>,
-    /// Locked grab failed once (e.g. X11): use Confined from then on.
+    /// Locked grab failed once: use Confined from then on.
     pub grab_use_confined: bool,
     /// The game holds the cursor (UserInputService.MouseBehavior while playing).
     pub game_grab: Option<crate::viewport::LookGrab>,
@@ -484,14 +482,12 @@ impl RustudioApp {
     pub fn new_in(
         egui_ctx: &egui::Context,
         render_state: Option<crate::d3d11::RenderState>,
-        wayland: Option<bool>,
         open: Option<PathBuf>,
         harness: Harness,
         demo: bool,
     ) -> Self {
         crate::ti::install(egui_ctx);
         theme::apply(egui_ctx);
-        crate::mouse_lock::note_window(wayland);
         let renderer = render_state.as_ref().map(Renderer::new);
         let mut ed = Editor {
             dialogs: crate::file_dialog::Dialogs::new(egui_ctx.clone()),
@@ -556,7 +552,6 @@ impl RustudioApp {
             draws_asset_gen: 0,
             material_gen: 0,
             wrap_gen: 0,
-            wrap_meshes: HashMap::new(),
             wrap_warned: Default::default(),
             terrain_tris: 0,
             terrain_drawn: None,
@@ -1649,21 +1644,42 @@ impl Editor {
     pub(crate) fn game_keys(&mut self, ctx: &egui::Context) {
         let no_ui = self.harness.no_ui;
         if self.play_game_input() {
+            let mut quality_delta: i8 = 0;
             let esc = ctx.input(|i| {
-                i.events.iter().any(|e| {
-                    matches!(
-                        e,
-                        egui::Event::Key { key: Key::Escape, pressed: true, repeat: false, .. }
-                    )
-                })
+                let mut esc = false;
+                for e in &i.events {
+                    match e {
+                        egui::Event::Key {
+                            key: Key::Escape,
+                            pressed: true,
+                            repeat: false,
+                            ..
+                        } => esc = true,
+                        egui::Event::Key {
+                            key: Key::F10,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                            ..
+                        } if !modifiers.ctrl && !modifiers.alt && !modifiers.command => {
+                            quality_delta = if modifiers.shift { -1 } else { 1 };
+                        }
+                        _ => {}
+                    }
+                }
+                esc
             });
+            if quality_delta != 0 {
+                crate::game_settings::step_graphics_quality(quality_delta);
+            }
             if esc {
                 self.toggle_game_menu();
             }
             // Presses this frame: a tap pressed and released within one frame
             // never shows in keys_down, yet scripts must see it. The key
             // positions are physical, like Roblox's KeyCodes (src/keys.rs).
-            // (Escape belongs to the Roblox menu: games never hear it.)
+            // (Escape belongs to the Roblox menu and F10 to graphics quality:
+            // games never hear them.)
             let taps: Vec<Key> = ctx.input(|i| {
                 i.events
                     .iter()
@@ -1673,8 +1689,14 @@ impl Editor {
                             physical_key,
                             pressed: true,
                             repeat: false,
+                            modifiers,
                             ..
-                        } if physical_key.unwrap_or(*key) != Key::Escape => {
+                        } if physical_key.unwrap_or(*key) != Key::Escape
+                            && !(physical_key.unwrap_or(*key) == Key::F10
+                                && !modifiers.ctrl
+                                && !modifiers.alt
+                                && !modifiers.command) =>
+                        {
                             Some(physical_key.unwrap_or(*key))
                         }
                         _ => None,
@@ -1700,9 +1722,14 @@ impl Editor {
                 }
             }
             ctx.input_mut(|i| {
-                i.events.retain(
-                    |e| !matches!(e, egui::Event::Key { modifiers, .. } if modifiers.is_none()),
-                );
+                i.events.retain(|e| {
+                    !matches!(
+                        e,
+                        egui::Event::Key { key, modifiers, .. }
+                            if modifiers.is_none()
+                                || (*key == Key::F10 && !modifiers.ctrl && !modifiers.alt && !modifiers.command)
+                    )
+                });
             });
         }
     }
@@ -1835,34 +1862,44 @@ impl Editor {
 impl Editor {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         self.hud.status_drawn = true;
-        ui.horizontal(|ui| {
-            let sel = self.doc.selection.len();
-            if let Some(s) = self.play_status() {
-                ui.label(RichText::new(format!("● {s}")).color(theme::ERROR).strong());
+        let row = egui::vec2(ui.available_size_before_wrap().x, ui.spacing().interact_size.y);
+        ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            ui.label(RichText::new(format!("{:.0} fps", self.fps)).color(theme::TEXT_DIM));
+            if let Some(mcp) = &self.mcp {
                 ui.separator();
+                ui.label(RichText::new(format!("MCP :{}", mcp.port)).color(theme::TEXT_DIM))
+                    .on_hover_text(format!("OmniMCP bridge listening on 127.0.0.1:{}", mcp.port));
             }
-            ui.label(RichText::new(format!("{} tool", self.tool.label())).color(theme::ACCENT));
-            ui.separator();
-            ui.label(format!("{sel} selected"));
-            ui.separator();
-            ui.label(format!("{} parts", self.scene.parts.len()));
-            ui.separator();
-            let p = self.cam.pos;
-            ui.label(format!("Camera {:.1}, {:.1}, {:.1}", p.x, p.y, p.z));
-            ui.separator();
-            ui.label(if self.snap_move {
-                format!("Snap {} st / {}°", self.move_inc, self.rotate_inc)
-            } else {
-                "Snap off".into()
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(format!("{:.0} fps", self.fps)).color(theme::TEXT_DIM));
-                if let Some(mcp) = &self.mcp {
-                    ui.separator();
-                    ui.label(RichText::new(format!("MCP :{}", mcp.port)).color(theme::TEXT_DIM))
-                        .on_hover_text(format!("OmniMCP bridge listening on 127.0.0.1:{}", mcp.port));
+            let left_rect = ui.available_rect_before_wrap();
+            if left_rect.width() > 0.0 {
+                let mut left = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(left_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                left.set_clip_rect(left_rect.intersect(ui.clip_rect()));
+                left.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                let sel = self.doc.selection.len();
+                if let Some(s) = self.play_status() {
+                    left.label(RichText::new(format!("● {s}")).color(theme::ERROR).strong());
+                    left.separator();
                 }
-            });
+                left.label(RichText::new(format!("{} tool", self.tool.label())).color(theme::ACCENT));
+                left.separator();
+                left.label(format!("{sel} selected"));
+                left.separator();
+                left.label(format!("{} parts", self.scene.parts.len()));
+                left.separator();
+                let p = self.cam.pos;
+                left.label(format!("Camera {:.1}, {:.1}, {:.1}", p.x, p.y, p.z));
+                left.separator();
+                left.label(if self.snap_move {
+                    format!("Snap {} st / {}°", self.move_inc, self.rotate_inc)
+                } else {
+                    "Snap off".into()
+                });
+            }
         });
     }
 
@@ -1957,7 +1994,7 @@ impl TabViewer for Viewer<'_> {
 
     fn title(&mut self, tab: &mut Tab) -> egui::WidgetText {
         match tab {
-            Tab::Script(r) => format!("📜 {}", self.ed.script_title(*r)).into(),
+            Tab::Script(r) => self.ed.script_title(*r).into(),
             // Studio's document tab: the place's name.
             Tab::Viewport => match self.ed.play_status() {
                 Some(s) => RichText::new(format!("{} — {s}", self.ed.doc.title))
@@ -2170,7 +2207,7 @@ impl RustudioApp {
             w.key = self.panels.free_key(w.tabs()[0].key());
             self.panels.popped.push(w);
         }
-        // Main window: its outer top-left on the screen (None on Wayland).
+        // Main window: its outer top-left on the screen.
         let origin = ctx.input(|i| {
             let v = i.viewport();
             match (v.outer_rect, v.inner_rect) {
@@ -2208,13 +2245,13 @@ impl crate::d3d11::WindowApp for RustudioApp {
         }
     }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
-        // A scripted run's window on Windows sits on the real desktop: the
-        // person's (or an idle session's) mouse pointer over it would hover
-        // and click like the script (a ribbon tooltip in a screenshot). Linux
-        // runs them in a headless gamescope with no pointer; here the real
-        // pointer is dropped before the script's own input goes in.
-        if cfg!(windows)
-            && (self.ed.harness.selftest.is_some() || self.ed.harness.screenshot.is_some() || self.ed.harness.ui_shots.is_some())
+        // A scripted run's window sits on the real desktop: the person's (or an
+        // idle session's) mouse pointer over it would hover and click like the
+        // script (a ribbon tooltip in a screenshot), so the real pointer is
+        // dropped before the script's own input goes in.
+        if (self.ed.harness.selftest.is_some()
+            || self.ed.harness.screenshot.is_some()
+            || self.ed.harness.ui_shots.is_some())
             && std::env::var_os("RUSTUDIO_VISIBLE_TESTS").is_none()
         {
             raw.events.retain(|e| {
@@ -2285,9 +2322,6 @@ impl RustudioApp {
             let (pending, loaded) = ed.textures.counts();
             crate::load_trace::assets(ed.meshes.count(), pending, loaded);
         }
-        // (the memory a load's decodes and downloads freed goes back to the
-        // system once it settles: src/heap.rs)
-        crate::heap::settle(ed.textures.counts().0 > 0 || !done.is_empty());
         if !done.is_empty() {
             ed.meshes.retry(&done);
             ed.textures.retry(&done);
@@ -2410,7 +2444,11 @@ impl RustudioApp {
                 ctx.request_repaint();
             }
             if ed.account.busy() || ed.assets.busy() {
-                ctx.request_repaint();
+                if ed.harness.plain() {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                } else {
+                    ctx.request_repaint();
+                }
             }
             ed.mcp_tick(&ctx);
             self.watchdog.complete();
@@ -2688,16 +2726,20 @@ impl RustudioApp {
         if bench_done {
             ed.finish_run(&ctx, "bench");
         }
+        let active_input = ctx.input(|i| i.pointer.any_down() || !i.keys_down.is_empty());
         if ed.drag.is_some()
-            || ed.play.is_some()
-            || ed.assets.busy()
-            || ed.textures.decoding()
-            || ctx.input(|i| i.pointer.any_down() || !i.keys_down.is_empty())
+            || ed.is_playing()
+            || active_input
             || ed.harness.screenshot.is_some()
             || ed.harness.selftest.is_some()
-            || ed.account.busy()
         {
             ctx.request_repaint();
+        } else if ed.assets.busy() || ed.textures.decoding() || ed.account.busy() {
+            if !ed.is_playing() && ed.harness.plain() && ed.drag.is_none() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            } else {
+                ctx.request_repaint();
+            }
         }
         self.watchdog.complete();
     }
@@ -2857,58 +2899,43 @@ impl Editor {
     }
 }
 
-/// This process's resident memory now (MB; NaN where not supported).
+/// This process's resident memory now (MB; NaN if the query fails).
 fn current_rss_mb() -> f64 {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-        use windows_sys::Win32::System::Threading::GetCurrentProcess;
-        // SAFETY: a zeroed counters struct with its size set, as the API asks.
-        let mut m: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
-        m.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-        if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut m, m.cb) } != 0 {
-            m.WorkingSetSize as f64 / (1024.0 * 1024.0)
-        } else {
-            f64::NAN
-        }
-    }
-    #[cfg(not(windows))]
-    {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: a zeroed counters struct with its size set, as the API asks.
+    let mut m: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    m.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut m, m.cb) } != 0 {
+        m.WorkingSetSize as f64 / (1024.0 * 1024.0)
+    } else {
         f64::NAN
     }
 }
 
 /// This process's CPU time (user + system, s) and peak resident memory (MB).
 fn process_usage() -> (f64, f64) {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::FILETIME;
-        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
-        let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
-        let (mut created, mut exited, mut kernel, mut user) = (z, z, z, z);
-        let secs = |f: FILETIME| (((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64) as f64 * 1e-7;
-        // SAFETY: the current process's pseudo-handle and four FILETIME out-pointers.
-        let cpu = if unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user) } != 0 {
-            secs(kernel) + secs(user)
-        } else {
-            f64::NAN
-        };
-        // SAFETY: a zeroed counters struct with its size set, as the API asks.
-        let mut m: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
-        m.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-        let peak = if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut m, m.cb) } != 0 {
-            m.PeakWorkingSetSize as f64 / (1024.0 * 1024.0)
-        } else {
-            f64::NAN
-        };
-        (cpu, peak)
-    }
-    // Not supported here: NaN, null in --result.
-    #[cfg(not(any(unix, windows)))]
-    {
-        (f64::NAN, f64::NAN)
-    }
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut created, mut exited, mut kernel, mut user) = (z, z, z, z);
+    let secs = |f: FILETIME| (((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64) as f64 * 1e-7;
+    // SAFETY: the current process's pseudo-handle and four FILETIME out-pointers.
+    let cpu = if unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user) } != 0 {
+        secs(kernel) + secs(user)
+    } else {
+        f64::NAN
+    };
+    // SAFETY: a zeroed counters struct with its size set, as the API asks.
+    let mut m: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    m.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    let peak = if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut m, m.cb) } != 0 {
+        m.PeakWorkingSetSize as f64 / (1024.0 * 1024.0)
+    } else {
+        f64::NAN
+    };
+    (cpu, peak)
 }
 
 // ------------------------------------------------------------------ harness

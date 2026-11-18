@@ -9,56 +9,19 @@
 //!   sets PlayerMouse.Icon to rbxasset://textures/MouseLockedCursor.png
 //!   (CameraModule/MouseLockController.lua, 32 × 32).
 //! - Back to Default: the cursor is let go where it is held. It never jumps
-//!   to the middle of the view. On Wayland a Locked pointer never moved, so
-//!   letting go is all there is (no position hint: Hyprland warps the cursor
-//!   to a lock's hint when the lock goes away). A Confined fallback (X11,
-//!   Windows: no real lock) is held at the pre-lock spot and put back there.
+//!   to the middle of the view. Windows only confines (no real pointer lock):
+//!   the cursor is held at the pre-lock spot and put back there.
 
 use egui::{Pos2, Rect, Vec2};
 
-/// Whether the window can truly lock the cursor (CursorGrab::Locked): winit
-/// on Wayland (pointer-constraints) and macOS. X11 and Windows only confine.
-/// winit picks Wayland whenever a Wayland socket is set.
-pub fn platform_locks() -> bool {
-    *LOCKS.get_or_init(detect_locks)
-}
-
-static LOCKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-/// The window's real backend, once it exists (app.rs, from its raw window
-/// handle): Some(true) on Wayland. Better than the environment guess (a
-/// failed Wayland connection falls back to X11).
-pub fn note_window(wayland: Option<bool>) {
-    if let Some(w) = wayland {
-        let _ = LOCKS.set(w || cfg!(target_os = "macos"));
-    }
-}
-
-fn detect_locks() -> bool {
-    if cfg!(target_os = "macos") {
-        return true;
-    }
-    if cfg!(all(unix, not(target_os = "macos"))) {
-        return wayland_session(
-            std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty()),
-            std::env::var_os("WAYLAND_SOCKET").is_some_and(|v| !v.is_empty()),
-        );
-    }
+/// Windows only confines the cursor (no true pointer lock).
+pub const fn platform_locks() -> bool {
     false
 }
 
-fn wayland_session(display: bool, socket: bool) -> bool {
-    display || socket
-}
-
-/// Whether a Locked grab that still sees the pointer move may be taken for
-/// "this platform can't lock" and turned into a Confined one. Never on a
-/// platform that locks: on Wayland motion queued before the compositor
-/// activated the lock (a fast flick as shift lock comes on) looked like
-/// that, and the Confined grab that replaced the lock left the cursor free
-/// in the window (Wayland can't re-centre an unlocked cursor) until the
-/// window lost focus.
-pub fn may_fall_back(platform_locks: bool) -> bool {
+/// Whether a Locked grab that still sees the pointer move may fall back to a
+/// Confined grab (always true on Windows).
+pub const fn may_fall_back(platform_locks: bool) -> bool {
     !platform_locks
 }
 
@@ -163,11 +126,10 @@ mod tests {
     }
 
     #[test]
-    fn wayland_never_trades_its_lock_for_a_confine() {
-        assert!(wayland_session(true, false) && wayland_session(false, true));
-        assert!(!wayland_session(false, false));
+    fn windows_confines_and_may_fall_back() {
+        assert!(!platform_locks());
+        assert!(may_fall_back(platform_locks()));
         assert!(!may_fall_back(true));
-        assert!(may_fall_back(false));
     }
 
     #[test]
