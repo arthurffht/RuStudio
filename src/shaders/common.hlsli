@@ -329,19 +329,22 @@ float sun_shadow_map(float3 world) {
     float3 d0 = world - g.sun_sphere[0].xyz;
     float3 d1 = world - g.sun_sphere[1].xyz;
     float3 d2 = world - g.sun_sphere[2].xyz;
-    int i = 3;
+    float4x4 casc = g.sun_casc[3];
+    float4 r = g.sun_rect[3];
     if (dot(d0, d0) < g.sun_sphere[0].w) {
-        i = 0;
+        casc = g.sun_casc[0];
+        r = g.sun_rect[0];
     } else if (dot(d1, d1) < g.sun_sphere[1].w) {
-        i = 1;
+        casc = g.sun_casc[1];
+        r = g.sun_rect[1];
     } else if (dot(d2, d2) < g.sun_sphere[2].w) {
-        i = 2;
+        casc = g.sun_casc[2];
+        r = g.sun_rect[2];
     }
-    float4 p = mul(g.sun_casc[i], float4(world, 1.0f));
+    float4 p = mul(casc, float4(world, 1.0f));
     if (any(p.xy <= 0.0f) || any(p.xy >= 1.0f)) {
         return -1.0f;
     }
-    float4 r = g.sun_rect[i];
     float4 m = sun_evsm_tex.SampleLevel(lshadow_sampler, r.xy + p.xy * r.zw, 0.0f);
     return evsm_visibility(m, 2.0f * p.z - 1.0f);
 }
@@ -371,11 +374,12 @@ float sun_shadow(float3 world, float3 n) {
 
 float3 env_cube(float3 n, float sky) {
     float3 w = n * n;
-    int x = (n.x > 0.0f) ? 0 : 1;
-    int y = (n.y > 0.0f) ? 2 : 3;
-    int z = (n.z > 0.0f) ? 4 : 5;
-    float3 outside = g.env[x].rgb * w.x + g.env[y].rgb * w.y + g.env[z].rgb * w.z;
-    float3 inside = g.env_indoor[x].rgb * w.x + g.env_indoor[y].rgb * w.y + g.env_indoor[z].rgb * w.z;
+    float3 outside = (n.x > 0.0f ? g.env[0].rgb : g.env[1].rgb) * w.x
+        + (n.y > 0.0f ? g.env[2].rgb : g.env[3].rgb) * w.y
+        + (n.z > 0.0f ? g.env[4].rgb : g.env[5].rgb) * w.z;
+    float3 inside = (n.x > 0.0f ? g.env_indoor[0].rgb : g.env_indoor[1].rgb) * w.x
+        + (n.y > 0.0f ? g.env_indoor[2].rgb : g.env_indoor[3].rgb) * w.y
+        + (n.z > 0.0f ? g.env_indoor[4].rgb : g.env_indoor[5].rgb) * w.z;
     return lerp(inside, outside, sky);
 }
 
@@ -448,6 +452,7 @@ float occ_transmit(float3 a, float3 b) {
     }
     float steps = clamp(ceil(len / g.lightocc.w), 1.0f, LIGHTOCC_MAX_STEPS);
     float tau = 0.0f;
+    [loop]
     for (float i = 0.0f; i < steps; i += 1.0f) {
         tau += occ_at(a + d * ((i + 0.5f) / steps));
     }
@@ -470,8 +475,8 @@ float light_occlusion(float3 world, float3 n, float3 lpos) {
 }
 
 float light_shadow(int slot, float3 world) {
-    ShadowSlot s = lshadow_slots[slot];
-    float3 v = world - s.pos.xyz;
+    float4 pos = lshadow_slots[slot].pos;
+    float3 v = world - pos.xyz;
     float3 a = abs(v);
     uint f = 0u;
     if (a.x >= a.y && a.x >= a.z) {
@@ -481,18 +486,28 @@ float light_shadow(int slot, float3 world) {
     } else {
         f = (v.z > 0.0f) ? 4u : 5u;
     }
-    float4 clip = mul(s.vp[f], float4(world, 1.0f));
+    float4 clip;
+    [branch]
+    switch (f) {
+        case 0u: clip = mul(lshadow_slots[slot].vp[0], float4(world, 1.0f)); break;
+        case 1u: clip = mul(lshadow_slots[slot].vp[1], float4(world, 1.0f)); break;
+        case 2u: clip = mul(lshadow_slots[slot].vp[2], float4(world, 1.0f)); break;
+        case 3u: clip = mul(lshadow_slots[slot].vp[3], float4(world, 1.0f)); break;
+        case 4u: clip = mul(lshadow_slots[slot].vp[4], float4(world, 1.0f)); break;
+        default: clip = mul(lshadow_slots[slot].vp[5], float4(world, 1.0f)); break;
+    }
     float w = max(clip.w, 1e-4f);
     float2 ndc = clamp(clip.xy / w, float2(-1.0f, -1.0f), float2(1.0f, 1.0f));
     uint k = (uint)slot * 6u + f;
     float2 cell = float2((float)(k % LSHADOW_COLS), (float)(k / LSHADOW_COLS));
     float2 uv = (cell + ndc * float2(0.5f, -0.5f) + 0.5f) * LSHADOW_CELL;
     float4 m = lshadow_tex.SampleLevel(lshadow_sampler, uv, 0.0f);
-    return evsm_visibility(m, 2.0f * (w * s.pos.w) - 1.0f);
+    return evsm_visibility(m, 2.0f * (w * pos.w) - 1.0f);
 }
 
 float3 local_lights(float3 world, float3 n) {
     float3 sum = float3(0.0f, 0.0f, 0.0f);
+    [branch]
     if (g.sun_color.w > 0.5f) {
         if (g.lightgrid.w > 0.0f) {
             float3 p = (world + n * 6.0f) * 0.25f - g.lightgrid.xyz;
@@ -504,18 +519,23 @@ float3 local_lights(float3 world, float3 n) {
         }
     } else {
         uint count = (uint)g.params.x;
-        for (uint i = 0u; i < count; i++) {
-            Light l = lights[i];
-            float3 c = local_light(l, world, n);
-            if (!any(c > 0.0f)) {
-                continue;
+        [branch]
+        if (count > 0u) {
+            [loop]
+            for (uint i = 0u; i < count; i++) {
+                Light l = lights[i];
+                float3 c = local_light(l, world, n);
+                [branch]
+                if (any(c > 0.0f)) {
+                    [branch]
+                    if (l.extra.w >= 0.0f) {
+                        c *= light_shadow((int)l.extra.w, world);
+                    } else if (l.extra.z > 0.5f) {
+                        c *= light_occlusion(world, n, l.pos_range.xyz);
+                    }
+                    sum += c;
+                }
             }
-            if (l.extra.w >= 0.0f) {
-                c *= light_shadow((int)l.extra.w, world);
-            } else if (l.extra.z > 0.5f) {
-                c *= light_occlusion(world, n, l.pos_range.xyz);
-            }
-            sum += c;
         }
     }
     return sum;
@@ -530,33 +550,39 @@ LocalPbr local_pbr(float3 world, float3 n, float3 v, float rough, float3 f0, flo
     LocalPbr result;
     result.diffuse = float3(0.0f, 0.0f, 0.0f);
     result.specular = float3(0.0f, 0.0f, 0.0f);
+    [branch]
     if (g.sun_color.w > 0.5f || g.env_spec.z <= 0.5f) {
         result.diffuse = local_lights(world, n);
     } else {
         uint count = (uint)g.params.x;
-        for (uint i = 0u; i < count; i++) {
-            Light light = lights[i];
-            float3 radiance = local_light(light, world, n);
-            if (!any(radiance > 0.0f)) {
-                continue;
+        [branch]
+        if (count > 0u) {
+            [loop]
+            for (uint i = 0u; i < count; i++) {
+                Light light = lights[i];
+                float3 radiance = local_light(light, world, n);
+                [branch]
+                if (any(radiance > 0.0f)) {
+                    [branch]
+                    if (light.extra.w >= 0.0f) {
+                        radiance *= light_shadow((int)light.extra.w, world);
+                    } else if (light.extra.z > 0.5f) {
+                        radiance *= light_occlusion(world, n, light.pos_range.xyz);
+                    }
+                    float3 direction = normalize(light_point(light, world) - world);
+                    float3 vh = v + direction;
+                    float3 h = vh * rsqrt(max(dot(vh, vh), 0.0001f));
+                    float nh = max(dot(n, h), 0.001f);
+                    float lh = dot(direction, h);
+                    float edge = pow(abs(max(1.0f - lh, 0.0f)), 5.0f);
+                    float3 fresnel = float3(edge, edge, edge) + f0 * (1.0f - edge);
+                    float a = pow(abs(max(rough, 0.0f)), 4.0f);
+                    float denominator = (nh * a - nh) * nh + 1.0f;
+                    float distribution = (a + a * a) / (denominator * denominator * (lh * 3.0f + 0.5f) * (nh * 0.75f + 0.25f));
+                    result.diffuse += ((float3)kd - fresnel * ss * kd) * radiance;
+                    result.specular += fresnel * distribution * radiance;
+                }
             }
-            if (light.extra.w >= 0.0f) {
-                radiance *= light_shadow((int)light.extra.w, world);
-            } else if (light.extra.z > 0.5f) {
-                radiance *= light_occlusion(world, n, light.pos_range.xyz);
-            }
-            float3 direction = normalize(light_point(light, world) - world);
-            float3 vh = v + direction;
-            float3 h = vh * rsqrt(max(dot(vh, vh), 0.0001f));
-            float nh = max(dot(n, h), 0.001f);
-            float lh = dot(direction, h);
-            float edge = pow(abs(max(1.0f - lh, 0.0f)), 5.0f);
-            float3 fresnel = float3(edge, edge, edge) + f0 * (1.0f - edge);
-            float a = pow(abs(max(rough, 0.0f)), 4.0f);
-            float denominator = (nh * a - nh) * nh + 1.0f;
-            float distribution = (a + a * a) / (denominator * denominator * (lh * 3.0f + 0.5f) * (nh * 0.75f + 0.25f));
-            result.diffuse += ((float3)kd - fresnel * ss * kd) * radiance;
-            result.specular += fresnel * distribution * radiance;
         }
     }
     return result;

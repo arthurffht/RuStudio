@@ -2304,7 +2304,13 @@
   {
    "name": "D3D11 quality feature thresholds",
    "group": "performance",
-   "value": "shadows/clouds >= 4, bloom >= 6, local shadows >= 8, 3-cascade >= 10, SSAO >= 12, DoF/high-shadow/LOD-1.0 >= 14, 4x MSAA/4-cascade >= 16 (UMA caps MSAA at 1x, atlas at 1024, local shadows at 4, and auto SSAO/DoF off)",
+   "value": "shadows/clouds >= 4, bloom >= 6, local shadows >= 8, 3-cascade >= 10, SSAO >= 12, DoF/high-shadow/LOD-1.0 >= 14, 4x MSAA/4-cascade >= 16 (UMA caps MSAA at 1x, atlas at 1024, local shadows at 4, auto ceiling at 12, and auto SSAO/DoF off)",
+   "estimated": true
+  },
+  {
+   "name": "D3D11 quality anisotropy scaling",
+   "group": "performance",
+   "value": "<= 5: 1x trilinear; 6..=15 or UMA: 4x anisotropic; >= 16 non-UMA: 8x anisotropic (TEXTURE_ANISOTROPY)",
    "estimated": true
   },
   {

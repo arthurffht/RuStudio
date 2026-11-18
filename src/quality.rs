@@ -18,6 +18,7 @@ pub struct QualityProfile {
     pub enable_clouds: bool,
     pub max_local_shadows: usize,
     pub lod_bias: f32,
+    pub max_anisotropy: u32,
 }
 
 impl QualityProfile {
@@ -34,6 +35,13 @@ impl QualityProfile {
             } else {
                 1
             };
+        let max_anisotropy = if lvl >= mech::QUALITY_ANISO_HIGH_MIN_LEVEL && !caps.is_uma {
+            (mech::TEXTURE_ANISOTROPY as u32).min(caps.max_anisotropy).max(1)
+        } else if lvl >= mech::QUALITY_ANISO_MID_MIN_LEVEL && lvl > mech::QUALITY_ANISO_LOW_MAX_LEVEL {
+            mech::QUALITY_ANISO_MID.min(caps.max_anisotropy).max(1)
+        } else {
+            mech::QUALITY_ANISO_LOW
+        };
         Self {
             level: lvl,
             auto_mode,
@@ -73,6 +81,7 @@ impl QualityProfile {
             } else {
                 1.75
             },
+            max_anisotropy,
         }
     }
 
@@ -96,12 +105,17 @@ impl QualityProfile {
         frm_level: Option<u8>,
     ) -> Self {
         let auto_mode = quality_setting == 0 || frm_enabled;
-        let level = if quality_setting == 0 {
+        let raw_level = if quality_setting == 0 {
             frm_level.unwrap_or_else(|| Self::recommended_for_caps(caps))
         } else if frm_enabled {
             frm_level.unwrap_or(quality_setting)
         } else {
             quality_setting
+        };
+        let level = if auto_mode && caps.is_uma {
+            raw_level.min(mech::QUALITY_MID_DEFAULT_LEVEL)
+        } else {
+            raw_level
         };
         Self::from_level(level, caps, auto_mode)
     }
@@ -111,14 +125,21 @@ impl QualityProfile {
 /// and steps `QualityLevel` up or down to maintain interactive frame rates.
 pub struct FrameRateManager {
     level: u8,
+    max_level: u8,
     ema_ms: f32,
     frames_since_change: u32,
 }
 
 impl FrameRateManager {
     pub fn new(caps: &GpuCaps) -> Self {
+        let max_level = if caps.is_uma {
+            mech::QUALITY_MID_DEFAULT_LEVEL
+        } else {
+            mech::QUALITY_LEVEL_MAX
+        };
         Self {
-            level: QualityProfile::recommended_for_caps(caps),
+            level: QualityProfile::recommended_for_caps(caps).min(max_level),
+            max_level,
             ema_ms: mech::FRM_TARGET_INITIAL_MS,
             frames_since_change: 0,
         }
@@ -149,8 +170,8 @@ impl FrameRateManager {
                     .saturating_sub(mech::FRM_DOWNGRADE_STEP)
                     .max(mech::QUALITY_LEVEL_MIN);
                 self.frames_since_change = 0;
-            } else if self.ema_ms < mech::FRM_UPGRADE_MS && self.level < mech::QUALITY_LEVEL_MAX {
-                self.level = (self.level + mech::FRM_UPGRADE_STEP).min(mech::QUALITY_LEVEL_MAX);
+            } else if self.ema_ms < mech::FRM_UPGRADE_MS && self.level < self.max_level {
+                self.level = (self.level + mech::FRM_UPGRADE_STEP).min(self.max_level);
                 self.frames_since_change = 0;
             }
         }
@@ -214,13 +235,15 @@ mod tests {
         assert!(auto.enable_clouds);
         assert_eq!(auto.max_local_shadows, 0);
         assert_eq!(auto.lod_bias, 1.75);
+        assert_eq!(auto.max_anisotropy, 1);
 
-        // Even if FRM pushes level up to 21 in auto mode, UMA keeps MSAA=1x, atlas=1024, SSAO/DoF off.
+        // Even if FRM pushes level up to 21 in auto mode, UMA caps auto ceiling at QUALITY_MID_DEFAULT_LEVEL (12), MSAA=1x, atlas=1024, SSAO/DoF off, aniso<=4.
         let auto_max = QualityProfile::resolve(&caps, 0, true, Some(21));
-        assert_eq!(auto_max.level, 21);
+        assert_eq!(auto_max.level, mech::QUALITY_MID_DEFAULT_LEVEL);
         assert_eq!(auto_max.msaa_samples, 1);
         assert_eq!(auto_max.shadow_atlas_side, 1024);
         assert_eq!(auto_max.max_local_shadows, 4);
+        assert_eq!(auto_max.max_anisotropy, 4);
         assert!(!auto_max.enable_ssao);
         assert!(!auto_max.enable_dof);
 
@@ -236,6 +259,7 @@ mod tests {
         assert!(manual.enable_bloom);
         assert_eq!(manual.max_local_shadows, 4);
         assert_eq!(manual.lod_bias, 1.0);
+        assert_eq!(manual.max_anisotropy, 4);
     }
 
     #[test]
@@ -256,6 +280,7 @@ mod tests {
         assert!(p21.enable_clouds);
         assert_eq!(p21.max_local_shadows, 16);
         assert_eq!(p21.lod_bias, 1.0);
+        assert_eq!(p21.max_anisotropy, mech::TEXTURE_ANISOTROPY as u32);
 
         // Mid-VRAM (1 GB) defaults to level 12 in Automatic.
         let mid = discrete_gpu_caps(1024, 4);
@@ -270,6 +295,7 @@ mod tests {
         assert!(p_mid.enable_bloom);
         assert_eq!(p_mid.max_local_shadows, 4);
         assert_eq!(p_mid.lod_bias, 1.25);
+        assert_eq!(p_mid.max_anisotropy, 4);
 
         // Discrete GPU without 4x FP16 MSAA falls back to level 5 recommended and 1x MSAA even at Level21.
         let no_msaa = discrete_gpu_caps(4096, 1);

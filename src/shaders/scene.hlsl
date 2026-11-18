@@ -267,13 +267,15 @@ float3 surface_shade(uint packed_faces, float3 objn, float3 local_p, float3 half
         gy = ddy_l.xy;
     }
     uint band = (packed_faces >> (3u * face)) & 7u;
-    if (band == 0u) {
-        return float3(1.0f, 1.0f, 1.0f);
+    float3 res = float3(1.0f, 1.0f, 1.0f);
+    [branch]
+    if (band != 0u) {
+        float2 k = float2(0.5f, 1.0f / 32.0f);
+        float2 at = float2(uv.x * 0.5f, ((float)(band - 1u) + frac(uv.y / 8.0f)) * 0.25f);
+        float t = studs_tex.SampleGrad(studs_sampler, at, gx * k, gy * k).r;
+        res = sq((float3)(t * 2.0f));
     }
-    float2 k = float2(0.5f, 1.0f / 32.0f);
-    float2 at = float2(uv.x * 0.5f, ((float)(band - 1u) + frac(uv.y / 8.0f)) * 0.25f);
-    float t = studs_tex.SampleGrad(studs_sampler, at, gx * k, gy * k).r;
-    return sq((float3)(t * 2.0f));
+    return res;
 }
 
 float2 face_studs(float3 objn, float3 local_p, float3 half_ext, uint oblique) {
@@ -325,7 +327,7 @@ float4 see_out(float3 c, float w, float a, bool enc_out) {
     return float4(c * w, a);
 }
 
-float4 part_shade(PartOut input, bool front, bool enc_out) {
+float4 part_shade_impl(PartOut input, bool front, bool enc_out, bool opaque_pass) {
     uint code = (uint)(input.extra.x + 0.5f);
     float kind = (float)(code & 7u);
     int layer = (int)(code >> 4u) - 1;
@@ -344,31 +346,55 @@ float4 part_shade(PartOut input, bool front, bool enc_out) {
     float3 ddx_l = ddx(input.local);
     float3 ddy_l = ddy(input.local);
 
-    bool decal_clamp = ((uint)(input.extra.w + 0.5f) == 2u) && all(abs(input.mscale - float4(1.0f, 1.0f, 0.0f, 0.0f)) < 1e-4f);
-    float2 edge_px = 0.5f / (float2)tex_dims2d(tex);
-    float2 suv = decal_clamp ? clamp(input.uv, edge_px, 1.0f - edge_px) : input.uv;
-    float4 t_s = tex.Sample(tex_sampler, suv);
-    float emask = emissive_tex.Sample(tex_sampler, input.uv).r;
-    float4 sa_map = surface_tex.Sample(tex_sampler, input.uv);
-
+    uint mode = (uint)(input.extra.w + 0.5f);
     float3 n = normalize(input.normal);
     if (dot(n, g.cam_pos.xyz - input.world) < 0.0f) {
         n = -n;
     }
     float3 vtint = sq(input.vtint.rgb);
     float3 base = input.color.rgb * vtint;
-    float alpha = input.color.a;
-    bool translucent = alpha < 0.999f;
+    float alpha = opaque_pass ? 1.0f : input.color.a;
+    bool translucent = !opaque_pass && alpha < 0.999f;
     if (translucent) {
         alpha = alpha * input.vtint.a;
     }
 
-    float3 t_raw = linear_to_srgb(t_s.rgb);
-    float4 t = float4(t_raw * t_raw, t_s.a);
-    uint mode = (uint)(input.extra.w + 0.5f);
+    float3 t_raw = float3(0.0f, 0.0f, 0.0f);
+    float4 t = float4(0.0f, 0.0f, 0.0f, 1.0f);
+    float emask = 0.0f;
+    float mat_rough = -1.0f;
+    float mat_metal = 0.0f;
+
+    [branch]
+    if (mode != 0u || (!opaque_pass && kind == 6.0f)) {
+        bool decal_clamp = (mode == 2u) && all(abs(input.mscale - float4(1.0f, 1.0f, 0.0f, 0.0f)) < 1e-4f);
+        float2 edge_px = 0.5f / (float2)tex_dims2d(tex);
+        float2 suv = decal_clamp ? clamp(input.uv, edge_px, 1.0f - edge_px) : input.uv;
+        float4 t_s = tex.SampleGrad(tex_sampler, suv, udx, udy);
+        t_raw = linear_to_srgb(t_s.rgb);
+        t = float4(t_raw * t_raw, t_s.a);
+
+        if (mode == 1u || mode >= 3u) {
+            emask = emissive_tex.SampleGrad(tex_sampler, input.uv, udx, udy).r;
+            if (tex_dims2d(surface_tex).x > 1) {
+                float4 sa_map = surface_tex.SampleGrad(tex_sampler, input.uv, udx, udy);
+                mat_rough = sa_map.b;
+                mat_metal = sa_map.a;
+                float det = udx.x * udy.y - udx.y * udy.x;
+                if (abs(det) > 1e-10f) {
+                    float3 tangent = (wdx * udy.y - wdy * udx.y) / det;
+                    float3 bitangent = (wdy * udx.x - wdx * udy.x) / det;
+                    float3 tn = mat_normal(sa_map);
+                    float3 tt = normalize(tangent - n * dot(n, tangent));
+                    float3 bb = normalize(bitangent - n * dot(n, bitangent));
+                    n = normalize(tt * tn.x - bb * tn.y + n * tn.z);
+                }
+            }
+        }
+    }
 
     float4 out_res = float4(0.0f, 0.0f, 0.0f, 0.0f);
-    if (kind == 6.0f) {
+    if (!opaque_pass && kind == 6.0f) {
         float3 view = normalize(g.cam_pos.xyz - input.world);
         float rim = 1.0f - saturate(2.0f * abs(dot(n, view)));
         float phase = abs(cos(0.3f * g.cam_pos.w) * cos(g.cam_pos.w));
@@ -380,50 +406,38 @@ float4 part_shade(PartOut input, bool front, bool enc_out) {
         out_res = see_out(lerp(base, fog_rgb_at(input.world), fog), cover, cover * (1.0f - fog), enc_out);
     } else {
 
-    bool surface = input.tint.w > 0.5f;
-    float3 sa_raw = t_raw * input.tint.rgb * sqrt(max(input.emissive_albedo, 0.0f));
-    if (mode == 1u && surface) {
-        float3 under = sqrt(max(input.color.rgb, float3(0.0f, 0.0f, 0.0f))) * input.vtint.rgb;
-        float3 raw = lerp(under, sa_raw, t.a);
-        base = raw * raw;
-    } else if (mode == 1u) {
-        base = lerp(base, t.rgb * input.emissive_albedo * vtint, t.a);
-    } else if (mode == 6u) {
-        float3 raw = t_raw * lerp(float3(1.0f, 1.0f, 1.0f), input.tint.rgb, t.a) * sqrt(max(input.emissive_albedo, 0.0f));
-        base = raw * raw;
-    } else if (mode == 2u) {
-        base = t.rgb * base;
-        alpha = alpha * t.a;
-    } else if (mode == 3u) {
-        base = t.rgb * input.emissive_albedo * vtint;
-        if (translucent) { alpha = alpha * t.a; }
-    } else if (mode == 5u) {
-        base = t.rgb * input.color.rgb * vtint;
-        if (translucent) { alpha = alpha * t.a; }
-    } else if (mode == 4u) {
-        base = surface ? (sa_raw * sa_raw) : (t.rgb * input.emissive_albedo * vtint);
-        alpha = input.color.a * input.vtint.a * t.a;
-    }
-
-    float mat_rough = -1.0f;
-    float mat_metal = 0.0f;
-    if ((mode == 1u || mode >= 3u) && tex_dims2d(surface_tex).x > 1) {
-        mat_rough = sa_map.b;
-        mat_metal = sa_map.a;
-        float det = udx.x * udy.y - udx.y * udy.x;
-        if (abs(det) > 1e-10f) {
-            float3 tangent = (wdx * udy.y - wdy * udx.y) / det;
-            float3 bitangent = (wdy * udx.x - wdx * udy.x) / det;
-            float3 tn = mat_normal(sa_map);
-            float3 tt = normalize(tangent - n * dot(n, tangent));
-            float3 bb = normalize(bitangent - n * dot(n, bitangent));
-            n = normalize(tt * tn.x - bb * tn.y + n * tn.z);
+    [branch]
+    if (mode != 0u) {
+        bool surface = input.tint.w > 0.5f;
+        float3 sa_raw = t_raw * input.tint.rgb * sqrt(max(input.emissive_albedo, 0.0f));
+        if (mode == 1u && surface) {
+            float3 under = sqrt(max(input.color.rgb, float3(0.0f, 0.0f, 0.0f))) * input.vtint.rgb;
+            float3 raw = lerp(under, sa_raw, t.a);
+            base = raw * raw;
+        } else if (mode == 1u) {
+            base = lerp(base, t.rgb * input.emissive_albedo * vtint, t.a);
+        } else if (mode == 6u) {
+            float3 raw = t_raw * lerp(float3(1.0f, 1.0f, 1.0f), input.tint.rgb, t.a) * sqrt(max(input.emissive_albedo, 0.0f));
+            base = raw * raw;
+        } else if (mode == 2u) {
+            base = t.rgb * base;
+            if (!opaque_pass) { alpha = alpha * t.a; }
+        } else if (mode == 3u) {
+            base = t.rgb * input.emissive_albedo * vtint;
+            if (translucent) { alpha = alpha * t.a; }
+        } else if (mode == 5u) {
+            base = t.rgb * input.color.rgb * vtint;
+            if (translucent) { alpha = alpha * t.a; }
+        } else if (mode == 4u) {
+            base = surface ? (sa_raw * sa_raw) : (t.rgb * input.emissive_albedo * vtint);
+            if (!opaque_pass) { alpha = input.color.a * input.vtint.a * t.a; }
         }
     }
 
     float3 material_emission = float3(0.0f, 0.0f, 0.0f);
     float glass_alpha = alpha;
     float glass_scene_alpha = -1.0f;
+    [branch]
     if (mode == 0u && layer >= 0) {
         float4 mp0 = float4(-1.0f, 0.0f, 0.0f, 1.0f);
         float4 mp1 = float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -447,6 +461,7 @@ float4 part_shade(PartOut input, bool front, bool enc_out) {
         float3 nm;
         float2 duv = muv;
         float dk = 1.0f;
+        [branch]
         if (mp1.y > 0.5f) {
             float k = detile_noise(muv * mp1.x) * DETILE_LEVELS;
             float f = frac(k);
@@ -471,6 +486,7 @@ float4 part_shade(PartOut input, bool front, bool enc_out) {
             dk = mp0.w;
             a = mat_albedo.SampleGrad(studs_sampler, float3(duv, (float)layer), mdx * dk, mdy * dk);
             su = mat_surface.SampleGrad(studs_sampler, float3(duv, (float)layer), mdx * dk, mdy * dk);
+            [branch]
             if (lq || shader_type == 7u || shader_type == 8u) {
                 float cutoff = lq ? MATERIAL_LQ_DIFFUSE_CUTOFF : mc.x;
                 float2 uv = lq ? muv : duv;
@@ -480,6 +496,7 @@ float4 part_shade(PartOut input, bool front, bool enc_out) {
                 float4 near = mat_albedo.SampleGrad(studs_sampler, float3(uv, (float)layer), dx, dy);
                 a = lerp(far, near, saturate((fades.x - cutoff) * ms.x));
             }
+            [branch]
             if ((!lq && shader_type == 8u) || shader_type == 10u || shader_type == 11u) {
                 float4 sn = mat_surface.SampleGrad(studs_sampler, float3(duv * mf.y, (float)layer), mdx * dk * mf.y, mdy * dk * mf.y);
                 float4 ss = mat_surface.SampleGrad(studs_sampler, float3(duv * mf.z, (float)layer), mdx * dk * mf.z, mdy * dk * mf.z);
@@ -490,17 +507,19 @@ float4 part_shade(PartOut input, bool front, bool enc_out) {
         }
         mat_rough = su.b;
         mat_metal = su.a;
-        if (shader_type == 10u || shader_type == 11u) {
+        if (!opaque_pass && (shader_type == 10u || shader_type == 11u)) {
             glass_alpha = saturate(2.0f * alpha - 1.0f + a.a);
         }
         float tint_k = (mp1.w > 0.5f && shader_type != 10u && shader_type != 11u) ? a.a : 1.0f;
         base = sq(lerp(float3(1.0f, 1.0f, 1.0f), sqrt(max(base, float3(0.0f, 0.0f, 0.0f))), tint_k) * a.rgb);
+        [branch]
         if (shader_type == 9u) {
             float mask = mat_emission.SampleGrad(studs_sampler, float3(duv, (float)layer), mdx * dk, mdy * dk).r;
             material_emission = float3(mf.w, mc.w, ms.w) * mask;
         }
         float2 xy = nm.xy;
         float z = nm.z * ((shader_type == 10u || shader_type == 11u) ? 10.0f : 1.0f);
+        [branch]
         if (mp0.x >= 0.0f && mp0.z != 0.0f) {
             float t_scale = mp0.y * dk;
             float4 dn = mat_surface.SampleGrad(studs_sampler, float3(duv * mp0.y, (float)(int)mp0.x), mdx * t_scale, mdy * t_scale);
@@ -519,6 +538,7 @@ float4 part_shade(PartOut input, bool front, bool enc_out) {
 
     uint packed_flags = (uint)(input.extra.y + 0.5f);
     uint faces = (packed_flags >> 1u) & 0x3FFFFu;
+    [branch]
     if (faces != 0u) {
         base *= surface_shade(faces, input.objn, input.local, input.half_ext, ddx_l, ddy_l);
     }
@@ -529,7 +549,7 @@ float4 part_shade(PartOut input, bool front, bool enc_out) {
     if (g.lamp1.w > 1.5f) {
         float3 lit = min(g.ambient.rgb + g.sun_color.rgb * max(dot(n, normalize(g.sun_dir.xyz)), 0.0f), float3(1.0f, 1.0f, 1.0f));
         out_res = see_out(lit * base, alpha, alpha, enc_out);
-    } else if (kind > 4.5f && kind < 5.5f) {
+    } else if (!opaque_pass && kind > 4.5f && kind < 5.5f) {
         float3 up = normalize(input.normal);
         bool below = dot(up, g.cam_pos.xyz - input.world) < 0.0f;
         if (under_water() && (!below || up.y < WATER_INSIDE_MIN_UP)) {
@@ -548,6 +568,7 @@ float4 part_shade(PartOut input, bool front, bool enc_out) {
             c_w = lerp(lit, sky_color(reflect(vd, n)), fres);
             alpha = saturate(1.0f - input.emissive.y * (1.0f - fres));
         }
+        [branch]
         if (g.fog.z > 0.5f) {
             float d = length(input.world - g.cam_pos.xyz);
             float f = fog_amount(d);
@@ -557,6 +578,7 @@ float4 part_shade(PartOut input, bool front, bool enc_out) {
     } else {
         float3 c = float3(0.0f, 0.0f, 0.0f);
         bool debug_lit_exit = false;
+        [branch]
         if (kind > 0.5f && kind < 1.5f) {
             c = base * base * NEON_GLOW;
         } else {
@@ -564,7 +586,7 @@ float4 part_shade(PartOut input, bool front, bool enc_out) {
             float ndl = max(dot(n, l), 0.0f);
             float shadow = (ndl > 0.0f) ? sun_shadow(input.world, normalize(input.normal)) : 1.0f;
             float sv = light_grid(input.world, normalize(input.normal));
-            bool is_glass = (kind > 2.5f) && (kind < 3.5f);
+            bool is_glass = !opaque_pass && (kind > 2.5f) && (kind < 3.5f);
             float3 v = normalize(g.cam_pos.xyz - input.world);
             float nv = max(dot(n, v), 1e-4f);
             float fade = saturate(1.0f - length(g.cam_pos.xyz - input.world) * ENV_SPEC_FADE);
@@ -580,6 +602,7 @@ float4 part_shade(PartOut input, bool front, bool enc_out) {
 
             float3 sun_spec = float3(0.0f, 0.0f, 0.0f);
             float3 fs = float3(0.0f, 0.0f, 0.0f);
+            [branch]
             if (g.env_spec.z > 0.5f) {
                 float3 h = normalize(v + l);
                 float nh = max(dot(n, h), 0.001f);
@@ -620,6 +643,7 @@ float4 part_shade(PartOut input, bool front, bool enc_out) {
                 debug_lit_exit = true;
             } else {
                 float3 albedo = base;
+                [branch]
                 if (reflective) {
                     albedo = lerp(base, env_reflect(reflect(-v, n), rough, 1.0f, true), refl);
                 }
@@ -632,6 +656,7 @@ float4 part_shade(PartOut input, bool front, bool enc_out) {
                         * lerp(float3(1.0f, 1.0f, 1.0f), base, 0.5f);
                     float grazing = 0.8f * (1.0f - nv) * (1.0f - nv) * saturate(2.0f * alpha);
                     float4 scene = float4(0.0f, 0.0f, 0.0f, 0.0f);
+                    [branch]
                     if (alpha < 0.999f) {
                         scene = glass_scene_at(input.world, n, alpha);
                     }
@@ -662,15 +687,18 @@ float4 part_shade(PartOut input, bool front, bool enc_out) {
             }
             c = c + float3(0.004f, 0.008f, 0.014f) * step(1.5f, input.extra.z);
 
-            bool see_through_neon = (kind > 0.5f) && (kind < 1.5f) && (alpha < 0.999f);
+            bool see_through_neon = !opaque_pass && (kind > 0.5f) && (kind < 1.5f) && (alpha < 0.999f);
             float visibility = 1.0f;
+            [branch]
             if (g.fog.z > 0.5f) {
                 float d = length(input.world - g.cam_pos.xyz);
                 float f = fog_amount(d);
                 visibility = 1.0f - f;
                 c = lerp(c, fog_rgb_at(input.world), f);
             }
-            if (see_through_neon) {
+            if (opaque_pass) {
+                out_res = float4(c, 1.0f);
+            } else if (see_through_neon) {
                 float a = 1.0f - visibility * (1.0f - alpha);
                 out_res = enc_out ? see_out(c, a, a, true) : neon_over_scene(c, a, input.clip.xy);
             } else if (glass_scene_alpha >= 0.0f) {
@@ -685,12 +713,16 @@ float4 part_shade(PartOut input, bool front, bool enc_out) {
     return out_res;
 }
 
+float4 fs_part_opaque(PartOut input, bool front : SV_IsFrontFace) : SV_Target {
+    return part_shade_impl(input, front, false, true);
+}
+
 float4 fs_part(PartOut input, bool front : SV_IsFrontFace) : SV_Target {
-    return part_shade(input, front, false);
+    return part_shade_impl(input, front, false, false);
 }
 
 float4 fs_part_enc(PartOut input, bool front : SV_IsFrontFace) : SV_Target {
-    return part_shade(input, front, true);
+    return part_shade_impl(input, front, true, false);
 }
 
 #if MSAA_SAMPLES > 1
@@ -901,6 +933,7 @@ TerrainSample terrain_sample(float2 uv, float2 dx, float2 dy, uint pal, bool bla
         t = float4(GRASS_BLADE_COLOR, 0.5f);
         su.a = 1.0f;
     }
+    [branch]
     if (layer >= 0 && !blade) {
         float fp = max(length(dx), length(dy)) * 1024.0f;
         float k = (fp < 2.0f) ? (2.0f / max(fp, 1e-6f)) : 1.0f;
@@ -996,6 +1029,7 @@ float4 fs_terrain(TerrainOut input) : SV_Target {
     light += g.lamp1.rgb * max(-dot(n, l), 0.0f);
     light += local_lights(input.world, (g.sun_color.w > 0.5f) ? n0 : n);
 
+    [branch]
     if (is_blade) {
         float grass_shadow = (g.env_spec.z > 0.5f) ? sun_shadow(input.world, grid_n) : 1.0f;
         float3 grass_indoor = float3(0.0f, 0.0f, 0.0f);
@@ -1013,6 +1047,7 @@ float4 fs_terrain(TerrainOut input) : SV_Target {
             float highlight = pow(abs(saturate(input.grass_view.y)), 12.0f) * input.grass_view.w;
             grass_c += (albedo * albedo * transmission + (float3)(highlight * sun_cover())) * g.sun_color.rgb * g.sun_dir.w * grass_shadow;
         }
+        [branch]
         if (g.fog.z > 0.5f) {
             grass_c = lerp(grass_c, fog_rgb_at(input.world), fog_amount(length(input.world - g.cam_pos.xyz)));
         }
@@ -1026,6 +1061,7 @@ float4 fs_terrain(TerrainOut input) : SV_Target {
     float spec = fr * (a2 + a2 * a2) / (dd * dd * (vh * 3.0f + 0.5f) * (nh * 0.75f + 0.25f));
     c += g.sun_color.rgb * g.sun_dir.w * spec * ndl * shadow * fade * sun_cover();
     c += env_reflect(reflect(-v, n), rough, sv, false) * fe * sS;
+    [branch]
     if (g.fog.z > 0.5f) {
         float d = length(input.world - g.cam_pos.xyz);
         float f = fog_amount(d);

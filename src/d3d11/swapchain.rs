@@ -55,7 +55,7 @@ impl Swapchain {
             Stereo: false.into(),
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-            BufferCount: 2,
+            BufferCount: 3,
             Scaling: DXGI_SCALING_NONE,
             SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
             AlphaMode: DXGI_ALPHA_MODE_IGNORE,
@@ -67,6 +67,7 @@ impl Swapchain {
                 .CreateSwapChainForHwnd(&rs.device, hwnd, &desc, None, None)
         }
         .or_else(|_| {
+            desc.BufferCount = 2;
             desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
             desc.Flags = 0;
             unsafe {

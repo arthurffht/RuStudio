@@ -1153,6 +1153,7 @@ pub struct Renderer {
     vs_sky: ID3D11VertexShader,
     ps_sky: ID3D11PixelShader,
     vs_part: ID3D11VertexShader,
+    ps_part_opaque: ID3D11PixelShader,
     ps_part: ID3D11PixelShader,
     ps_part_enc: ID3D11PixelShader,
     ps_decal_depth: ID3D11PixelShader,
@@ -1224,7 +1225,6 @@ pub struct Renderer {
     lightocc_srv: ID3D11ShaderResourceView,
     /// Studio's legacy surface atlas (studs.dds); grey (no change) until loaded.
     studs_srv: ID3D11ShaderResourceView,
-    studs_sampler: ID3D11SamplerState,
     /// Material texture packs (matpack.rs): one array layer per pack,
     /// colour + height and normal + roughness + metalness.
     materials: MaterialArrays,
@@ -1235,6 +1235,8 @@ pub struct Renderer {
     meshes: Vec<Mesh>,
     /// (mesh, cull back) -> the second slot drawing it the other way.
     cull_alias: HashMap<(u32, bool), u32>,
+    sampler_low: ID3D11SamplerState,
+    sampler_mid: ID3D11SamplerState,
     sampler: ID3D11SamplerState,
     /// Texture slots (`t15..t17`); index 0 is plain white.
     textures: Vec<PartTex>,
@@ -1465,14 +1467,6 @@ impl Renderer {
         );
         let studs_srv = Self::studs_texture(device, 1, 1, &[128, 128, 128, 255]);
         let materials = MaterialArrays::new(device, ctx, 1, 1);
-        let studs_sampler = crate::d3d11::create_sampler(
-            device,
-            D3D11_FILTER_ANISOTROPIC,
-            D3D11_TEXTURE_ADDRESS_WRAP,
-            D3D11_TEXTURE_ADDRESS_WRAP,
-            D3D11_TEXTURE_ADDRESS_WRAP,
-            crate::mech::TEXTURE_ANISOTROPY as u32,
-        );
         let lshadow = LightShadows::new(device);
         let sun = crate::sun_shadow::SunShadows::new(device, &shadow_srv);
         // Studio's scene environment probe (env_probe.rs): t8 is current slot, t14 blend target.
@@ -1480,6 +1474,22 @@ impl Renderer {
 
         let black_tex = make_tex2d_data(device, 1, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0, &[0, 0, 0, 255], 4);
         let black_srv = crate::d3d11::create_srv_2d(device, &black_tex, DXGI_FORMAT_R8G8B8A8_UNORM, false, 0, 1);
+        let sampler_low = crate::d3d11::create_sampler(
+            device,
+            D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            crate::mech::QUALITY_ANISO_LOW,
+        );
+        let sampler_mid = crate::d3d11::create_sampler(
+            device,
+            D3D11_FILTER_ANISOTROPIC,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            crate::mech::QUALITY_ANISO_MID,
+        );
         let sampler = crate::d3d11::create_sampler(
             device,
             D3D11_FILTER_ANISOTROPIC,
@@ -1565,6 +1575,7 @@ impl Renderer {
         let vs_sky = crate::d3d11::create_vs(device, shaders::VS_SKY);
         let ps_sky = crate::d3d11::create_ps(device, shaders::PS_SKY);
         let vs_part = crate::d3d11::create_vs(device, shaders::VS_PART);
+        let ps_part_opaque = crate::d3d11::create_ps(device, shaders::PS_PART_OPAQUE);
         let ps_part = crate::d3d11::create_ps(device, shaders::PS_PART);
         let ps_part_enc = crate::d3d11::create_ps(device, shaders::PS_PART_ENC);
         let ps_decal_depth = crate::d3d11::create_ps(device, shaders::PS_DECAL_DEPTH);
@@ -1666,6 +1677,7 @@ impl Renderer {
             vs_sky,
             ps_sky,
             vs_part,
+            ps_part_opaque,
             ps_part,
             ps_part_enc,
             ps_decal_depth,
@@ -1723,11 +1735,12 @@ impl Renderer {
             lightocc_tex,
             lightocc_srv,
             studs_srv,
-            studs_sampler,
             materials,
             sky_size: 0,
             meshes,
             cull_alias: HashMap::new(),
+            sampler_low,
+            sampler_mid,
             sampler,
             textures: Vec::new(),
             black_srv,
@@ -1767,6 +1780,16 @@ impl Renderer {
 
     pub(super) fn samples(&self) -> u32 {
         self.quality.msaa_samples
+    }
+
+    fn active_sampler(&self) -> &ID3D11SamplerState {
+        if self.quality.max_anisotropy <= crate::mech::QUALITY_ANISO_LOW {
+            &self.sampler_low
+        } else if self.quality.max_anisotropy <= crate::mech::QUALITY_ANISO_MID {
+            &self.sampler_mid
+        } else {
+            &self.sampler
+        }
     }
 
     /// The last frame as shown (RGBA8, top row first): width, height,
@@ -1994,7 +2017,7 @@ impl Renderer {
         ];
         let samps = [
             Some(self.sky_sampler.clone()),     // s0
-            Some(self.studs_sampler.clone()),   // s1
+            Some(self.active_sampler().clone()), // s1
             Some(self.lshadow.sampler.clone()), // s2
         ];
         let glass_fallback = [Some(self.black_srv.clone()), Some(self.black_srv.clone())];
@@ -2019,8 +2042,8 @@ impl Renderer {
             ctx.IASetInputLayout(&self.il_part);
             ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             ctx.VSSetShader(&self.vs_part, None);
-            ctx.PSSetShader(&self.ps_part, None);
-            ctx.PSSetSamplers(3, Some(&[Some(self.sampler.clone())]));
+            ctx.PSSetShader(if transparent { &self.ps_part } else { &self.ps_part_opaque }, None);
+            ctx.PSSetSamplers(3, Some(&[Some(self.active_sampler().clone())]));
             ctx.RSSetState(if cull_back { &self.rs_cull_back } else { &self.rs_cull_none });
             ctx.OMSetDepthStencilState(
                 if transparent { &self.ds_gequal_ro } else { &self.ds_greater_rw },
@@ -2063,7 +2086,7 @@ impl Renderer {
         );
         unsafe {
             ctx.PSSetShaderResources(15, Some(&tex_srvs));
-            ctx.PSSetSamplers(3, Some(&[Some(self.sampler.clone())]));
+            ctx.PSSetSamplers(3, Some(&[Some(self.active_sampler().clone())]));
             ctx.IASetVertexBuffers(0, 2, Some(vbs.as_ptr()), Some(strides.as_ptr()), Some(offsets.as_ptr()));
             ctx.DrawInstanced(mesh.count, range.end - range.start, 0, range.start);
         }
@@ -2646,7 +2669,7 @@ impl Renderer {
             ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             ctx.VSSetShader(&self.vs_part, None);
             ctx.PSSetShader(ps, None);
-            ctx.PSSetSamplers(3, Some(&[Some(self.sampler.clone())]));
+            ctx.PSSetSamplers(3, Some(&[Some(self.active_sampler().clone())]));
             ctx.RSSetState(rs);
             ctx.OMSetDepthStencilState(ds, 0);
             ctx.OMSetBlendState(bs, Some(&[0.0; 4]), 0xFFFFFFFF);
@@ -3642,7 +3665,7 @@ impl Renderer {
                         ctx.IASetInputLayout(&self.il_part);
                         ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                         ctx.VSSetShader(&self.vs_part, None);
-                        ctx.PSSetShader(&self.ps_part, None);
+                        ctx.PSSetShader(&self.ps_part_opaque, None);
                         ctx.OMSetDepthStencilState(&self.ds_greater_rw, 0);
                         ctx.OMSetBlendState(&self.bs_opaque, Some(&[0.0; 4]), 0xFFFFFFFF);
                     }
@@ -3848,8 +3871,8 @@ impl Renderer {
             ctx.IASetInputLayout(&self.il_part);
             ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             ctx.VSSetShader(&self.vs_part, None);
-            ctx.PSSetShader(&self.ps_part, None);
-            ctx.PSSetSamplers(3, Some(&[Some(self.sampler.clone())]));
+            ctx.PSSetShader(&self.ps_part_opaque, None);
+            ctx.PSSetSamplers(3, Some(&[Some(self.active_sampler().clone())]));
             ctx.OMSetDepthStencilState(&self.ds_greater_rw, 0);
             ctx.OMSetBlendState(&self.bs_opaque, Some(&[0.0; 4]), 0xFFFFFFFF);
         }
@@ -3959,7 +3982,7 @@ impl Renderer {
                 unsafe {
                     ctx.IASetInputLayout(&self.il_part);
                     ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                    ctx.PSSetSamplers(3, Some(&[Some(self.sampler.clone())]));
+                    ctx.PSSetSamplers(3, Some(&[Some(self.active_sampler().clone())]));
                 }
                 self.water.bind(ctx, &target.scene_copy_srv, &target.depth_srv, msaa);
                 for r in &water_runs {

@@ -2656,12 +2656,19 @@ impl Editor {
         let vp_render = crate::bench::scope("vp_render");
         let tex = match (self.renderer.as_mut(), self.render_state.as_ref()) {
             (Some(r), Some(rs)) => {
+                let elapsed_ms = ctx.input(|i| i.unstable_dt) * 1000.0;
+                let frame_ms = if elapsed_ms > 0.0 && elapsed_ms <= crate::mech::FRM_FRAME_MS_MAX {
+                    elapsed_ms.max(self.last_work_ms)
+                } else {
+                    self.last_work_ms.max(crate::mech::FRM_TARGET_INITIAL_MS)
+                };
+                let deterministic = self.fixed_dt.is_some() || self.harness.selftest.is_some();
                 sync_quality(
                     r,
                     &rs.caps,
                     self.frame_no,
-                    self.last_work_ms,
-                    self.fixed_dt.is_some(),
+                    frame_ms,
+                    deterministic,
                 );
                 r.render(
                     rs,
@@ -4234,7 +4241,7 @@ fn sync_quality(
     renderer: &mut crate::render::Renderer,
     caps: &crate::d3d11::GpuCaps,
     frame_no: u64,
-    last_work_ms: f32,
+    frame_ms: f32,
     deterministic: bool,
 ) {
     static FRM: std::sync::Mutex<
@@ -4255,7 +4262,11 @@ fn sync_quality(
     let frm_enabled = match frm_mode {
         1 => true,
         2 => false,
-        _ => quality_setting == 0,
+        _ => {
+            quality_setting == 0
+                || (!deterministic
+                    && (caps.is_uma || caps.dedicated_vram_mb <= crate::mech::QUALITY_LOW_VRAM_MB))
+        }
     };
     let mut guard = FRM.lock().unwrap_or_else(|e| e.into_inner());
     let (frm, last, last_ptr) = guard.get_or_insert_with(|| {
@@ -4266,7 +4277,7 @@ fn sync_quality(
     }
     let frm_level = if frm_enabled {
         if frame_no > 0 && !deterministic {
-            Some(frm.observe_frame(last_work_ms))
+            Some(frm.observe_frame(frame_ms))
         } else {
             Some(frm.level())
         }

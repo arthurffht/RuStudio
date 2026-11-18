@@ -869,6 +869,7 @@ const SHADER_JOBS: &[ShaderJob] = &[
     ShaderJob { const_name: "VS_SKY", file: "scene.hlsl", entry: "vs_sky", target: "vs_5_0", msaa_samples: None },
     ShaderJob { const_name: "PS_SKY", file: "scene.hlsl", entry: "fs_sky", target: "ps_5_0", msaa_samples: None },
     ShaderJob { const_name: "VS_PART", file: "scene.hlsl", entry: "vs_part", target: "vs_5_0", msaa_samples: None },
+    ShaderJob { const_name: "PS_PART_OPAQUE", file: "scene.hlsl", entry: "fs_part_opaque", target: "ps_5_0", msaa_samples: None },
     ShaderJob { const_name: "PS_PART", file: "scene.hlsl", entry: "fs_part", target: "ps_5_0", msaa_samples: None },
     ShaderJob { const_name: "PS_PART_ENC", file: "scene.hlsl", entry: "fs_part_enc", target: "ps_5_0", msaa_samples: None },
     ShaderJob { const_name: "PS_DECAL_DEPTH", file: "scene.hlsl", entry: "fs_decal_depth", target: "ps_5_0", msaa_samples: None },

@@ -971,6 +971,13 @@ fn main() -> Result<(), String> {
             "EditQualityLevel",
             studio_settings::Val::Enum(q),
         );
+        if q > 0 && frm_override.is_none() {
+            studio_settings::set(
+                "RenderSettings",
+                "FrameRateManager",
+                studio_settings::Val::Enum(2),
+            );
+        }
     }
     if let Some(f) = frm_override {
         studio_settings::set(
