@@ -8,11 +8,27 @@
 //! with `D3D11_ASYNC_GETDATA_DONOTFLUSH`. Results lag the frame they measure by
 //! a frame or two.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::S_OK;
 use windows::Win32::Graphics::Direct3D11::*;
+
+static LAST_GPU_FRAME_SECS_BITS: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_gpu_frame_seconds(secs: f64) {
+    let clamped = if secs.is_finite() && secs >= 0.0 { secs } else { 0.0 };
+    LAST_GPU_FRAME_SECS_BITS.store(clamped.to_bits(), Ordering::Relaxed);
+}
+
+pub fn last_gpu_frame_seconds() -> f64 {
+    f64::from_bits(LAST_GPU_FRAME_SECS_BITS.load(Ordering::Relaxed))
+}
+
+pub fn last_gpu_frame_ms() -> f32 {
+    (last_gpu_frame_seconds() * 1000.0) as f32
+}
 
 const MAX_QUERIES: u32 = 256;
 const RING: usize = 4;

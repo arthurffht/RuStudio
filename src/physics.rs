@@ -4277,9 +4277,7 @@ impl Physics {
     }
 }
 
-// (Uses mech items the capsule deletion removed: does not compile on master either.
-// `cargo test --features skip-physics-tests` builds the other tests.)
-#[cfg(all(test, not(feature = "skip-physics-tests")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     // (the module's maps hash with FxHash; the functions under test take std's sets)

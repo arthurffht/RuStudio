@@ -2304,7 +2304,7 @@
   {
    "name": "D3D11 quality feature thresholds",
    "group": "performance",
-   "value": "shadows/clouds >= 4, bloom >= 6, local shadows >= 8, 3-cascade >= 10, SSAO >= 12, DoF/high-shadow/LOD-1.0 >= 14, 4x MSAA/4-cascade >= 16 (UMA caps MSAA at 1x, atlas at 1024, local shadows at 4, auto ceiling at 12, and auto SSAO/DoF off)",
+   "value": "<=3: PS_PART_LOW/PS_TERRAIN_LOW + fast water; >=4: shadows/clouds/refract-water/grass (half grass radius at 4..7); >=6: bloom; >=8: env-probe/lightocc/local shadows; >=10: 3-cascade; >=12: SSAO; >=14: DoF/high-shadow/LOD-1.0; >=16: 4x MSAA/4-cascade (UMA caps MSAA at 1x, atlas at 1024, local shadows at 4, auto ceiling at 12, and auto SSAO/DoF off)",
    "estimated": true
   },
   {

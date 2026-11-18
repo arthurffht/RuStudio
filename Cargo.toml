@@ -23,11 +23,6 @@ path = "src/main.rs"
 name = "rustudio-mcp"
 path = "src/bin/rustudio_mcp.rs"
 
-[features]
-# `cargo test --features skip-physics-tests`: leaves out physics.rs's test module, which
-# does not compile (mech items the capsule deletion removed), so the other tests can run.
-skip-physics-tests = []
-
 [dependencies]
 rustudio-account = { path = "crates/rustudio-account" }
 rustudio-net = { path = "crates/rustudio-net" }
@@ -71,6 +66,9 @@ blake3 = "1"
 dirs = "6"
 chrono = { version = "0.4.35", default-features = false, features = ["clock"] }
 base64 = "0.23"
+# Win32 Recycle Bin, Registry, Credentials, DWM titlebars, timers, and MCP host process control.
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_System_ProcessStatus", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_Security_Credentials", "Win32_System_Threading"] }
 
 [profile.dev]
 opt-level = 1
@@ -83,16 +81,8 @@ opt-level = 2
 inherits = "release"
 debug = "line-tables-only"
 
-[target.'cfg(windows)'.dependencies]
-# The Recycle Bin (platform.rs); thread/process CPU time, cycles, memory,
-# console attachment, SEH crash handler, and MCP instance liveness.
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_System_ProcessStatus", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel"] }
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_System_LibraryLoader"] }
-
 [dev-dependencies]
 draco-core = { version = "2.3", default-features = false, features = ["decoder", "encoder"] }
-
-[target.'cfg(windows)'.dev-dependencies]
 windows = { version = "0.62", features = ["Win32_Graphics_Direct3D_Fxc"] }
 
 [patch.crates-io]

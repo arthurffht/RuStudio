@@ -21,7 +21,18 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+
+static FONTS_READY: AtomicBool = AtomicBool::new(false);
+
+pub fn notify_fonts_ready() {
+    FONTS_READY.store(true, Ordering::Release);
+}
+
+pub fn take_fonts_ready() -> bool {
+    FONTS_READY.swap(false, Ordering::AcqRel)
+}
 
 /// (package, folder it unpacks into, relative to the Studio root).
 const PACKAGES: &[(&str, &str)] = &[

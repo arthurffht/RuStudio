@@ -2692,6 +2692,7 @@ impl Editor {
                         },
                         clouds: crate::clouds::look(&self.doc),
                         probe,
+                        defer_post: false,
                     },
                 )
             }

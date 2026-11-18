@@ -22,11 +22,23 @@
 //! a monitor where the window can't place itself (Wayland).
 
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use egui_dock::{DockState, Node, NodeIndex, SurfaceIndex, TabPath};
 use serde::{Deserialize, Serialize};
 
 use crate::app::Tab;
+
+pub fn app_icon() -> Option<Arc<egui::IconData>> {
+    static ICON: OnceLock<Arc<egui::IconData>> = OnceLock::new();
+    Some(Arc::clone(ICON.get_or_init(|| {
+        Arc::new(egui::IconData {
+            rgba: crate::icons::logo_rgba(64),
+            width: 64,
+            height: 64,
+        })
+    })))
+}
 
 /// Which side of the 3D view a panel docks on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

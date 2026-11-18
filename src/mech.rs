@@ -188,7 +188,7 @@ pub const SHADOW_LOD_SCALE: f32 = 2.0; // casters can be this much smaller on sc
 pub const ENV_SPEC_ROUGHNESS: f32 = 0.5; // the roughness of every material for the sky reflection and the sun highlight (Studio: 0.089 + 0.911 × a per-material vertex value, VARYING4.w; the table isn't read yet; estimated from Place B Newer's N1 road)
 pub const ENV_SPEC_LOD_SPAN: f32 = 5.0; // the sky reflection reads the skybox at mip (coarsest − this × (1 − roughness)); Studio's part FS reads its prefiltered cube at roughness × 5 (ShadowMap part FS)
 pub const ENV_DIFFUSE_GAIN: f32 = 1.0; // EnvironmentDiffuseScale × skybox irradiance × this (calibrated against Studio)
-pub const TEXTURE_ANISOTROPY: u16 = 8; // part textures: mipmapped, trilinear, 8× anisotropic, no mip bias. Studio binds material maps with filter 2 and anisotropy 0 = the device default, which a running offline Studio holds at 8; Vulkan's sampler has mipLodBias 0
+pub const TEXTURE_ANISOTROPY: u16 = 8; // part textures: mipmapped, trilinear, 8× anisotropic (Quality >= 16 non-UMA). Studio binds material maps with filter 2 and anisotropy 0 = device default (8x) with mipLodBias 0
 pub const LIGHT_TEST_TOLERANCE: u8 = 8; // self-test: lit colours within this many levels (0-255) of Studio's
 // Light grid skylight (lightgrid.rs; Studio measurements "Light grid
 // (skylight)"): read from Studio and a running Studio.
@@ -215,7 +215,7 @@ pub const LIGHTOCC_DENSITY: f32 = 20.0; // per stud of solid: light let through 
 pub const LIGHTOCC_START_VOXELS: f32 = 1.0; // the march starts this many voxels out along the normal (past the surface's own part)
 pub const LIGHTOCC_LIGHT_SKIP_VOXELS: f32 = 0.5; // and stops this far short of the light (its fitting)
 pub const LIGHTOCC_MAX_STEPS: f32 = 24.0; // samples per light at most (one per voxel up to this)
-// See-through Neon: no fitted constants; shader.wgsl neon_over_scene ports
+// See-through Neon: no fitted constants; src/shaders/scene.hlsl neon_over_scene ports
 // Studio's encoded SrcAlpha blend (checks/laser-tag-parity/render/findings.md).
 
 // Undo
@@ -966,13 +966,20 @@ pub const GRASS_NEAR_SAMPLE_POINTS: [[f32; 2]; 32] = [
     [0.5390124320983887, -0.3205811679363251],
 ];
 
-/// A panel window (src/panels.rs) eframe couldn't show this many frames in
+/// A panel window (src/panels.rs) winit couldn't show this many frames in
 /// a row is docked back into the main window (app.rs panel_windows).
 pub const PANEL_WINDOW_MAX_FAILS: u32 = 30;
 
 // D3D11 quality profile and Frame Rate Manager (src/quality.rs, estimated)
 pub const QUALITY_LEVEL_MIN: u8 = 1;
 pub const QUALITY_LEVEL_MAX: u8 = 21;
+pub const QUALITY_LOW_SHADER_MAX_LEVEL: u8 = 3;
+pub const QUALITY_WATER_REFRACT_MIN_LEVEL: u8 = 4;
+pub const QUALITY_GRASS_MIN_LEVEL: u8 = 4;
+pub const QUALITY_GRASS_MID_MAX_LEVEL: u8 = 7;
+pub const QUALITY_GRASS_MID_SCALE: f32 = 0.5;
+pub const QUALITY_ENV_PROBE_MIN_LEVEL: u8 = 8;
+pub const QUALITY_LIGHTOCC_MIN_LEVEL: u8 = 8;
 pub const QUALITY_UMA_DEFAULT_LEVEL: u8 = 5;
 pub const QUALITY_LOW_VRAM_MB: u64 = 512;
 pub const QUALITY_MID_VRAM_MB: u64 = 2048;

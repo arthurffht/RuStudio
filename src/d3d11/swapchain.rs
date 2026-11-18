@@ -144,6 +144,8 @@ impl Swapchain {
         self.size
     }
 
+    pub fn wait_frame_latency(&self) {}
+
     pub fn present(&self, vsync: bool) {
         let sync = u32::from(vsync);
         let flags = if !vsync && self.allow_tearing {

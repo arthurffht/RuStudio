@@ -1,12 +1,12 @@
 [package]
 name = "rustudio-account"
-description = "Roblox account layer for rustudio: OAuth 2.0 (PKCE) or Open Cloud API key, place listing, download and publishing"
+description = "Windows Credential Manager Roblox account layer for rustudio: .ROBLOSECURITY session, place listing, download and publishing"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-keyring = "4"
+keyring = { version = "4", default-features = false, features = ["v1", "windows-native-keyring-store"] }
 ureq = { version = "3", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

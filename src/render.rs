@@ -344,6 +344,8 @@ pub struct Frame<'a> {
     pub clouds: Option<crate::clouds::CloudsLook>,
     /// The scene environment probe's work this frame (env_probe.rs).
     pub probe: Option<crate::env_probe::ProbeFrame>,
+    /// Defer bloom + DoF + post composite until `finalize_post` after world GUI / highlights.
+    pub defer_post: bool,
 }
 
 /// Studs per side of the cells static parts are grouped into.
@@ -2958,6 +2960,8 @@ impl Renderer {
         }
         self.run_dof_and_post(ctx, target);
     }
+
+    pub fn finalize_post(&mut self, _rs: &crate::d3d11::RenderState) {}
 
     /// The last frame's fog (`Globals::fog`) and its linear colour, as
     /// fog_rgb works it out (world GUIs are fogged the same).

@@ -991,16 +991,13 @@ fn main() -> Result<(), String> {
     rustudio_settings::init(layout_store::enabled(&harness));
     // The saved window (src/layout_store.rs), for plain interactive runs.
     let saved_layout = (!harness.no_ui && layout_store::enabled(&harness)).then(layout_store::load).flatten();
-    let icon = egui::IconData {
-        rgba: icons::logo_rgba(64),
-        width: 64,
-        height: 64,
-    };
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("rustudio")
         .with_app_id("rustudio")
-        .with_inner_size(size)
-        .with_icon(icon);
+        .with_inner_size(size);
+    if let Some(icon) = panels::app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     // (--no-ui: any size, the view is the whole window)
     if !harness.no_ui {
         viewport = viewport.with_min_inner_size([900.0, 560.0]);

@@ -119,6 +119,23 @@ impl QualityProfile {
         };
         Self::from_level(level, caps, auto_mode)
     }
+
+    /// Maps `UserGameSettings.SavedQualityLevel` (`0` = Automatic, `1..=10`) to `1..=21`.
+    pub fn saved_to_21(saved: u8) -> u8 {
+        match saved {
+            0 => 0,
+            1 => 1,
+            2 => 3,
+            3 => 5,
+            4 => 7,
+            5 => 10,
+            6 => 12,
+            7 => 14,
+            8 => 16,
+            9 => 18,
+            _ => 21,
+        }
+    }
 }
 
 /// Hysteresis-based Frame Rate Manager that tracks smoothed GPU/CPU frame time
