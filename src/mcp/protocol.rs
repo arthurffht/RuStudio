@@ -267,7 +267,6 @@ pub fn is_process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
         use windows_sys::Win32::System::Threading::{
@@ -281,10 +280,6 @@ pub fn is_process_alive(pid: u32) -> bool {
         let ok = GetExitCodeProcess(handle, &mut exit_code);
         CloseHandle(handle);
         ok != 0 && exit_code == STILL_ACTIVE as u32
-    }
-    #[cfg(not(windows))]
-    {
-        false
     }
 }
 

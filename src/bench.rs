@@ -36,7 +36,6 @@ fn instr_on() -> bool {
 /// profilers: this thread's CPU cycles instead (QueryThreadCycleTime), which
 /// like instructions don't stretch while the thread waits for a core. The
 /// report says so (`work_unit`): cycles, not instructions.
-#[cfg(windows)]
 pub(crate) fn instructions() -> u64 {
     use windows_sys::Win32::System::{Threading::GetCurrentThread, WindowsProgramming::QueryThreadCycleTime};
     let mut cycles = 0u64;
@@ -45,21 +44,9 @@ pub(crate) fn instructions() -> u64 {
     cycles
 }
 
-#[cfg(not(windows))]
-pub(crate) fn instructions() -> u64 {
-    0
-}
-
-/// What RUSTUDIO_BENCH_INSTR counts on this platform when it isn't Linux's
-/// instructions (None on Linux, or when the variable is unset).
+/// What RUSTUDIO_BENCH_INSTR counts on Windows when enabled.
 fn instr_note() -> Option<&'static str> {
-    if !instr_on() || cfg!(target_os = "linux") {
-        None
-    } else if cfg!(windows) {
-        Some("millions of CPU cycles (QueryThreadCycleTime): Windows counts cycles, not instructions")
-    } else {
-        Some("not supported on this platform: sections read 0")
-    }
+    instr_on().then_some("millions of CPU cycles (QueryThreadCycleTime): Windows counts cycles, not instructions")
 }
 
 impl Drop for Scope {
@@ -394,20 +381,15 @@ fn take_sections() -> Vec<(&'static str, f64, u64)> {
 fn thread_cpu_ms() -> f64 {
     // (kernel + user time in 100 ns units, advanced at the scheduler's tick:
     // fine for a bench's total, not for one frame)
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::FILETIME;
-        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
-        let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
-        let (mut created, mut exited, mut kernel, mut user) = (z, z, z, z);
-        // SAFETY: the current thread's pseudo-handle and four FILETIME out-pointers.
-        if unsafe { GetThreadTimes(GetCurrentThread(), &mut created, &mut exited, &mut kernel, &mut user) } != 0 {
-            let ms = |f: FILETIME| (((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64) as f64 / 1e4;
-            return ms(kernel) + ms(user);
-        }
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+    let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut created, mut exited, mut kernel, mut user) = (z, z, z, z);
+    // SAFETY: the current thread's pseudo-handle and four FILETIME out-pointers.
+    if unsafe { GetThreadTimes(GetCurrentThread(), &mut created, &mut exited, &mut kernel, &mut user) } != 0 {
+        let ms = |f: FILETIME| (((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64) as f64 / 1e4;
+        return ms(kernel) + ms(user);
     }
-    #[cfg(not(windows))]
-    return f64::NAN;
     0.0
 }
 

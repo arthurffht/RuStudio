@@ -12,7 +12,6 @@ use super::*;
 use crate::audio::Audio;
 use crate::runtime::ext::SoundCmd;
 use crate::scene::vec3_of;
-use crate::theme;
 
 #[path = "game_menu.rs"]
 pub mod game_menu;

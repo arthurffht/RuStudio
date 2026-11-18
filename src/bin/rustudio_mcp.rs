@@ -868,7 +868,6 @@ fn tool_studio_launch(args: &Value, session: &mut BridgeSession) -> ToolCallResu
 
     // Isolate stdio & console on Windows so `rustudio.exe`'s AttachConsole never
     // touches `rustudio-mcp.exe`'s JSON-RPC stdout pipe.
-    #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -982,20 +981,11 @@ fn tool_studio_kill_instance(args: &Value, session: &mut BridgeSession) -> ToolC
         }
 
         if !exited && is_process_alive(pid) {
-            #[cfg(windows)]
-            {
-                match terminate_windows_pid(pid) {
-                    Ok(()) => {
-                        method = "terminate_process";
-                    }
-                    Err(e) => return ToolCallResult::error(e),
+            match terminate_windows_pid(pid) {
+                Ok(()) => {
+                    method = "terminate_process";
                 }
-            }
-            #[cfg(not(windows))]
-            {
-                return ToolCallResult::error(format!(
-                    "graceful shutdown did not exit pid {pid} and TerminateProcess is Windows-only"
-                ));
+                Err(e) => return ToolCallResult::error(e),
             }
         }
     }
@@ -1016,7 +1006,6 @@ fn tool_studio_kill_instance(args: &Value, session: &mut BridgeSession) -> ToolC
     }))
 }
 
-#[cfg(windows)]
 fn terminate_windows_pid(pid: u32) -> Result<(), String> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{

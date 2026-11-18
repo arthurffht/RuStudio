@@ -2945,7 +2945,7 @@ mod tests {
             finished: false,
             held: 0.0,
         };
-        RustudioApp::new_in(&egui::Context::default(), None, None, None, harness, false).ed
+        RustudioApp::new_in(&egui::Context::default(), None, None, harness, false).ed
     }
 
     fn call_tool(ed: &mut crate::app::Editor, name: &str, args: Value) -> ToolCallResult {

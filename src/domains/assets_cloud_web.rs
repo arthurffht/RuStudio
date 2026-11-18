@@ -7,23 +7,6 @@ use rustudio_account::assets_cloud::Read;
 enum Reply { Json(String), Asset(Vec<u8>,u64) }
 #[derive(Default)]
 struct Jobs { next: u64, pending: HashMap<u64, Receiver<Result<Reply,String>>> }
-pub const LUA_METHODS: &[(&str,&str)] = &[
-    ("CheckUploadCaptureStatusAsync","CaptureService"),
-    ("GetBundleDetailsAsync","AssetService"),
-    ("SearchAudio","AssetService"),("SearchAudioAsync","AssetService"),
-    ("GetAudioMetadataAsync","AssetService"),
-    ("GetGamePlacesAsync","AssetService"),
-    ("GetLatestAssetVersionAsync","InsertService"),
-    ("LoadAssetVersion","InsertService"),("LoadAsset","InsertService"),("LoadAssetAsync","AssetService"),
-    ("CreatePlaceInPlayerInventoryAsync","AssetService"),
-    ("GetFreeModels","InsertService"),("GetFreeModelsAsync","InsertService"),
-    ("GetFreeDecals","InsertService"),("GetFreeDecalsAsync","InsertService"),
-    ("GetBaseSets","InsertService"),("GetUserSets","InsertService"),
-    ("GetCollection","InsertService"),("GetBaseCategories","InsertService"),("GetUserCategories","InsertService"),
-    ("GetAssetIdsForPackage","AssetService"),
-    ("GetAssetIdsForPackageAsync","AssetService"),
-    ("GetObjects","DataModel"),
-];
 /// An asset load's error as Studio gives it ("Request asset was not
 /// found"), tagged with the id for the Output warning Studio prints
 /// (`ContentId: rbxassetid://1 failed due to: …`): see `__ac_web_poll`.

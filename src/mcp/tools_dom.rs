@@ -3696,7 +3696,7 @@ pub(super) mod tests {
             finished: false,
             bench: Some(crate::bench::Bench::new(None, "mcp-test", true, 1.0)),
         };
-        crate::app::RustudioApp::new_in(ctx, None, None, None, harness, false)
+        crate::app::RustudioApp::new_in(ctx, None, None, harness, false)
     }
 
     fn call_json(ed: &mut Editor, ctx: &egui::Context, tool: &str, args: Value) -> Value {

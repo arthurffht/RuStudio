@@ -614,9 +614,8 @@ fn publish_dialog(ctx: &egui::Context, m: &mut PluginManager, client: Option<Sha
 pub fn open_plugins_folder(m: &mut PluginManager) {
     match m.store.ensure_plugins_dir() {
         Ok(d) => {
-            let opener = if cfg!(windows) { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
             if std::env::var_os("RUSTUDIO_NO_OPEN").is_none() {
-                let _ = std::process::Command::new(opener).arg(&d).spawn();
+                let _ = std::process::Command::new("explorer").arg(&d).spawn();
             }
             m.lines.push(super::manager::Line { level: super::watcher::Level::Info, text: format!("Plugins folder: {}", d.display()) });
         }

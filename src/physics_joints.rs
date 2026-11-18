@@ -256,7 +256,7 @@ impl Physics {
         .local_frame1(e0.frame)
         .local_frame2(e1.frame);
         // ActuatorType: None 0, Motor 1, Servo 2.
-        let mut actuate = |j: GenericJointBuilder,
+        let actuate = |j: GenericJointBuilder,
                            axis: Axis,
                            kind: Option<u32>,
                            vel: f32,
@@ -487,7 +487,7 @@ use crate::solver::joints as solver_joints;
 use solver_joints::instance::Class as SClass;
 
 /// The last frame's connector descriptions (`studio_constraints`' change tracking).
-pub(super) struct SjCache {
+pub(crate) struct SjCache {
     sig: (u64, usize, usize),
     refs: Vec<Ref>,
     known: HashSet<Ref>,

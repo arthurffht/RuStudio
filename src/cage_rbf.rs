@@ -23,6 +23,7 @@ use std::collections::HashMap;
 /// How many nearest cage points each mesh vertex adds to the centres.
 pub const NEAREST: usize = 6;
 
+#[cfg(test)]
 pub struct Rbf {
     /// Per centre: the cage vertex index read for it.
     pub centre_vertex: Vec<usize>,
@@ -121,6 +122,7 @@ fn solve(a: &mut [f64], n: usize, rhs: &mut [f64], m: usize) -> bool {
     true
 }
 
+#[cfg(test)]
 impl Rbf {
     /// Binds `points` (the mesh) to the reference `cage` (vertex positions
     /// in the same space). None when the cage is empty or degenerate.
@@ -191,10 +193,6 @@ impl Rbf {
             .zip(&self.weights)
             .map(|(p, w)| *p + w.iter().zip(&d).fold(Vec3::ZERO, |s, (w, d)| s + *d * *w))
             .collect()
-    }
-
-    pub fn centres(&self) -> usize {
-        self.centres.len()
     }
 }
 

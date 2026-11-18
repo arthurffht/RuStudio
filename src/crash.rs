@@ -110,7 +110,6 @@ pub fn install() {
     }));
 
     let _ = std::fs::create_dir_all(dir());
-    #[cfg(windows)]
     unsafe {
         windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter(Some(
             unhandled_exception_filter,
@@ -118,7 +117,6 @@ pub fn install() {
     }
 }
 
-#[cfg(windows)]
 unsafe extern "system" fn unhandled_exception_filter(
     info: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
 ) -> i32 {

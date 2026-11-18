@@ -35,19 +35,6 @@ pub const METHODS: &[(&str, &str)] = &[
     ("ApplyMesh", "MeshPart"),
 ];
 
-pub const LUA_METHODS: &[(&str, &str)] = &[
-    ("UnionAsync", "BasePart"),
-    ("SubtractAsync", "BasePart"),
-    ("IntersectAsync", "BasePart"),
-    ("UnionAsync", "GeometryService"),
-    ("SubtractAsync", "GeometryService"),
-    ("IntersectAsync", "GeometryService"),
-    ("FragmentAsync", "GeometryService"),
-    ("SweepPartAsync", "GeometryService"),
-    ("BakeToMeshAsync", "GeometryService"),
-    ("GetSurfaceSlotsAsync", "MeshPart"),
-];
-
 const UNKNOWN: &str = "CSG: One of the primitives was of unknown type (error -4)";
 const MAX_TRIS: usize = 20000;
 

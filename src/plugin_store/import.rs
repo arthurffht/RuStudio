@@ -3,14 +3,8 @@
 //! The source is only read.
 //!
 //! Where Studio keeps them:
-//! * Windows: `%LOCALAPPDATA%\Roblox\Plugins` and
-//!   `%LOCALAPPDATA%\Roblox\<userId>\InstalledPlugins\<assetId>\<versionId>\Plugin.rbxm`;
-//! * Vinegar (Linux): the same tree inside the Wine prefix
-//!   (`~/.var/app/org.vinegarhq.Vinegar[/<slot>]/data/vinegar/prefixes/*/drive_c/users/*/AppData/Local/Roblox`):
-//!   that is the PluginsDir Studio loads from (GlobalSettings_13.xml
-//!   `C:/users/<u>/AppData/Local/Roblox/Plugins`). Vinegar's
-//!   `data/vinegar/appdata/Roblox/Plugins` is not read by Studio, so it is
-//!   not imported either.
+//! `%LOCALAPPDATA%\Roblox\Plugins` and
+//! `%LOCALAPPDATA%\Roblox\<userId>\InstalledPlugins\<assetId>\<versionId>\Plugin.rbxm`.
 //!
 //! The settings files are Studio's own JSON (`settings.json`, one object of
 //! key → value, Studio's serialized types inline) and are copied as is.
@@ -51,39 +45,10 @@ fn dirs_in(p: &Path) -> Vec<PathBuf> {
 /// The Studio installs on this machine.
 pub fn detect() -> Vec<StudioInstall> {
     let mut out = Vec::new();
-    if cfg!(windows) {
-        if let Some(l) = dirs::data_local_dir() {
-            let r = l.join("Roblox");
-            if r.is_dir() {
-                out.push(StudioInstall { label: "Roblox Studio".into(), plugin_dirs: vec![r.join("Plugins")], roblox_dirs: vec![r] });
-            }
-        }
-    }
-    let base = crate::paths::home().join(".var/app/org.vinegarhq.Vinegar");
-    let mut roots = vec![("Vinegar".to_string(), base.join("data/vinegar"))];
-    for d in dirs_in(&base) {
-        let name = d.file_name().unwrap().to_string_lossy().to_string();
-        if d.join("data/vinegar").is_dir() {
-            roots.push((format!("Vinegar ({name})"), d.join("data/vinegar")));
-        }
-    }
-    for (label, v) in roots {
-        if !v.is_dir() {
-            continue;
-        }
-        let mut s = StudioInstall { label, plugin_dirs: Vec::new(), roblox_dirs: Vec::new() };
-        for prefix in dirs_in(&v.join("prefixes")) {
-            for user in dirs_in(&prefix.join("drive_c/users")) {
-                let r = user.join("AppData/Local/Roblox");
-                if r.is_dir() {
-                    s.plugin_dirs.push(r.join("Plugins"));
-                    s.roblox_dirs.push(r);
-                }
-            }
-        }
-        s.plugin_dirs.retain(|p| p.is_dir());
-        if !s.plugin_dirs.is_empty() || !s.roblox_dirs.is_empty() {
-            out.push(s);
+    if let Some(l) = dirs::data_local_dir() {
+        let r = l.join("Roblox");
+        if r.is_dir() {
+            out.push(StudioInstall { label: "Roblox Studio".into(), plugin_dirs: vec![r.join("Plugins")], roblox_dirs: vec![r] });
         }
     }
     out

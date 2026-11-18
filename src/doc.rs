@@ -181,7 +181,7 @@ pub struct Document {
 
 #[path = "doc_history.rs"]
 mod history;
-pub use history::{studio_step_name, FinishOp, HistoryEvent};
+pub use history::{FinishOp, HistoryEvent};
 
 /// Studio's default for a property missing from a place file, where it
 /// isn't the reflection database's: Lighting.Brightness reads 1 in Studio and
@@ -391,11 +391,7 @@ impl Document {
         // values, to rule the sharing in or out of a property bug.
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*OFF.get_or_init(|| std::env::var_os("RUSTUDIO_NO_SHARE_PROPS").is_some()) {
-            // (a place's worth: the full-size maps the file was read into
-            // are free now, and go back to the system)
-            if dom.share_properties() >= 10_000 {
-                crate::heap::trim();
-            }
+            dom.share_properties();
         }
         Document {
             dom,
@@ -520,7 +516,7 @@ impl Document {
 
     /// Lends a removed instance (and its subtree) from the undo limbo back
     /// to the DOM, parentless, so code reacting to its removal can still read
-    /// it (the plugin host's edit sync). `relimbo` takes it back.
+    /// it (the plugin host's edit sync).
     pub fn unlimbo(&mut self, r: Ref) -> bool {
         if self.limbo.get_by_ref(r).is_some() && r != self.limbo.root_ref() {
             // (transfer needs a parent: in under the root, then out.)
@@ -530,17 +526,6 @@ impl Document {
             true
         } else {
             false
-        }
-    }
-
-    /// Returns an instance `unlimbo` lent, if it is still parentless (a
-    /// script that parented it somewhere keeps it there). (The plugin host
-    /// no longer returns them: a plugin may keep reading an instance the
-    /// person deleted, as in Studio, and undo / redo find it either way.)
-    pub fn relimbo(&mut self, r: Ref) {
-        if self.dom.get_by_ref(r).is_some_and(|i| i.parent().is_none()) && r != self.dom.root_ref() {
-            let lr = self.limbo.root_ref();
-            self.dom.transfer(r, &mut self.limbo, lr);
         }
     }
 

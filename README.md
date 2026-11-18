@@ -24,13 +24,13 @@ Open, edit, and save Roblox places, run real Luau scripts, physics, characters, 
   - **Unrestricted DOM & Script tooling**: Batch recursive tree creation (`dom_create_instances`), property/attribute/tag edits bypassing `NotScriptable` and capability gates (`dom_set_properties`), unlimited queries (`dom_query`, `script_grep`), atomic multi-script patches (`script_write_batch`, `script_patch_batch`), and single-frame `omni_batch`.
   - **Edit during Play**: Read and edit the source `Edit` DataModel even while Play (`F5`) or Run (`F8`) is running, plus inspect/mutate `Server` and `Client` DataModels.
   - **Live Luau VM & Physics**: Execute Luau at security identity `2`/`4`/`6`/`8` (`luau_execute`), fire signals (`luau_fire_signal`), step deterministic frames (`play_step_frames`), drive the character (`play_character_control`), inject inputs (`play_input_inject`), and inspect/manipulate dynamic physics (`physics_inspect`, `physics_manipulate`).
-  - **SmoothGrid Terrain & GPU Vision**: Programmatic voxel fill/sculpt/generate (`terrain_*`), raycasts & surface placement (`world_*`), lighting/atmosphere presets (`lighting_and_atmosphere`), GUI rect inspection (`gui_inspect`), and live `wgpu` PNG viewport captures (`viewport_capture`).
+  - **SmoothGrid Terrain & GPU Vision**: Programmatic voxel fill/sculpt/generate (`terrain_*`), raycasts & surface placement (`world_*`), lighting/atmosphere presets (`lighting_and_atmosphere`), GUI rect inspection (`gui_inspect`), and live Direct3D 11 PNG viewport captures (`viewport_capture`).
   - Full details in [docs/MCP.md](docs/MCP.md).
 - **Editor:** Explorer, Properties, Output, script tabs with Luau syntax checking, move/scale/rotate gizmos with drag duplication and selection rotation, pop-out panels, terrain brushes and threaded generation, undo/redo, and Studio menus/shortcuts.
 - **Files & Rojo/Argon:** `.rbxl` / `.rbxlx` places and `.rbxm` / `.rbxmx` models, plus project folders (`*.project.json` with plain files as source of truth, `sourcemap.json`, and File > Save as Project Folder…).
 - **Roblox Destinations, Plugins & Toolbox:** Save/Publish to Roblox, run local and Creator Store Studio plugins, and search/insert Creator Store assets (when signed in).
 - **Play / Run:** Separate server and client DataModels, remotes, Studio-tuned physics solver (`RUSTUDIO_SOLVER=rapier` available as fallback), R15/R6 characters with climbing and held jump, shift lock, sounds, tweens, 2D and 3D GUIs.
-- **Rendering:** Native `wgpu` (DX12 / Vulkan) with lighting, shadows, sky, atmosphere, materials tuned against Studio, local lights, meshes, FBX import, and voxel terrain.
+- **Rendering:** Native Direct3D 11 + HLSL SM 5.0 with lighting, shadows, sky, atmosphere, materials tuned against Studio, local lights, meshes, FBX import, and voxel terrain.
 
 ## Install on Windows
 
@@ -62,7 +62,7 @@ Requirements:
 - Windows 10/11 (x64)
 - Rust toolchain (`1.85+`, `x86_64-pc-windows-msvc`)
 - Visual Studio C++ Build Tools & Windows SDK (`vcvars64.bat` / Developer PowerShell)
-- GPU supporting DirectX 12 or Vulkan (WARP software adapter works for `--headless`)
+- GPU supporting Direct3D 11 / HLSL Shader Model 5.0 (WARP software adapter works for `--headless`)
 
 ```powershell
 git clone https://github.com/arthurffht/RuStudio.git
@@ -76,7 +76,7 @@ Run tests:
 
 ```powershell
 cargo check --workspace --all-targets
-cargo test --workspace --features skip-physics-tests
+cargo test --workspace
 ```
 
 ## Windows Paths & Studio Content
