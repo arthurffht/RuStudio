@@ -11,8 +11,15 @@
 //! attachment shared with that snapshot. A separate depth attachment orders
 //! overlapping water surfaces. See-through parts are drawn after it.
 
-use egui_wgpu::wgpu;
-use wgpu::util::DeviceExt;
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11BlendState, ID3D11Buffer, ID3D11DepthStencilState, ID3D11Device, ID3D11DeviceContext,
+    ID3D11PixelShader, ID3D11RasterizerState, ID3D11SamplerState, ID3D11ShaderResourceView,
+    ID3D11VertexShader, D3D11_BIND_SHADER_RESOURCE, D3D11_COMPARISON_GREATER, D3D11_CULL_NONE,
+    D3D11_FILTER_ANISOTROPIC, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE_ADDRESS_WRAP,
+};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+
+use crate::d3d11::{self, BlendMode, Tex2dSpec};
 
 /// The pass's uniforms (`WaterParams` in shader.wgsl).
 #[repr(C)]
@@ -40,157 +47,87 @@ pub const FRAMES: u32 = 25;
 const SIZE: u32 = 256;
 
 pub struct WaterPass {
-    pub pipeline: wgpu::RenderPipeline,
-    pub bgl: wgpu::BindGroupLayout,
-    pub buf: wgpu::Buffer,
-    normals: wgpu::TextureView,
-    sampler: wgpu::Sampler,
+    pub cb: ID3D11Buffer,
+    vs: ID3D11VertexShader,
+    ps_1x: ID3D11PixelShader,
+    ps_msaa: ID3D11PixelShader,
+    normals: ID3D11ShaderResourceView,
+    sampler: ID3D11SamplerState,
+    depth_state: ID3D11DepthStencilState,
+    blend_state: ID3D11BlendState,
+    rast_state: ID3D11RasterizerState,
     layers: u32,
 }
 
 impl WaterPass {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        shader: &wgpu::ShaderModule,
-        globals: &wgpu::BindGroupLayout,
-        textures: &wgpu::BindGroupLayout,
-        buffers: &[Option<wgpu::VertexBufferLayout>],
-        hdr: wgpu::TextureFormat,
-        samples: u32,
-    ) -> Self {
-        let frag = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX,
-            ty,
-            count: None,
-        };
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("water"),
-            entries: &[
-                frag(
-                    0,
-                    wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                ),
-                frag(
-                    1,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                ),
-                frag(2, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
-                frag(
-                    3,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                ),
-                frag(
-                    4,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: samples > 1,
-                    },
-                ),
-            ],
-        });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("water"),
-            bind_group_layouts: &[Some(globals), Some(textures), Some(&bgl)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("water"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: shader,
-                entry_point: Some("vs_water"),
-                compilation_options: Default::default(),
-                buffers,
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Greater),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: samples,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: shader,
-                entry_point: Some("fs_water"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: hdr,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("water"),
-            size: std::mem::size_of::<WaterRaw>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let (normals, layers) = load_normals(device, queue);
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("water normals"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            // Mipmapped: far ripples average out instead of shimmering.
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            anisotropy_clamp: crate::mech::TEXTURE_ANISOTROPY,
-            ..Default::default()
-        });
+    pub fn new(device: &ID3D11Device, _ctx: &ID3D11DeviceContext, _samples: u32) -> Self {
+        let vs = d3d11::create_vs(device, crate::d3d11::shaders::VS_WATER);
+        let ps_1x = d3d11::create_ps(device, crate::d3d11::shaders::PS_WATER_1X);
+        let ps_msaa = d3d11::create_ps(device, crate::d3d11::shaders::PS_WATER_MSAA);
+        let cb = d3d11::create_cb(device, std::mem::size_of::<WaterRaw>());
+        let (normals, layers) = load_normals(device);
+        let sampler = d3d11::create_sampler(
+            device,
+            D3D11_FILTER_ANISOTROPIC,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            crate::mech::TEXTURE_ANISOTROPY as u32,
+        );
+        let depth_state = d3d11::create_depth_state(device, true, true, D3D11_COMPARISON_GREATER);
+        let blend_state = d3d11::create_blend_state(device, BlendMode::Opaque);
+        let rast_state = d3d11::create_raster_state(device, D3D11_CULL_NONE, false, false, 0, 0.0);
         WaterPass {
-            pipeline,
-            bgl,
-            buf,
+            cb,
+            vs,
+            ps_1x,
+            ps_msaa,
             normals,
             sampler,
+            depth_state,
+            blend_state,
+            rast_state,
             layers,
         }
     }
 
-    /// The bind group for one render target (its scene copy and depth).
+    pub fn upload(&self, ctx: &ID3D11DeviceContext, raw: &WaterRaw) {
+        d3d11::upload_cb(ctx, &self.cb, raw);
+    }
+
+    /// Bind shaders, pipeline states, uniforms (`b3`), normal array (`t21`),
+    /// scene copy (`t22`), depth (`t23`), and sampler (`s4`).
     pub fn bind(
         &self,
-        device: &wgpu::Device,
-        scene: &wgpu::TextureView,
-        depth: &wgpu::TextureView,
-    ) -> wgpu::BindGroup {
-        use wgpu::BindingResource as B;
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("water"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: B::TextureView(&self.normals) },
-                wgpu::BindGroupEntry { binding: 2, resource: B::Sampler(&self.sampler) },
-                wgpu::BindGroupEntry { binding: 3, resource: B::TextureView(scene) },
-                wgpu::BindGroupEntry { binding: 4, resource: B::TextureView(depth) },
-            ],
-        })
+        ctx: &ID3D11DeviceContext,
+        scene_srv: &ID3D11ShaderResourceView,
+        depth_srv: &ID3D11ShaderResourceView,
+        msaa: bool,
+    ) {
+        let ps = if msaa { &self.ps_msaa } else { &self.ps_1x };
+        unsafe {
+            ctx.VSSetShader(&self.vs, None);
+            ctx.PSSetShader(ps, None);
+            ctx.RSSetState(&self.rast_state);
+            ctx.OMSetDepthStencilState(&self.depth_state, 0);
+            ctx.OMSetBlendState(&self.blend_state, None, 0xffff_ffff);
+            let cbs = [Some(self.cb.clone())];
+            ctx.VSSetConstantBuffers(3, Some(&cbs));
+            ctx.PSSetConstantBuffers(3, Some(&cbs));
+            let srvs = [
+                Some(self.normals.clone()),
+                Some(scene_srv.clone()),
+                Some(depth_srv.clone()),
+            ];
+            ctx.PSSetShaderResources(21, Some(&srvs));
+            let samplers = [Some(self.sampler.clone())];
+            ctx.PSSetSamplers(4, Some(&samplers));
+        }
+    }
+
+    /// Unbind water's PS SRV slots (`t21..=t23`) after drawing.
+    pub fn unbind(&self, ctx: &ID3D11DeviceContext) {
+        d3d11::unbind_ps_srvs(ctx, 21, 3);
     }
 
     /// This frame's uniforms.
@@ -223,7 +160,7 @@ impl WaterPass {
 }
 
 /// The 25 normal map frames as one mipmapped array (a flat map if missing).
-fn load_normals(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::TextureView, u32) {
+fn load_normals(device: &ID3D11Device) -> (ID3D11ShaderResourceView, u32) {
     let mut frames: Vec<Vec<u8>> = Vec::new();
     for i in 1..=FRAMES {
         let id = format!("rbxasset://textures/water/normal_{i:02}.dds");
@@ -242,12 +179,13 @@ fn load_normals(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::TextureVie
     }
     let layers = frames.len() as u32;
     let mips = 32 - SIZE.leading_zeros();
-    let mut data = Vec::new();
+    // Keep each mip allocation alive across CreateTexture2D (LayerMajor order: layer * mips + mip).
+    let mut level_bufs: Vec<(Vec<u8>, u32)> = Vec::with_capacity((layers * mips) as usize);
     for f in &frames {
         let mut level = f.clone();
         let mut s = SIZE;
         for _ in 0..mips {
-            data.extend_from_slice(&level);
+            level_bufs.push((level.clone(), s * 4));
             if s == 1 {
                 break;
             }
@@ -255,30 +193,37 @@ fn load_normals(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::TextureVie
             s /= 2;
         }
     }
-    let tex = device.create_texture_with_data(
-        queue,
-        &wgpu::TextureDescriptor {
-            label: Some("water normals"),
-            size: wgpu::Extent3d {
-                width: SIZE,
-                height: SIZE,
-                depth_or_array_layers: layers,
-            },
-            mip_level_count: mips,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
+    let subresources: Vec<D3D11_SUBRESOURCE_DATA> = level_bufs
+        .iter()
+        .map(|(buf, pitch)| D3D11_SUBRESOURCE_DATA {
+            pSysMem: buf.as_ptr().cast(),
+            SysMemPitch: *pitch,
+            SysMemSlicePitch: 0,
+        })
+        .collect();
+    let tex = d3d11::create_tex2d(
+        device,
+        &Tex2dSpec {
+            width: SIZE,
+            height: SIZE,
+            mips,
+            array_size: layers,
+            format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            samples: 1,
+            bind_flags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            misc_flags: 0,
         },
-        wgpu::util::TextureDataOrder::LayerMajor,
-        &data,
+        Some(&subresources),
     );
-    let view = tex.create_view(&wgpu::TextureViewDescriptor {
-        dimension: Some(wgpu::TextureViewDimension::D2Array),
-        ..Default::default()
-    });
-    (view, layers)
+    let srv = d3d11::create_srv_2d_array(
+        device,
+        &tex,
+        DXGI_FORMAT_R8G8B8A8_UNORM,
+        mips,
+        0,
+        layers,
+    );
+    (srv, layers)
 }
 
 /// A 2× box-filtered mip of a square RGBA8 image (linear: normal data).

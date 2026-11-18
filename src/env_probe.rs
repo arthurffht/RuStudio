@@ -404,7 +404,7 @@ pub fn world_ray(d: &crate::doc::Document, scene: &crate::scene::Scene, o: Vec3,
 }
 
 /// The face's view basis (forward, up), cube order +X, -X, +Y, -Y, +Z, -Z
-/// (Studio; D3D / wgpu cube faces).
+/// (Studio; D3D cube faces).
 pub fn face_basis(face: u32) -> (Vec3, Vec3) {
     match face {
         0 => (Vec3::X, Vec3::Y),

@@ -620,7 +620,7 @@ impl Editor {
         }
         let mut redo = Vec::new();
         let mut patched = false;
-        let queue = self.render_state.as_ref().map(|rs| rs.queue.clone());
+        let queue = self.render_state.as_ref().map(|rs| rs.context.clone());
         for (id, p) in patches {
             match p {
                 LivePatch::Ranges(runs) => {
@@ -757,7 +757,7 @@ impl Editor {
         let (Some(renderer), Some(rs)) = (renderer.as_mut(), render_state.as_ref()) else {
             return;
         };
-        let (device, queue) = (rs.device.clone(), rs.queue.clone());
+        let (device, queue) = (rs.device.clone(), rs.context.clone());
         let dir = doc_dir.as_deref();
         let use2022 = scene::use_2022_materials(&self.doc);
         if changes.full {
@@ -2053,7 +2053,7 @@ impl Editor {
         else {
             return;
         };
-        let (device, queue) = (rs.device.clone(), rs.queue.clone());
+        let (device, queue) = (rs.device.clone(), rs.context.clone());
         let mut params = vec![[0.0f32; 4]; crate::render::TERRAIN_PALETTE * 4];
         let mut waiting = false;
         for m in 0..23u8 {
@@ -2655,27 +2655,39 @@ impl Editor {
         });
         let vp_render = crate::bench::scope("vp_render");
         let tex = match (self.renderer.as_mut(), self.render_state.as_ref()) {
-            (Some(r), Some(rs)) => r.render(
-                rs,
-                size,
-                &Frame {
-                    globals,
-                    cull_view_proj: self.cam.view_proj(rrect),
-                    fov_y: self.cam.fov_deg.to_radians(),
-                    lights: &lights,
-                    shadows,
-                    sun_cascades,
-                    overlay: &overlay,
-                    lines: &lines,
-                    sky: self.cam.ortho.is_none(),
-                    water: crate::water::WaterLook {
-                        time: std::env::var("RUSTUDIO_CAPTURE_WATER_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| crate::sim_clock::since(self.harness.started).as_secs_f32()),
-                        ..self.water_waves
+            (Some(r), Some(rs)) => {
+                sync_quality(
+                    r,
+                    &rs.caps,
+                    self.frame_no,
+                    self.last_work_ms,
+                    self.fixed_dt.is_some(),
+                );
+                r.render(
+                    rs,
+                    size,
+                    &Frame {
+                        globals,
+                        cull_view_proj: self.cam.view_proj(rrect),
+                        fov_y: self.cam.fov_deg.to_radians(),
+                        lights: &lights,
+                        shadows,
+                        sun_cascades,
+                        overlay: &overlay,
+                        lines: &lines,
+                        sky: self.cam.ortho.is_none(),
+                        water: crate::water::WaterLook {
+                            time: std::env::var("RUSTUDIO_CAPTURE_WATER_TIME")
+                                .ok()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or_else(|| crate::sim_clock::since(self.harness.started).as_secs_f32()),
+                            ..self.water_waves
+                        },
+                        clouds: crate::clouds::look(&self.doc),
+                        probe,
                     },
-                    clouds: crate::clouds::look(&self.doc),
-                    probe,
-                },
-            ),
+                )
+            }
             _ => None,
         };
         drop(vp_render);
@@ -2697,7 +2709,7 @@ impl Editor {
                 painter.text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "3D viewport unavailable (no wgpu device)",
+                    "3D viewport unavailable (no D3D11 device)",
                     egui::FontId::proportional(16.0),
                     theme::TEXT_DIM,
                 );
@@ -3595,7 +3607,7 @@ impl Editor {
             flip(fit(&imgs[0])),
             flip(fit(&imgs[2])),
         ];
-        renderer.set_indoor(&rs.device, &rs.queue, size, &cube);
+        renderer.set_indoor(&rs.device, &rs.context, size, &cube);
         self.lighting.indoor_irr = crate::lighting::sky_irradiance(&cube, size);
     }
 
@@ -3665,7 +3677,7 @@ impl Editor {
             return;
         };
         let Some((size, cube, irr)) = sky else {
-            renderer.set_sky(&rs.device, &rs.queue, 0, None);
+            renderer.set_sky(&rs.device, &rs.context, 0, None);
             // The gradient sky: its colours, squared.
             let top = crate::lighting::sq(mech::SKY_GRADIENT_TOP);
             let hor = crate::lighting::sq(mech::SKY_GRADIENT_HORIZON);
@@ -3673,7 +3685,7 @@ impl Editor {
             self.lighting.sky_irr = [side, side, top, hor * 0.5, side, side];
             return;
         };
-        renderer.set_sky(&rs.device, &rs.queue, size, Some(&cube));
+        renderer.set_sky(&rs.device, &rs.context, size, Some(&cube));
         self.lighting.sky_irr = irr;
         let up = self.lighting.sky_irr[2];
         self.info(format!(
@@ -3708,7 +3720,7 @@ impl Editor {
                     if let (Some(renderer), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
                         // Only if the grid it re-lit is still the one shown.
                         if st.lightgrid_shown == Some(locals.origin) {
-                            renderer.set_localgrid(&rs.queue, &local);
+                            renderer.set_localgrid(&rs.context, &local);
                             st.lightgrid_locals = Some(locals);
                             st.lightgrid_local_dirty = true;
                         }
@@ -3733,8 +3745,8 @@ impl Editor {
                         }
                     }
                     if let (Some(renderer), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
-                        renderer.set_lightgrid(&rs.queue, &grid.data);
-                        renderer.set_localgrid(&rs.queue, &grid.local);
+                        renderer.set_lightgrid(&rs.context, &grid.data);
+                        renderer.set_localgrid(&rs.context, &grid.local);
                         st.lightgrid_shown = Some(grid.origin);
                         // (the GPU has the channel; it's kept as `locals`)
                         grid.local = Vec::new();
@@ -3869,7 +3881,7 @@ impl Editor {
                     match locals.update(&occ, &st.lightgrid_lights, mech::LIGHTGRID_LOCAL_PATCH_MAX) {
                         Ok(patch) => {
                             if let (Some(p), Some(renderer), Some(rs)) = (patch, self.renderer.as_mut(), self.render_state.as_ref()) {
-                                renderer.set_localgrid_region(&rs.queue, &p);
+                                renderer.set_localgrid_region(&rs.context, &p);
                             }
                             st.lightgrid_local_dirty = false;
                         }
@@ -3907,7 +3919,7 @@ impl Editor {
             match crate::sim_clock::job_recv(rx) {
                 Ok(grid) => {
                     if let (Some(renderer), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
-                        renderer.set_lightocc(&rs.queue, &grid.data);
+                        renderer.set_lightocc(&rs.context, &grid.data);
                         st.lightocc_shown = Some((grid.origin, grid.voxel));
                     }
                     st.lightocc_job = None;
@@ -3993,7 +4005,7 @@ impl Editor {
             }
         };
         if let (Some(renderer), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
-            renderer.set_studs(&rs.device, &rs.queue, img.width, img.height, &img.pixels);
+            renderer.set_studs(&rs.device, &rs.context, img.width, img.height, &img.pixels);
         }
     }
 
@@ -4218,7 +4230,60 @@ fn prepare_sky(bytes: &[std::sync::Arc<Vec<u8>>], orient: Vec3) -> Option<(u32, 
     Some((size, crate::render::cube_mips(size, &cube), irr))
 }
 
-/// Turns a sky cube (+X, −X, +Y, −Y, +Z, −Z faces, wgpu's layout) by
+fn sync_quality(
+    renderer: &mut crate::render::Renderer,
+    caps: &crate::d3d11::GpuCaps,
+    frame_no: u64,
+    last_work_ms: f32,
+    deterministic: bool,
+) {
+    static FRM: std::sync::Mutex<
+        Option<(
+            crate::quality::FrameRateManager,
+            Option<crate::quality::QualityProfile>,
+            usize,
+        )>,
+    > = std::sync::Mutex::new(None);
+    let quality_setting = match crate::studio_settings::get("RenderSettings", "EditQualityLevel") {
+        Some(crate::studio_settings::Val::Enum(v)) => (v as u8).min(21),
+        _ => 21,
+    };
+    let frm_mode = match crate::studio_settings::get("RenderSettings", "FrameRateManager") {
+        Some(crate::studio_settings::Val::Enum(v)) => v,
+        _ => 0,
+    };
+    let frm_enabled = match frm_mode {
+        1 => true,
+        2 => false,
+        _ => quality_setting == 0,
+    };
+    let mut guard = FRM.lock().unwrap_or_else(|e| e.into_inner());
+    let (frm, last, last_ptr) = guard.get_or_insert_with(|| {
+        (crate::quality::FrameRateManager::new(caps), None, 0)
+    });
+    if quality_setting > 0 && !frm_enabled {
+        frm.set_level(quality_setting);
+    }
+    let frm_level = if frm_enabled {
+        if frame_no > 0 && !deterministic {
+            Some(frm.observe_frame(last_work_ms))
+        } else {
+            Some(frm.level())
+        }
+    } else {
+        None
+    };
+    let profile =
+        crate::quality::QualityProfile::resolve(caps, quality_setting, frm_enabled, frm_level);
+    let r_ptr = renderer as *const crate::render::Renderer as usize;
+    if *last != Some(profile) || *last_ptr != r_ptr {
+        *last = Some(profile);
+        *last_ptr = r_ptr;
+        renderer.set_quality(profile);
+    }
+}
+
+/// Turns a sky cube (+X, −X, +Y, −Y, +Z, −Z faces, D3D cube layout) by
 /// Sky.SkyboxOrientation (degrees), as Studio does: each texel toward d takes
 /// the unturned sky toward R⁻¹·d, R = Rz·Rx·Ry (Roblox's axis rotations),
 /// bilinear within a face. Quarter turns land on texel centres, so they are
@@ -4443,7 +4508,7 @@ impl<'a> SilhouetteMask<'a> {
         };
         // Wholly outside one frustum plane: nothing to clip or cover.
         if (0..6).any(|plane| tri.iter().all(|p| distance(plane, *p) < 0.0)) { return; }
-        // WGPU homogeneous frustum, including the near plane, before divide
+        // D3D homogeneous frustum, including the near plane, before divide
         // (a triangle clipped by 6 planes has at most 9 corners).
         let mut poly = [glam::Vec4::ZERO; 9];
         let mut len = 3;
@@ -4590,7 +4655,7 @@ mod outline_tests {
         fn triangle(&mut self, tri: [glam::Vec4; 3]) {
             if self.remaining_rows == 0 || tri.iter().any(|p| !p.is_finite()) { return; }
             let mut poly = tri.to_vec();
-            // WGPU homogeneous frustum, including the near plane, before divide.
+            // D3D homogeneous frustum, including the near plane, before divide.
             for plane in 0..6 {
                 let distance = |p: glam::Vec4| match plane {
                     0 => p.x+p.w, 1 => p.w-p.x, 2 => p.y+p.w,

@@ -9,7 +9,32 @@
 //! egui's: premultiplied, gamma-space, on an Rgba8Unorm target (egui's
 //! "gamma framebuffer" path), so they come out as egui would paint them.
 
-use egui_wgpu::wgpu;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use windows::core::Interface;
+use windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11BlendState, ID3D11Buffer, ID3D11DepthStencilState, ID3D11Device, ID3D11DeviceContext,
+    ID3D11InputLayout, ID3D11PixelShader, ID3D11RasterizerState, ID3D11RenderTargetView,
+    ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11VertexShader,
+    D3D11_APPEND_ALIGNED_ELEMENT, D3D11_BIND_INDEX_BUFFER, D3D11_BIND_RENDER_TARGET,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_VERTEX_BUFFER, D3D11_BLEND_DESC,
+    D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD, D3D11_BLEND_ZERO,
+    D3D11_COLOR_WRITE_ENABLE_ALL, D3D11_COMPARISON_ALWAYS, D3D11_CULL_NONE,
+    D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT, D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+    D3D11_INPUT_ELEMENT_DESC, D3D11_INPUT_PER_INSTANCE_DATA, D3D11_INPUT_PER_VERTEX_DATA,
+    D3D11_RENDER_TARGET_BLEND_DESC, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE_ADDRESS_CLAMP,
+    D3D11_TEXTURE_ADDRESS_WRAP,
+};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
+    DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32_UINT,
+    DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R8G8B8A8_UNORM,
+    DXGI_FORMAT_R8G8_UNORM,
+};
+
+use crate::d3d11::{self, BlendMode, RenderState, Tex2dSpec};
 
 /// One vertex: NDC position, reverse-Z depth, egui's UV and colour, and
 /// the light it takes (linear RGB
@@ -192,32 +217,43 @@ pub struct GuiBatch {
     pub indices: Vec<u32>,
 }
 
-/// Appends a mesh's triangles, starting a new batch when the texture changes
-/// (so later items stay over earlier ones).
-/// Textures egui only knows by bind group (`register_native_texture`
-/// keeps no texture): ViewportFrame images (vf_render.rs), with a count
-/// bumped each time one is drawn again. Without this a SurfaceGui's or
-/// BillboardGui's ViewportFrame drew only its background.
-static NATIVE: std::sync::Mutex<Option<std::collections::HashMap<egui::TextureId, (wgpu::Texture, u64)>>> = std::sync::Mutex::new(None);
+/// Native textures registered outside egui's own atlas (ViewportFrame
+/// images in vf_render.rs), with a generation counter bumped each time one
+/// is redrawn.
+static NATIVE_GEN: Mutex<Option<HashMap<egui::TextureId, u64>>> = Mutex::new(None);
 
-pub fn register_native(id: egui::TextureId, tex: wgpu::Texture) {
-    NATIVE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(id, (tex, 0));
+pub fn register_native(id: egui::TextureId) {
+    NATIVE_GEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(id, 0);
 }
 
 pub fn native_changed(id: egui::TextureId) {
-    if let Some((_, g)) = NATIVE.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|m| m.get_mut(&id)) {
+    if let Some(g) = NATIVE_GEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|m| m.get_mut(&id))
+    {
         *g += 1;
     }
 }
 
 pub fn unregister_native(id: egui::TextureId) {
-    if let Some(m) = NATIVE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+    if let Some(m) = NATIVE_GEN.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         m.remove(&id);
     }
 }
 
-fn native(id: egui::TextureId) -> Option<(wgpu::Texture, u64)> {
-    NATIVE.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&id).cloned()
+fn native_gen(id: egui::TextureId) -> Option<u64> {
+    NATIVE_GEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()?
+        .get(&id)
+        .copied()
 }
 
 pub fn push(batches: &mut Vec<GuiBatch>, texture: egui::TextureId, vertices: Vec<GuiVertex>, indices: &[u32]) {
@@ -235,497 +271,6 @@ pub fn push_wrap(batches: &mut Vec<GuiBatch>, texture: egui::TextureId, wrap: bo
     b.indices.extend(indices.iter().map(|i| base + i));
 }
 
-const SHADER: &str = r#"
-struct VIn {
-    @location(0) ndc: vec2<f32>,
-    @location(1) depth: f32,
-    @location(2) uv: vec2<f32>,
-    @location(3) color: vec4<f32>,
-    @location(4) light: vec3<f32>,
-    @location(5) dist: f32,
-    @location(6) clip_w: f32,
-    @location(7) alpha_mul: f32,
-};
-struct VOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-    @location(1) color: vec4<f32>,
-    @location(2) depth: f32,
-    @location(3) light: vec3<f32>,
-    @location(4) dist: f32,
-    // 1 for particles / beams / trails (clip-space input), 0 for GUIs.
-    @location(5) @interpolate(flat) fx: f32,
-    @location(6) @interpolate(flat) alpha_mul: f32,
-    @location(7) uv2: vec2<f32>,
-    @location(8) @interpolate(flat) blend: f32,
-    @location(9) @interpolate(flat) soft: vec2<f32>,
-    // The clip w (view depth) at the pixel, for soft particles.
-    @location(10) vw: f32,
-    @location(11) beam_sun: vec3<f32>,
-    @location(12) world: vec3<f32>,
-    @location(13) beam_grid: f32,
-};
-// Studio's soft-particle depth texture holds view depth / 500
-// (ParticleCustomFS_Soft: depth × 500; ParticleCustomVS_Soft: min(w − ZOffset,
-// 500 − fade)).
-const SOFT_DEPTH_MAX: f32 = 500.0;
-// fog: the scene's (shader.wgsl g.fog: start, end or exp2 terms, mode);
-// fog_rgb: its colour, linear; e_on: tone curve e, on, the near plane.
-// casc / sphere / rect: the sun's shadow cascades (shader.wgsl g.sun_*);
-// sun: x Realistic, y sunDist, z hybridLerpSlope, w shadows on.
-// Effects (FxFrame): vp the reverse-Z view-projection, cam the camera (w 1:
-// light check), amb (w: local lights), outdoor, lamp (the sun), env:
-// effects::SceneLight's terms.
-struct Tone { curve: vec4<f32>, e_on: vec4<f32>, fog: vec4<f32>, fog_rgb: vec4<f32>, casc: array<mat4x4<f32>, 4>, sphere: array<vec4<f32>, 4>, rect: array<vec4<f32>, 4>, grid: vec4<f32>, sun: vec4<f32>,
-    vp: mat4x4<f32>, cam: vec4<f32>, amb: vec4<f32>, outdoor: vec4<f32>, lamp: vec4<f32>, env: vec4<f32>, right: vec4<f32> };
-// render.rs LightRaw / shader.wgsl Light.
-struct Light { pos_range: vec4<f32>, color: vec4<f32>, dir: vec4<f32>, extra: vec4<f32>, surface_u: vec4<f32>, surface_v: vec4<f32> };
-@group(0) @binding(0) var scene_depth: texture_depth_multisampled_2d;
-@group(0) @binding(1) var<uniform> tone: Tone;
-@group(0) @binding(2) var sun_atlas: texture_2d<f32>;
-@group(0) @binding(3) var sun_grid: texture_3d<f32>;
-@group(0) @binding(4) var sun_sampler: sampler;
-@group(0) @binding(5) var<storage, read> lights: array<Light>;
-// effects::Glass (FxGlass) and each effect's list of the ones in front.
-struct Glass { x: vec4<f32>, y: vec4<f32>, z: vec4<f32>, pos: vec4<f32> };
-@group(0) @binding(6) var<storage, read> glass: array<Glass>;
-@group(0) @binding(7) var<storage, read> glass_idx: array<u32>;
-@group(1) @binding(0) var tex: texture_2d<f32>;
-@group(1) @binding(1) var samp: sampler;
-
-@vertex
-fn vs(v: VIn) -> VOut {
-    var o: VOut;
-    o.pos = vec4<f32>(v.ndc, 0.5, 1.0);
-    o.fx = 0.0;
-    o.alpha_mul = v.alpha_mul;
-    o.uv2 = v.uv;
-    o.blend = 0.0;
-    o.soft = vec2<f32>(0.0);
-    o.vw = 0.0;
-    o.uv = v.uv;
-    o.color = v.color;
-    o.depth = v.depth;
-    o.light = v.light;
-    o.beam_sun = vec3<f32>(0.0);
-    o.beam_grid = 0.0;
-    o.world = vec3<f32>(0.0);
-    o.dist = v.dist;
-    return o;
-}
-
-// ------------------------------------------------------------ effect light
-// effects::SceneLight on the GPU (Studio lights effects on the GPU:
-// ParticleLightingVS / FS into the "Emitter Lighting Atlas", TrailFSLight
-// at the pixel). Same terms, same order as the CPU reference.
-
-// The light grid at p, trilinear (SceneLight::grid): x skylight, y sun;
-// 1 beyond its border or before the first grid.
-fn fx_grid(p: vec3<f32>) -> vec2<f32> {
-    if (tone.grid.w <= 0.0) { return vec2<f32>(1.0); }
-    let q = (p / FX_VOXEL - tone.grid.xyz).xzy / vec3<f32>(textureDimensions(sun_grid));
-    if (any(abs(q - vec3<f32>(0.5)) >= vec3<f32>(FX_GRID_BORDER))) { return vec2<f32>(1.0); }
-    return textureSampleLevel(sun_grid, sun_sampler, q, 0.0).rg;
-}
-
-// One local light without N·L (SceneLight::local).
-fn fx_local(l: Light, p: vec3<f32>) -> vec3<f32> {
-    let range = l.pos_range.w;
-    let to = l.pos_range.xyz - p;
-    let d = length(to);
-    let reach = range + FX_LOCAL_REACH;
-    if (range <= 0.0 || d >= reach) { return vec3<f32>(0.0); }
-    let dir = to / max(d, 1e-4);
-    var k = FX_LOCAL_SLOPE * (reach - d);
-    if (l.color.w > 0.5) {
-        let c = dot(-dir, l.dir.xyz);
-        let cone = clamp((c - l.dir.w) / max(1.0 - l.dir.w, 1e-3), 0.0, 1.0);
-        k *= cone * cone;
-        if (l.color.w > 1.5 && c < 0.0) { k = 0.0; }
-    }
-    return l.color.rgb / FX_LIGHT_INTENSITY * k;
-}
-
-// The light at p (SceneLight::at): min(ambient + sky + local, cap) per
-// channel (ParticleLightingFS), then the sun × the voxel sun.
-fn fx_scene(p: vec3<f32>, g: vec2<f32>) -> vec3<f32> {
-    var c = tone.amb.rgb + tone.outdoor.rgb * g.x + tone.env.rgb * g.x;
-    let n = u32(tone.amb.w);
-    for (var i = 0u; i < n; i++) {
-        c += fx_local(lights[i], p);
-    }
-    return min(c, vec3<f32>(FX_LIGHT_CAP)) + tone.lamp.rgb * g.y;
-}
-
-// Look::light: Brightness × (1 − w) + the scene's light × w.
-fn fx_look(look: vec4<f32>, lit: vec3<f32>) -> vec3<f32> {
-    return vec3<f32>(look.x) + lit * look.y;
-}
-
-// RUSTUDIO_FX_LIGHT_CHECK: the CPU's light against the GPU's.
-fn fx_checked(o: ptr<function, VOut>, gpu: vec3<f32>, cpu: vec3<f32>) {
-    if (tone.cam.w > 0.5 && any(abs(gpu - cpu) > vec3<f32>(2e-3) + abs(cpu) * 2e-3)) {
-        (*o).color = vec4<f32>(1.0, 0.0, 1.0, 1.0);
-        (*o).light = vec3<f32>(1.0);
-        (*o).beam_sun = vec3<f32>(0.0);
-        (*o).uv = vec2<f32>(FX_WHITE_UV);
-        (*o).uv2 = vec2<f32>(FX_WHITE_UV);
-    }
-}
-
-// Whether the segment from o (length len along unit d) enters the box
-// (effects::Glass::hit).
-fn fx_hit(g: Glass, o: vec3<f32>, d: vec3<f32>, len: f32) -> bool {
-    let rel = o - g.pos.xyz;
-    let lo = vec3<f32>(dot(g.x.xyz, rel), dot(g.y.xyz, rel), dot(g.z.xyz, rel));
-    let ld = vec3<f32>(dot(g.x.xyz, d), dot(g.y.xyz, d), dot(g.z.xyz, d));
-    let half = vec3<f32>(g.x.w, g.y.w, g.z.w);
-    var t0 = 0.0;
-    var t1 = len;
-    for (var i = 0; i < 3; i++) {
-        if (abs(ld[i]) < 1e-6) {
-            if (abs(lo[i]) > half[i]) { return false; }
-        } else {
-            let a = (-half[i] - lo[i]) / ld[i];
-            let b = (half[i] - lo[i]) / ld[i];
-            t0 = max(t0, min(a, b));
-            t1 = min(t1, max(a, b));
-            if (t0 > t1) { return false; }
-        }
-    }
-    return true;
-}
-
-// How much of an effect at p shows through the glass in front of it
-// (GlassSet::transmit; Studio sorts see-through parts and effects together).
-fn fx_transmit(p: vec3<f32>, list: vec2<u32>) -> f32 {
-    var t = 1.0;
-    if (list.y == 0u) { return t; }
-    let seg = p - tone.cam.xyz;
-    let len = length(seg);
-    let d = seg / max(len, 1e-6);
-    for (var i = 0u; i < list.y; i++) {
-        let g = glass[glass_idx[list.x + i]];
-        if (fx_hit(g, tone.cam.xyz, d, len)) { t *= 1.0 - g.pos.w; }
-    }
-    return t;
-}
-
-fn fx_clip(p: vec3<f32>) -> vec4<f32> {
-    var c = tone.vp * vec4<f32>(p, 1.0);
-    if (c.w == 0.0) { c.w = -1e-6; }
-    return c;
-}
-
-fn toward_cam(p: vec3<f32>) -> vec3<f32> {
-    let d = tone.cam.xyz - p;
-    let l = length(d);
-    return select(vec3<f32>(0.0), d / l, l > 0.0);
-}
-
-struct StripIn {
-    @location(0) pos: vec3<f32>,
-    @location(1) zoff: f32,
-    @location(2) at: vec3<f32>,
-    @location(3) color: vec4<f32>,
-    @location(4) uv: vec2<f32>,
-    @location(5) look: vec4<f32>,
-    @location(6) check: vec3<f32>,
-    @location(7) glass: vec2<u32>,
-    @location(8) face: vec4<f32>,
-    @location(9) scroll: f32,
-};
-
-// Beams, trails and constraints (TrailVSLightUnified): world position, the
-// row moved ZOffset toward the camera, lit at the row's centre.
-@vertex
-fn vs_strip(v: StripIn) -> VOut {
-    var o: VOut;
-    var p = v.pos;
-    var at = v.at;
-    if (v.face.w != 0.0) {
-        // FaceCamera: across tangent × (camera − p), else the camera's right
-        // (glam normalize_or).
-        let c = cross(v.face.xyz, tone.cam.xyz - p);
-        let rcp = 1.0 / length(c);
-        let side = select(tone.right.xyz, c * rcp, rcp > 0.0 && rcp < 3.0e38);
-        p += side * v.face.w;
-    }
-    if (v.zoff != 0.0) {
-        let s = toward_cam(at) * v.zoff;
-        p += s;
-        at += s;
-    }
-    let c = fx_clip(p);
-    o.pos = c;
-    o.depth = c.z;
-    o.vw = c.w;
-    o.fx = 1.0;
-    o.alpha_mul = v.look.w;
-    o.uv = vec2<f32>(v.uv.x, v.uv.y - v.scroll);
-    o.uv2 = o.uv;
-    o.blend = 0.0;
-    o.soft = vec2<f32>(0.0);
-    let t = fx_transmit(at, v.glass);
-    o.color = v.color * t;
-    o.dist = length(p - tone.cam.xyz);
-    o.world = p;
-    o.beam_sun = vec3<f32>(0.0);
-    o.beam_grid = 0.0;
-    if (v.look.y > 0.0) {
-        let g = fx_grid(at);
-        o.light = fx_look(v.look, fx_scene(at, g));
-        if (v.look.z > 1.5) {
-            // TrailFSLight: Lamp0 × the sun's visibility per pixel (beam_light).
-            o.beam_sun = tone.lamp.rgb * v.look.y;
-            o.beam_grid = g.y;
-        }
-    } else {
-        o.light = vec3<f32>(v.look.x);
-    }
-    fx_checked(&o, o.light * t, v.check);
-    return o;
-}
-
-struct ParticleIn {
-    @location(0) centre: vec3<f32>,
-    @location(1) zoffset: f32,
-    @location(2) e1: vec3<f32>,
-    @location(3) soft: f32,
-    @location(4) e2: vec3<f32>,
-    @location(5) blend: f32,
-    @location(6) uv0: vec2<f32>,
-    @location(7) uv1: vec2<f32>,
-    @location(8) cell: vec2<f32>,
-    @location(9) color: vec4<f32>,
-    @location(11) look: vec4<f32>,
-    @location(12) check: vec3<f32>,
-    @location(13) glass: vec2<u32>,
-};
-
-// Particles (ParticleCustomVS): the quad made from the particle, six
-// vertices per instance; ZOffset moves the depth only; lit once, at the
-// centre FX_LIGHT_TOWARD_CAMERA toward the camera (ParticleLightingVS).
-@vertex
-fn vs_particle(v: ParticleIn, @builtin(vertex_index) vi: u32) -> VOut {
-    var o: VOut;
-    var corners = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u);
-    let k = corners[vi];
-    let cx = select(-1.0, 1.0, k == 1u || k == 2u);
-    let cy = select(-1.0, 1.0, k >= 2u);
-    let p = v.centre + (v.e1 * cx + v.e2 * cy);
-    let c = fx_clip(p);
-    var z = c.z;
-    if (v.zoffset != 0.0) {
-        let q = p + toward_cam(p) * v.zoffset;
-        let cz = tone.vp * vec4<f32>(q, 1.0);
-        if (abs(cz.w) > 1e-6) { z = cz.z * c.w / cz.w; }
-    }
-    o.pos = vec4<f32>(c.xy, z, c.w);
-    o.depth = z;
-    o.vw = c.w;
-    o.fx = 1.0;
-    o.alpha_mul = v.look.w;
-    let corner = vec2<f32>((cx + 1.0) * 0.5, 1.0 - (cy + 1.0) * 0.5) * v.cell;
-    o.uv = v.uv0 + corner;
-    o.uv2 = v.uv1 + corner;
-    o.blend = v.blend;
-    o.soft = vec2<f32>(v.soft, select(0.0, v.zoffset, v.soft > 0.0));
-    let t = fx_transmit(v.centre, v.glass);
-    o.color = v.color * t;
-    o.dist = length(p - tone.cam.xyz);
-    o.world = p;
-    o.beam_sun = vec3<f32>(0.0);
-    o.beam_grid = 0.0;
-    if (v.look.y > 0.0) {
-        let at = v.centre + toward_cam(v.centre) * FX_LIGHT_TOWARD_CAMERA;
-        o.light = fx_look(v.look, fx_scene(at, fx_grid(at)));
-    } else {
-        o.light = vec3<f32>(v.look.x);
-    }
-    fx_checked(&o, o.light * t, v.check);
-    return o;
-}
-
-// shader.wgsl fog_amount: Lighting's FogStart / FogEnd fog (exp2, not linear),
-// under water Studio's exp2, or Atmosphere's exp2 (fog.z 3).
-fn fog_amount(d: f32) -> f32 {
-    if (tone.fog.z > 2.5) {
-        return 1.0 - clamp(exp2(tone.fog.x - tone.fog.y * d), 0.0, 1.0);
-    }
-    if (tone.fog.z > 1.5) {
-        return 1.0 - clamp(exp2(tone.fog.x - tone.fog.y * d) - 1.0, 0.0, 1.0);
-    }
-    return 1.0 - clamp(exp2((tone.fog.y - d) / max(tone.fog.y - tone.fog.x, 1e-3)) - 1.0, 0.0, 1.0);
-}
-
-// The scene's tone curve (shader.wgsl tonemap: y = x(ax+b)/(x(ax+c)+d)·e),
-// off for Legacy / Voxel / Compatibility.
-fn tonemap(x: vec3<f32>) -> vec3<f32> {
-    var y = max(x, vec3<f32>(0.0));
-    if (tone.e_on.y > 0.5) {
-        let a = tone.curve.x; let b = tone.curve.y; let c = tone.curve.z; let d = tone.curve.w;
-        y = y * (a * y + b) / (y * (a * y + c) + d) * tone.e_on.x;
-    }
-    return sqrt(clamp(y, vec3<f32>(0.0), vec3<f32>(1.0)));
-}
-
-@fragment
-fn fs(in: VOut) -> @location(0) vec4<f32> {
-    // (sampled first: textureSample needs uniform control flow)
-    // FlipbookBlendFrames: the two frames' premultiplied texels mixed
-    // (ParticleCustomFS; egui's textures are premultiplied already).
-    let t = mix(textureSample(tex, samp, in.uv), textureSample(tex, samp, in.uv2), in.blend);
-    let g = in.color * t;
-    let s = textureLoad(scene_depth, vec2<i32>(floor(in.pos.xy)), 0);
-    // Studio lights world GUIs in the scene: the colour as linear light ×
-    // the GUI's light factor, through the tone curve, back to display.
-    var c = g;
-    if (g.a > 0.0) {
-        var lin = (g.rgb / g.a) * (g.rgb / g.a) * in.light;
-        if (in.fx > 0.5) {
-            // Studio's ParticleCustomFS / TrailFSLight (round 25): fog fades
-            // the effect out (alpha × the fog factor) instead of tinting it,
-            // and LightEmission scales only the alpha.
-            var a = g.a * (1.0 - fog_amount(in.dist));
-            // Soft particles (ParticleCustomFS_Soft, camera-facing ones):
-            // faded by how far the scene behind is, over the particle's
-            // half size. Reverse-Z infinite: view depth = near / depth.
-            if (in.soft.x > 0.0) {
-                let sd = select(SOFT_DEPTH_MAX, min(tone.e_on.z / max(s, 1e-9), SOFT_DEPTH_MAX), s > 0.0);
-                let pd = min(in.vw - in.soft.y, SOFT_DEPTH_MAX - 1.0 / in.soft.x);
-                a *= clamp(abs(sd - pd) * in.soft.x, 0.0, 1.0);
-            }
-            // Studio blends before its tone curve: the curve of the
-            // premultiplied colour (exact over black and when opaque;
-            // effects place: red at Transparency 0.5, LightEmission 1 reads
-            // 166 in Studio, 126 as tone(c) × a).
-            c = vec4<f32>(tonemap(lin * a * a), a * in.alpha_mul);
-        } else {
-            // As Studio's lit GUI shader: fogged like the
-            // scene, after the light and before the exposure.
-            lin = mix(lin, tone.fog_rgb.rgb, fog_amount(in.dist));
-            c = vec4<f32>(tonemap(lin) * g.a, g.a);
-        }
-    }
-    // (effects: their own clip z / w)
-    let depth = select(in.depth, in.pos.z, in.fx > 0.5);
-    // Reverse-Z: nearer is larger. A sliver of slack: a SurfaceGui lies on
-    // its part's face.
-    if (depth < s * (1.0 - 0.0015)) {
-        discard;
-    }
-    return c;
-}
-
-// Effects into the scene's light, blended as Studio blends them (round 27):
-// in a buffer holding the square root of linear light (WorldGuiPass::effects
-// fills it from the scene's HDR image and squares it back), before the tone
-// curve and the bloom. ParticleCustomFS: rgb = sqrt(clamp(lin)) × alpha,
-// alpha × (1 − LightEmission). Overlapping additive particles add up in
-// that space; tone-mapping each one first (round 25) crushed them in the
-// curve's toe.
-// As Studio's lit trail shader: Lamp0 alone is cut by the
-// sun's visibility, the parts' own (shader.wgsl sun_shadow): the shadow
-// cascade whose sphere holds the pixel, its EVSM moments tested with
-// Chebyshev on both warps, handed to the voxel sun (light grid .y) past
-// sunDist. Skylight, local light and the effect's own parameters stay.
-fn beam_light(in: VOut) -> vec3<f32> {
-    if (!any(in.beam_sun > vec3<f32>(0.0))) { return in.light; }
-    var visible = -1.0;
-    if (tone.sun.w > 0.5) {
-        let d0 = in.world - tone.sphere[0].xyz;
-        let d1 = in.world - tone.sphere[1].xyz;
-        let d2 = in.world - tone.sphere[2].xyz;
-        var i = 3;
-        if (dot(d0, d0) < tone.sphere[0].w) {
-            i = 0;
-        } else if (dot(d1, d1) < tone.sphere[1].w) {
-            i = 1;
-        } else if (dot(d2, d2) < tone.sphere[2].w) {
-            i = 2;
-        }
-        let p = tone.casc[i] * vec4<f32>(in.world, 1.0);
-        if (all(p.xy > vec2<f32>(0.0)) && all(p.xy < vec2<f32>(1.0))) {
-            let r = tone.rect[i];
-            let m = textureSampleLevel(sun_atlas, sun_sampler, r.xy + p.xy * r.zw, 0.0);
-            let z = 2.0 * p.z - 1.0;
-            let ep = exp(EVSM_POS_EXP * z);
-            let en = -exp(-EVSM_NEG_EXP * z);
-            let mv = vec2<f32>(EVSM_POS_EXP, EVSM_NEG_EXP) * EVSM_SHADOW_BIAS * vec2<f32>(ep, en);
-            let vp = max(m.y - m.x * m.x, mv.x * mv.x);
-            let dp = ep - m.x;
-            let vn = max(m.w - m.z * m.z, mv.y * mv.y);
-            let dn = en - m.z;
-            let pp = select(clamp((vp / (vp + dp * dp) - EVSM_BLEED_CUT) / (1.0 - EVSM_BLEED_CUT), 0.0, 1.0), 1.0, ep <= m.x);
-            let pn = select(clamp((vn / (vn + dn * dn) - EVSM_BLEED_CUT) / (1.0 - EVSM_BLEED_CUT), 0.0, 1.0), 1.0, en <= m.z);
-            visible = min(pp, pn);
-        }
-    }
-    var voxel = 1.0;
-    let q = (in.world * 0.25 - tone.grid.xyz).xzy / vec3<f32>(textureDimensions(sun_grid));
-    if (tone.grid.w > 0.0 && all(abs(q - vec3<f32>(0.5)) < vec3<f32>(0.4921875))) {
-        voxel = textureSampleLevel(sun_grid, samp, q, 0.0).g;
-    }
-    var visibility = voxel;
-    if (visible >= 0.0) {
-        visibility = select(voxel * visible,
-            mix(visible, voxel, clamp((in.dist - tone.sun.y) * tone.sun.z, 0.0, 1.0)), tone.sun.x > 0.5);
-    }
-    return max(in.light + in.beam_sun * (visibility - in.beam_grid), vec3<f32>(0.0));
-}
-
-@fragment
-fn fs_fx(in: VOut) -> @location(0) vec4<f32> {
-    let t = mix(textureSample(tex, samp, in.uv), textureSample(tex, samp, in.uv2), in.blend);
-    let g = in.color * t;
-    let s = textureLoad(scene_depth, vec2<i32>(floor(in.pos.xy)), 0);
-    let depth = select(in.depth, in.pos.z, in.fx > 0.5);
-    if (g.a <= 0.0 || depth < s * (1.0 - 0.0015)) {
-        discard;
-    }
-    // (e_on.w: mech::FX_LIGHT_CLAMP)
-    var lin = (g.rgb / g.a) * (g.rgb / g.a) * beam_light(in);
-    if (in.fx < 0.5) {
-        // UILitFogFS: lit world GUI colour enters the scene before post.
-        lin = mix(lin, tone.fog_rgb.rgb, fog_amount(in.dist));
-        return vec4<f32>(sqrt(max(lin, vec3<f32>(0.0))) * g.a, g.a);
-    }
-    lin = min(lin, vec3<f32>(tone.e_on.w));
-    var a = g.a * (1.0 - fog_amount(in.dist));
-    if (in.soft.x > 0.0) {
-        let sd = select(SOFT_DEPTH_MAX, min(tone.e_on.z / max(s, 1e-9), SOFT_DEPTH_MAX), s > 0.0);
-        let pd = min(in.vw - in.soft.y, SOFT_DEPTH_MAX - 1.0 / in.soft.x);
-        a *= clamp(abs(sd - pd) * in.soft.x, 0.0, 1.0);
-    }
-    return vec4<f32>(sqrt(lin) * a, a * in.alpha_mul);
-}
-"#;
-
-/// The effects' buffer: filled with the square root of the scene's linear
-/// light, and squared back into it once the effects are in.
-const FX_SHADER: &str = r#"
-@group(0) @binding(0) var src: texture_2d<f32>;
-struct VOut { @builtin(position) pos: vec4<f32> };
-@vertex
-fn vs(@builtin(vertex_index) i: u32) -> VOut {
-    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
-    var o: VOut;
-    o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
-    return o;
-}
-@fragment
-fn fs_in(in: VOut) -> @location(0) vec4<f32> {
-    let c = textureLoad(src, vec2<i32>(in.pos.xy), 0);
-    return vec4<f32>(sqrt(max(c.rgb, vec3<f32>(0.0))), c.a);
-}
-@fragment
-fn fs_out(in: VOut) -> @location(0) vec4<f32> {
-    let c = textureLoad(src, vec2<i32>(in.pos.xy), 0);
-    return vec4<f32>(c.rgb * c.rgb, c.a);
-}
-"#;
-
 /// The sun's shadow cascades as the beams' shader reads them
 /// (render.rs Globals sun_casc / sun_sphere / sun_rect).
 #[derive(Clone, Copy, Default)]
@@ -735,69 +280,92 @@ pub struct SunCascades {
     pub rect: [[f32; 4]; 4],
 }
 
+/// The scene's HDR format (render.rs HDR_FORMAT) and the effects' buffer.
+const FX_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
+
+struct DynBuf {
+    buf: ID3D11Buffer,
+    bytes: usize,
+}
+
+struct DynStructured {
+    buf: ID3D11Buffer,
+    srv: ID3D11ShaderResourceView,
+    cap_bytes: usize,
+}
+
+struct MipChain {
+    src_raw: usize,
+    size: [u32; 2],
+    full_srv: ID3D11ShaderResourceView,
+    level_rtvs: Vec<ID3D11RenderTargetView>,
+    level_srvs: Vec<ID3D11ShaderResourceView>,
+    used: u64,
+}
+
 pub struct WorldGuiPass {
-    tone_buf: wgpu::Buffer,
+    tone_cb: ID3D11Buffer,
     /// The sun's shadow cascades (sun_shadow.rs): the EVSM atlas.
-    pub sun_atlas: wgpu::TextureView,
-    sun_sampler: wgpu::Sampler,
-    pub sun_grid: wgpu::TextureView,
+    pub sun_atlas: ID3D11ShaderResourceView,
+    sun_sampler: ID3D11SamplerState,
+    pub sun_grid: ID3D11ShaderResourceView,
     pub lightgrid: [f32; 4],
     pub sun_params: [f32; 4],
     pub sun_cascades: SunCascades,
-    pipeline: wgpu::RenderPipeline,
-    depth_bgl: wgpu::BindGroupLayout,
-    tex_bgl: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
+    vs_gui: ID3D11VertexShader,
+    ps_gui_1x: ID3D11PixelShader,
+    ps_gui_msaa: ID3D11PixelShader,
+    il_gui: ID3D11InputLayout,
+    vs_strip: ID3D11VertexShader,
+    il_strip: ID3D11InputLayout,
+    vs_particle: ID3D11VertexShader,
+    il_particle: ID3D11InputLayout,
+    ps_fx_1x: ID3D11PixelShader,
+    ps_fx_msaa: ID3D11PixelShader,
+    vs_mip: ID3D11VertexShader,
+    ps_mip: ID3D11PixelShader,
+    vs_glass_mask: ID3D11VertexShader,
+    ps_glass_in: ID3D11PixelShader,
+    ps_glass_out: ID3D11PixelShader,
+    rast_state: ID3D11RasterizerState,
+    depth_off: ID3D11DepthStencilState,
+    blend_opaque: ID3D11BlendState,
+    blend_gui: ID3D11BlendState,
+    blend_fx: ID3D11BlendState,
+    sampler: ID3D11SamplerState,
     /// Repeating, for beams' and trails' tiled textures (round 25).
-    sampler_wrap: wgpu::Sampler,
+    sampler_wrap: ID3D11SamplerState,
     /// Effects' textures with mip levels (Studio samples particle, beam and
     /// trail images mipmapped: far or small particles are the image's
     /// average, not a sparse sample of its texels), made from egui's copy
-    /// on first use. Keyed by egui's texture; the copy, its view, and the
-    /// frame each was last used (and, for the font atlas, refilled).
-    mips: std::collections::HashMap<wgpu::Texture, (wgpu::Texture, wgpu::TextureView, u64)>,
-    mip_pipeline: wgpu::RenderPipeline,
-    mip_bgl: wgpu::BindGroupLayout,
-    mip_sampler: wgpu::Sampler,
-    sampler_mip: wgpu::Sampler,
-    sampler_mip_wrap: wgpu::Sampler,
+    /// on first use.
+    mips: HashMap<egui::TextureId, MipChain>,
+    mip_sampler: ID3D11SamplerState,
+    sampler_mip: ID3D11SamplerState,
+    sampler_mip_wrap: ID3D11SamplerState,
     frame: u64,
-    /// Effects (`effects`): their pipeline into the square-root buffer,
-    /// the fill / square-back passes, and the buffer sized to the view.
-    fx_pipeline: wgpu::RenderPipeline,
-    /// Effects (FxFrame): beams / trails, and particles (instanced).
-    strip_pipeline: wgpu::RenderPipeline,
-    particle_pipeline: wgpu::RenderPipeline,
-    /// The frame's local lights (render.rs lights_buf) and how many.
-    pub lights: wgpu::Buffer,
+    /// The frame's local lights (render.rs lights SRV) and how many.
+    pub lights: ID3D11ShaderResourceView,
     pub n_lights: u32,
     /// Vertex / index buffers kept from frame to frame, grown as needed
     /// (Studio's particle buffer is one 4 MB dynamic vertex buffer).
-    bufs: [Option<wgpu::Buffer>; 5],
+    bufs: [Option<DynBuf>; 5],
     /// The glass and its lists (FxFrame::glass / glass_idx), never empty.
-    glass: [Option<wgpu::Buffer>; 2],
-    /// Texture bind groups by egui id and wrap: the egui texture they were
-    /// made for, and the frame each was last used.
-    tex_groups: std::collections::HashMap<(egui::TextureId, bool), (wgpu::Texture, wgpu::BindGroup, u64)>,
+    glass: [Option<DynStructured>; 2],
+    /// Texture view & sampler cache keyed by `(id, wrap)`: `(src_raw, size, srv, sampler, used)`.
+    tex_cache: HashMap<(egui::TextureId, bool), (usize, [u32; 2], ID3D11ShaderResourceView, ID3D11SamplerState, u64)>,
     /// Each native texture's draw count when its copy was last refilled.
-    native_seen: std::collections::HashMap<egui::TextureId, u64>,
+    native_seen: HashMap<egui::TextureId, u64>,
     /// Untextured effects: one white texel.
-    white: wgpu::BindGroup,
-    fx_bgl: wgpu::BindGroupLayout,
-    fx_in: wgpu::RenderPipeline,
-    fx_out: wgpu::RenderPipeline,
-    fx_tex: Option<([u32; 2], wgpu::TextureView)>,
+    white_srv: ID3D11ShaderResourceView,
+    fx_tex: Option<([u32; 2], ID3D11RenderTargetView, ID3D11ShaderResourceView)>,
 }
-
-/// The scene's HDR format (render.rs HDR_FORMAT) and the effects' buffer.
-const FX_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// `WorldGuiPass::upload`'s result.
 struct Upload {
-    depth_bg: wgpu::BindGroup,
-    /// GUI vertices / indices, strip vertices / indices, particles
-    /// (`WorldGuiPass::bufs`).
-    draws: Vec<(Kind, wgpu::BindGroup, u32, u32)>,
+    glass_srv: ID3D11ShaderResourceView,
+    glass_idx_srv: ID3D11ShaderResourceView,
+    draws: Vec<(Kind, ID3D11ShaderResourceView, ID3D11SamplerState, u32, u32)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -807,442 +375,319 @@ enum Kind {
     Particles,
 }
 
-/// The effects' shader constants (mech.rs).
-fn fx_constants() -> String {
-    let w = egui::epaint::WHITE_UV;
-    format!(
-        "const FX_VOXEL: f32 = {:?};\nconst FX_GRID_BORDER: f32 = {:?};\nconst FX_LOCAL_REACH: f32 = {:?};\nconst FX_LOCAL_SLOPE: f32 = {:?};\nconst FX_LIGHT_INTENSITY: f32 = {:?};\nconst FX_LIGHT_CAP: f32 = {:?};\nconst FX_LIGHT_TOWARD_CAMERA: f32 = {:?};\nconst FX_WHITE_UV = vec2<f32>({:?}, {:?});\n",
-        crate::terrain::VOXEL,
-        crate::mech::LIGHTGRID_BORDER,
-        crate::mech::FX_LOCAL_REACH,
-        crate::mech::FX_LOCAL_SLOPE,
-        crate::mech::LIGHT_INTENSITY,
-        crate::mech::FX_LIGHT_CAP,
-        crate::mech::FX_LIGHT_TOWARD_CAMERA,
-        w.x,
-        w.y,
-    )
-}
-
-/// Writes `data` into the kept buffer `slot`, growing it (to the next power
-/// of two) when it doesn't fit.
-fn fill(device: &wgpu::Device, queue: &wgpu::Queue, slot: &mut Option<wgpu::Buffer>, usage: wgpu::BufferUsages, data: &[u8]) {
+fn fill_dyn(
+    device: &ID3D11Device,
+    ctx: &ID3D11DeviceContext,
+    slot: &mut Option<DynBuf>,
+    bind_flag: u32,
+    data: &[u8],
+) {
     if data.is_empty() {
         return;
     }
-    let need = (data.len() as u64).next_power_of_two().max(4096);
-    if slot.as_ref().is_none_or(|b| b.size() < data.len() as u64) {
-        *slot = Some(device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("world gui / effects"),
-            size: need,
-            usage: usage | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        }));
+    let need = data.len().next_power_of_two().max(4096);
+    if slot.as_ref().is_none_or(|b| b.bytes < data.len()) {
+        *slot = Some(DynBuf {
+            buf: d3d11::create_dynamic_buffer(device, bind_flag, need),
+            bytes: need,
+        });
     }
     if let Some(b) = slot {
-        queue.write_buffer(b, 0, data);
+        d3d11::update_dynamic(ctx, &b.buf, data);
     }
 }
 
-/// Downsamples one mip level into the next (each texel the average of the
-/// 2 × 2 under it: a bilinear tap at their shared corner).
-const MIP_SHADER: &str = r#"
-@group(0) @binding(0) var src: texture_2d<f32>;
-@group(0) @binding(1) var samp: sampler;
-struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
-@vertex
-fn vs(@builtin(vertex_index) i: u32) -> VOut {
-    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
-    var o: VOut;
-    o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
-    o.uv = vec2<f32>(p.x, 1.0 - p.y);
-    return o;
+fn fill_structured(
+    device: &ID3D11Device,
+    ctx: &ID3D11DeviceContext,
+    slot: &mut Option<DynStructured>,
+    stride: u32,
+    data: &[u8],
+) {
+    if data.is_empty() {
+        return;
+    }
+    let count = (data.len() / stride as usize).max(1);
+    let need_count = count.next_power_of_two().max(64);
+    let need_bytes = need_count * stride as usize;
+    if slot.as_ref().is_none_or(|s| s.cap_bytes < data.len()) {
+        let (buf, srv) = d3d11::create_structured_srv(device, stride, need_count as u32, true, None);
+        *slot = Some(DynStructured {
+            buf,
+            srv,
+            cap_bytes: need_bytes,
+        });
+    }
+    if let Some(s) = slot {
+        d3d11::update_dynamic(ctx, &s.buf, data);
+    }
 }
-@fragment
-fn fs(in: VOut) -> @location(0) vec4<f32> {
-    return textureSampleLevel(src, samp, in.uv, 0.0);
+
+fn elem_v(idx: u32, fmt: DXGI_FORMAT) -> D3D11_INPUT_ELEMENT_DESC {
+    D3D11_INPUT_ELEMENT_DESC {
+        SemanticName: windows::core::s!("TEXCOORD"),
+        SemanticIndex: idx,
+        Format: fmt,
+        InputSlot: 0,
+        AlignedByteOffset: D3D11_APPEND_ALIGNED_ELEMENT,
+        InputSlotClass: D3D11_INPUT_PER_VERTEX_DATA,
+        InstanceDataStepRate: 0,
+    }
 }
-"#;
+
+fn elem_i(idx: u32, fmt: DXGI_FORMAT) -> D3D11_INPUT_ELEMENT_DESC {
+    D3D11_INPUT_ELEMENT_DESC {
+        SemanticName: windows::core::s!("TEXCOORD"),
+        SemanticIndex: idx,
+        Format: fmt,
+        InputSlot: 0,
+        AlignedByteOffset: D3D11_APPEND_ALIGNED_ELEMENT,
+        InputSlotClass: D3D11_INPUT_PER_INSTANCE_DATA,
+        InstanceDataStepRate: 1,
+    }
+}
+
+fn create_fx_blend(device: &ID3D11Device) -> ID3D11BlendState {
+    let mut desc = D3D11_BLEND_DESC::default();
+    desc.RenderTarget[0] = D3D11_RENDER_TARGET_BLEND_DESC {
+        BlendEnable: true.into(),
+        SrcBlend: D3D11_BLEND_ONE,
+        DestBlend: D3D11_BLEND_INV_SRC_ALPHA,
+        BlendOp: D3D11_BLEND_OP_ADD,
+        SrcBlendAlpha: D3D11_BLEND_ZERO,
+        DestBlendAlpha: D3D11_BLEND_ONE,
+        BlendOpAlpha: D3D11_BLEND_OP_ADD,
+        RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
+    };
+    let mut out = None;
+    unsafe { device.CreateBlendState(&desc, Some(&mut out)) }.expect("CreateBlendState fx");
+    out.unwrap()
+}
 
 impl WorldGuiPass {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, target: wgpu::TextureFormat) -> Self {
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("world gui"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!(
-                    "const EVSM_POS_EXP: f32 = {:?};\nconst EVSM_NEG_EXP: f32 = {:?};\nconst EVSM_SHADOW_BIAS: f32 = {:?};\nconst EVSM_BLEED_CUT: f32 = {:?};\n{}{SHADER}",
-                    crate::mech::EVSM_POS_EXP,
-                    crate::mech::EVSM_NEG_EXP,
-                    crate::mech::EVSM_SHADOW_BIAS,
-                    crate::mech::EVSM_BLEED_CUT,
-                    fx_constants(),
-                )
-                .into(),
-            ),
-        });
-        let depth_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("world gui depth"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: true,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false }, count: None,
-                },
-                // The frame's local lights (render.rs lights_buf).
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5, visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None,
-                },
-                // Effects: the glass in view, and each effect's list of it.
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6, visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7, visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None,
-                },
+    pub fn new(device: &ID3D11Device, _ctx: &ID3D11DeviceContext) -> Self {
+        let vs_gui = d3d11::create_vs(device, crate::d3d11::shaders::VS_GUI);
+        let ps_gui_1x = d3d11::create_ps(device, crate::d3d11::shaders::PS_GUI_1X);
+        let ps_gui_msaa = d3d11::create_ps(device, crate::d3d11::shaders::PS_GUI_MSAA);
+        let il_gui = d3d11::create_input_layout(
+            device,
+            &[
+                elem_v(0, DXGI_FORMAT_R32G32_FLOAT),
+                elem_v(1, DXGI_FORMAT_R32_FLOAT),
+                elem_v(2, DXGI_FORMAT_R32G32_FLOAT),
+                elem_v(3, DXGI_FORMAT_R8G8B8A8_UNORM),
+                elem_v(4, DXGI_FORMAT_R32G32B32_FLOAT),
+                elem_v(5, DXGI_FORMAT_R32_FLOAT),
+                elem_v(6, DXGI_FORMAT_R32_FLOAT),
+                elem_v(7, DXGI_FORMAT_R32_FLOAT),
             ],
-        });
-        let tex_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("world gui texture"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
+            crate::d3d11::shaders::VS_GUI,
+        );
+
+        let vs_strip = d3d11::create_vs(device, crate::d3d11::shaders::VS_FX_STRIP);
+        let il_strip = d3d11::create_input_layout(
+            device,
+            &[
+                elem_v(0, DXGI_FORMAT_R32G32B32_FLOAT),
+                elem_v(1, DXGI_FORMAT_R32_FLOAT),
+                elem_v(2, DXGI_FORMAT_R32G32B32_FLOAT),
+                elem_v(3, DXGI_FORMAT_R8G8B8A8_UNORM),
+                elem_v(4, DXGI_FORMAT_R32G32_FLOAT),
+                elem_v(5, DXGI_FORMAT_R32G32B32A32_FLOAT),
+                elem_v(6, DXGI_FORMAT_R32G32B32_FLOAT),
+                elem_v(7, DXGI_FORMAT_R32G32_UINT),
+                elem_v(8, DXGI_FORMAT_R32G32B32A32_FLOAT),
+                elem_v(9, DXGI_FORMAT_R32_FLOAT),
             ],
-        });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("world gui"),
-            bind_group_layouts: &[Some(&depth_bgl), Some(&tex_bgl)],
-            immediate_size: 0,
-        });
-        let attrs = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32, 2 => Float32x2, 3 => Unorm8x4, 4 => Float32x3, 5 => Float32, 6 => Float32, 7 => Float32];
-        let strip_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32, 2 => Float32x3, 3 => Unorm8x4, 4 => Float32x2, 5 => Float32x4, 6 => Float32x3, 7 => Uint32x2, 8 => Float32x4, 9 => Float32];
-        let particle_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32, 2 => Float32x3, 3 => Float32, 4 => Float32x3, 5 => Float32, 6 => Float32x2, 7 => Float32x2, 8 => Float32x2, 9 => Unorm8x4, 11 => Float32x4, 12 => Float32x3, 13 => Uint32x2];
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("world gui"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<GuiVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &attrs,
-                })],
+            crate::d3d11::shaders::VS_FX_STRIP,
+        );
+
+        let vs_particle = d3d11::create_vs(device, crate::d3d11::shaders::VS_FX_PARTICLE);
+        let il_particle = d3d11::create_input_layout(
+            device,
+            &[
+                elem_i(0, DXGI_FORMAT_R32G32B32_FLOAT),
+                elem_i(1, DXGI_FORMAT_R32_FLOAT),
+                elem_i(2, DXGI_FORMAT_R32G32B32_FLOAT),
+                elem_i(3, DXGI_FORMAT_R32_FLOAT),
+                elem_i(4, DXGI_FORMAT_R32G32B32_FLOAT),
+                elem_i(5, DXGI_FORMAT_R32_FLOAT),
+                elem_i(6, DXGI_FORMAT_R32G32_FLOAT),
+                elem_i(7, DXGI_FORMAT_R32G32_FLOAT),
+                elem_i(8, DXGI_FORMAT_R32G32_FLOAT),
+                elem_i(9, DXGI_FORMAT_R8G8B8A8_UNORM),
+                elem_i(11, DXGI_FORMAT_R32G32B32A32_FLOAT),
+                elem_i(12, DXGI_FORMAT_R32G32B32_FLOAT),
+                elem_i(13, DXGI_FORMAT_R32G32_UINT),
+            ],
+            crate::d3d11::shaders::VS_FX_PARTICLE,
+        );
+
+        let ps_fx_1x = d3d11::create_ps(device, crate::d3d11::shaders::PS_FX_1X);
+        let ps_fx_msaa = d3d11::create_ps(device, crate::d3d11::shaders::PS_FX_MSAA);
+        let vs_mip = d3d11::create_vs(device, crate::d3d11::shaders::VS_MIP);
+        let ps_mip = d3d11::create_ps(device, crate::d3d11::shaders::PS_MIP);
+        let vs_glass_mask = d3d11::create_vs(device, crate::d3d11::shaders::VS_GLASS_MASK);
+        let ps_glass_in = d3d11::create_ps(device, crate::d3d11::shaders::PS_GLASS_IN);
+        let ps_glass_out = d3d11::create_ps(device, crate::d3d11::shaders::PS_GLASS_OUT);
+
+        let rast_state = d3d11::create_raster_state(device, D3D11_CULL_NONE, false, false, 0, 0.0);
+        let depth_off = d3d11::create_depth_state(device, false, false, D3D11_COMPARISON_ALWAYS);
+        let blend_opaque = d3d11::create_blend_state(device, BlendMode::Opaque);
+        let blend_gui = d3d11::create_blend_state(device, BlendMode::PremulAlpha);
+        let blend_fx = create_fx_blend(device);
+
+        let sampler = d3d11::create_sampler(
+            device,
+            D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            1,
+        );
+        let sampler_wrap = d3d11::create_sampler(
+            device,
+            D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            1,
+        );
+        let sampler_mip = d3d11::create_sampler(
+            device,
+            D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            1,
+        );
+        let sampler_mip_wrap = d3d11::create_sampler(
+            device,
+            D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            D3D11_TEXTURE_ADDRESS_WRAP,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            1,
+        );
+        let mip_sampler = sampler_mip.clone();
+        let sun_sampler = d3d11::create_sampler(
+            device,
+            D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            1,
+        );
+
+        let tone_cb = d3d11::create_cb(device, 640);
+        let (_, lights) = d3d11::create_structured_srv(
+            device,
+            std::mem::size_of::<crate::render::LightRaw>() as u32,
+            1,
+            false,
+            None,
+        );
+
+        let white_init = [255u8; 4];
+        let white_sub = D3D11_SUBRESOURCE_DATA {
+            pSysMem: white_init.as_ptr().cast(),
+            SysMemPitch: 4,
+            SysMemSlicePitch: 0,
+        };
+        let white_tex = d3d11::create_tex2d(
+            device,
+            &Tex2dSpec {
+                width: 1,
+                height: 1,
+                mips: 1,
+                array_size: 1,
+                format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                samples: 1,
+                bind_flags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                misc_flags: 0,
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: target,
-                    // egui's premultiplied blending.
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                        alpha: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::OneMinusDstAlpha,
-                            dst_factor: wgpu::BlendFactor::One,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("world gui"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let sampler_wrap = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("world gui wrap"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let tone_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("world gui tone"),
-            size: 640,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let mip_sampler_desc = |wrap: bool| wgpu::SamplerDescriptor {
-            label: Some("world gui effects"),
-            address_mode_u: if wrap { wgpu::AddressMode::Repeat } else { wgpu::AddressMode::ClampToEdge },
-            address_mode_v: if wrap { wgpu::AddressMode::Repeat } else { wgpu::AddressMode::ClampToEdge },
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            ..Default::default()
-        };
-        let sampler_mip = device.create_sampler(&mip_sampler_desc(false));
-        let sampler_mip_wrap = device.create_sampler(&mip_sampler_desc(true));
-        let mip_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("world gui mip build"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let mip_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("world gui mips"),
-            source: wgpu::ShaderSource::Wgsl(MIP_SHADER.into()),
-        });
-        let mip_bgl = tex_bgl.clone();
-        let mip_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("world gui mips"),
-            bind_group_layouts: &[Some(&mip_bgl)],
-            immediate_size: 0,
-        });
-        let mip_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("world gui mips"),
-            layout: Some(&mip_layout),
-            vertex: wgpu::VertexState {
-                module: &mip_module,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[],
+            Some(&[white_sub]),
+        );
+        let white_srv = d3d11::create_srv_2d(device, &white_tex, DXGI_FORMAT_R8G8B8A8_UNORM, false, 0, 1);
+
+        let sun_atlas_tex = d3d11::create_tex2d(
+            device,
+            &Tex2dSpec {
+                width: 1,
+                height: 1,
+                mips: 1,
+                array_size: 1,
+                format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                samples: 1,
+                bind_flags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                misc_flags: 0,
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &mip_module,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-        // Into the effects' buffer (`effects`): world GUIs, strips and
-        // particles, premultiplied, alpha kept (round 27).
-        let fx_into = |label: &str, entry: &str, stride: usize, step: wgpu::VertexStepMode, attributes: &[wgpu::VertexAttribute]| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &module,
-                    entry_point: Some(entry),
-                    compilation_options: Default::default(),
-                    buffers: &[Some(wgpu::VertexBufferLayout { array_stride: stride as u64, step_mode: step, attributes })],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some("fs_fx"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: FX_FORMAT,
-                        blend: Some(wgpu::BlendState {
-                            color: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::One,
-                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                            alpha: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::Zero,
-                                dst_factor: wgpu::BlendFactor::One,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                        }),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let fx_pipeline = fx_into("world gui effects", "vs", std::mem::size_of::<GuiVertex>(), wgpu::VertexStepMode::Vertex, &attrs);
-        let strip_pipeline = fx_into("effects strips", "vs_strip", std::mem::size_of::<FxVertex>(), wgpu::VertexStepMode::Vertex, &strip_attrs);
-        let particle_pipeline = fx_into("effects particles", "vs_particle", std::mem::size_of::<FxParticle>(), wgpu::VertexStepMode::Instance, &particle_attrs);
-        let fx_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("world gui effects buffer"),
-            source: wgpu::ShaderSource::Wgsl(FX_SHADER.into()),
-        });
-        let fx_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("world gui effects buffer"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            }],
-        });
-        let fx_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("world gui effects buffer"),
-            bind_group_layouts: &[Some(&fx_bgl)],
-            immediate_size: 0,
-        });
-        let full = |label: &str, entry: &str| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&fx_layout),
-                vertex: wgpu::VertexState {
-                    module: &fx_module,
-                    entry_point: Some("vs"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &fx_module,
-                    entry_point: Some(entry),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState { format: FX_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let fx_in = full("world gui effects in", "fs_in");
-        let fx_out = full("world gui effects out", "fs_out");
-        let no_lights = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("effects no lights"),
-            size: std::mem::size_of::<crate::render::LightRaw>() as u64,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let white = {
-            let tex = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("effects white"),
-                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            queue.write_texture(
-                tex.as_image_copy(),
-                &[255u8; 4],
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: None },
-                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-            );
-            let view = tex.create_view(&Default::default());
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("effects white"),
-                layout: &tex_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
-                ],
-            })
-        };
+            None,
+        );
+        let sun_atlas = d3d11::create_srv_2d(
+            device,
+            &sun_atlas_tex,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            false,
+            0,
+            1,
+        );
+
+        let sun_grid_tex = d3d11::create_tex3d(
+            device,
+            1,
+            1,
+            1,
+            1,
+            DXGI_FORMAT_R8G8_UNORM,
+            D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            None,
+        );
+        let sun_grid = d3d11::create_srv_3d(device, &sun_grid_tex, DXGI_FORMAT_R8G8_UNORM, 1);
+
         WorldGuiPass {
-            white,
-            fx_pipeline,
-            strip_pipeline,
-            particle_pipeline,
-            lights: no_lights,
-            n_lights: 0,
-            bufs: Default::default(),
-            glass: Default::default(),
-            tex_groups: Default::default(),
-            native_seen: Default::default(),
-            fx_bgl,
-            fx_in,
-            fx_out,
-            fx_tex: None,
-            sun_atlas: device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("unshadowed GUI fallback"), size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-                mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba16Float, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
-            }).create_view(&Default::default()),
-            sun_sampler: device.create_sampler(&wgpu::SamplerDescriptor {
-                label: Some("sun shadow cascades"),
-                mag_filter: wgpu::FilterMode::Linear,
-                min_filter: wgpu::FilterMode::Linear,
-                ..Default::default()
-            }),
-            sun_grid: device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("unshadowed beam grid fallback"), size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-                mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D3,
-                format: wgpu::TextureFormat::Rg8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
-            }).create_view(&Default::default()),
+            tone_cb,
+            sun_atlas,
+            sun_sampler,
+            sun_grid,
             lightgrid: [0.0; 4],
             sun_params: [0.0, 580.0, 0.05, 0.0],
             sun_cascades: Default::default(),
-            tone_buf,
-            pipeline,
-            depth_bgl,
-            tex_bgl,
+            vs_gui,
+            ps_gui_1x,
+            ps_gui_msaa,
+            il_gui,
+            vs_strip,
+            il_strip,
+            vs_particle,
+            il_particle,
+            ps_fx_1x,
+            ps_fx_msaa,
+            vs_mip,
+            ps_mip,
+            vs_glass_mask,
+            ps_glass_in,
+            ps_glass_out,
+            rast_state,
+            depth_off,
+            blend_opaque,
+            blend_gui,
+            blend_fx,
             sampler,
             sampler_wrap,
             mips: Default::default(),
-            mip_pipeline,
-            mip_bgl,
             mip_sampler,
             sampler_mip,
             sampler_mip_wrap,
             frame: 0,
+            lights,
+            n_lights: 0,
+            bufs: Default::default(),
+            glass: Default::default(),
+            tex_cache: Default::default(),
+            native_seen: Default::default(),
+            white_srv,
+            fx_tex: None,
         }
     }
 
@@ -1256,85 +701,111 @@ impl WorldGuiPass {
     /// frame, not kept from the first frame: a SurfaceGui whose text size
     /// was first laid out after the copy was made drew nothing (Place A's
     /// Liquid Divinium counter).
-    fn mipped(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, live: bool) -> wgpu::TextureView {
+    fn mipped(
+        &mut self,
+        device: &ID3D11Device,
+        ctx: &ID3D11DeviceContext,
+        id: egui::TextureId,
+        src_srv: &ID3D11ShaderResourceView,
+        size: [u32; 2],
+        live: bool,
+    ) -> ID3D11ShaderResourceView {
         let frame = self.frame;
-        let reuse = match self.mips.get_mut(tex) {
-            Some((_, view, used)) if !live || *used == frame => {
-                *used = frame;
-                return view.clone();
+        let src_raw = src_srv.as_raw() as usize;
+        let reuse = match self.mips.get_mut(&id) {
+            Some(c) if c.src_raw == src_raw && c.size == size && (!live || c.used == frame) => {
+                c.used = frame;
+                return c.full_srv.clone();
             }
-            Some((copy, view, used)) => {
-                *used = frame;
-                Some((copy.clone(), view.clone()))
+            Some(c) if c.src_raw == src_raw && c.size == size => {
+                c.used = frame;
+                true
             }
-            None => None,
+            _ => false,
         };
-        let size = tex.size();
-        let levels = 32 - size.width.max(size.height).max(1).leading_zeros();
-        let mipped = if let Some((copy, _)) = &reuse { copy.clone() } else { device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("world gui effect texture"),
-            size: wgpu::Extent3d { width: size.width, height: size.height, depth_or_array_layers: 1 },
-            mip_level_count: levels,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        }) };
-        let level_view = |l: u32| {
-            mipped.create_view(&wgpu::TextureViewDescriptor {
-                base_mip_level: l,
-                mip_level_count: Some(1),
-                ..Default::default()
-            })
-        };
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world gui mips") });
-        for l in 0..levels {
-            let src = if l == 0 { tex.create_view(&Default::default()) } else { level_view(l - 1) };
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("world gui mips"),
-                layout: &self.mip_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.mip_sampler) },
-                ],
-            });
-            let dst = level_view(l);
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("world gui mip"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &dst,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.mip_pipeline);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.draw(0..3, 0..1);
+        if !reuse {
+            let levels = 32 - size[0].max(size[1]).max(1).leading_zeros();
+            let tex = d3d11::create_tex2d(
+                device,
+                &Tex2dSpec {
+                    width: size[0],
+                    height: size[1],
+                    mips: levels,
+                    array_size: 1,
+                    format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    samples: 1,
+                    bind_flags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+                    misc_flags: 0,
+                },
+                None,
+            );
+            let full_srv = d3d11::create_srv_2d(
+                device,
+                &tex,
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                false,
+                0,
+                levels,
+            );
+            let mut level_rtvs = Vec::with_capacity(levels as usize);
+            let mut level_srvs = Vec::with_capacity(levels as usize);
+            for l in 0..levels {
+                level_rtvs.push(d3d11::create_rtv(device, &tex, DXGI_FORMAT_R8G8B8A8_UNORM, l, false));
+                level_srvs.push(d3d11::create_srv_2d(
+                    device,
+                    &tex,
+                    DXGI_FORMAT_R8G8B8A8_UNORM,
+                    false,
+                    l,
+                    1,
+                ));
+            }
+            self.mips.insert(
+                id,
+                MipChain {
+                    src_raw,
+                    size,
+                    full_srv,
+                    level_rtvs,
+                    level_srvs,
+                    used: frame,
+                },
+            );
         }
-        crate::gpu_timing::submit(device, queue, "gpu: world gui mips", [enc.finish()]);
-        if let Some((_, view)) = reuse {
-            return view;
-        }
-        let view = mipped.create_view(&Default::default());
-        self.mips.insert(tex.clone(), (mipped, view.clone(), frame));
-        view
+        let chain = self.mips.get(&id).expect("mip chain");
+        crate::gpu_timing::scope(device, ctx, "gpu: world gui mips", || unsafe {
+            ctx.IASetInputLayout(None);
+            ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx.VSSetShader(&self.vs_mip, None);
+            ctx.PSSetShader(&self.ps_mip, None);
+            ctx.RSSetState(&self.rast_state);
+            ctx.OMSetDepthStencilState(&self.depth_off, 0);
+            ctx.OMSetBlendState(&self.blend_opaque, None, 0xffff_ffff);
+            let samplers = [Some(self.mip_sampler.clone())];
+            ctx.PSSetSamplers(1, Some(&samplers));
+
+            for l in 0..chain.level_rtvs.len() {
+                let mw = (size[0] >> l as u32).max(1);
+                let mh = (size[1] >> l as u32).max(1);
+                d3d11::set_viewport(ctx, 0.0, 0.0, mw as f32, mh as f32);
+                let src = if l == 0 { src_srv } else { &chain.level_srvs[l - 1] };
+                ctx.ClearRenderTargetView(&chain.level_rtvs[l], &[0.0, 0.0, 0.0, 0.0]);
+                ctx.OMSetRenderTargets(Some(&[Some(chain.level_rtvs[l].clone())]), None);
+                ctx.PSSetShaderResources(7, Some(&[Some(src.clone())]));
+                ctx.Draw(3, 0);
+                ctx.OMSetRenderTargets(None, None);
+                d3d11::unbind_ps_srvs(ctx, 7, 1);
+            }
+        });
+        chain.full_srv.clone()
     }
 
     /// The world GUIs (`batches`) and, into the scene, the effects (`fx`),
-    /// uploaded into the kept buffers: the depth / tone bind group, and per
-    /// draw its kind, its texture's bind group and its index / instance
-    /// range.
+    /// uploaded into the kept buffers.
     #[allow(clippy::too_many_arguments)]
     fn upload(
         &mut self,
-        rs: &egui_wgpu::RenderState,
-        depth: &wgpu::TextureView,
+        rs: &RenderState,
         batches: &[GuiBatch],
         fx: Option<&FxFrame>,
         tone_curve: Option<[f32; 5]>,
@@ -1346,12 +817,27 @@ impl WorldGuiPass {
             return None;
         }
         let device = &rs.device;
+        let ctx = &rs.context;
         let t = tone_curve.unwrap_or([0.0; 5]);
-        let u: [f32; 16] = [
-            t[0], t[1], t[2], t[3], t[4], if tone_curve.is_some() { 1.0 } else { 0.0 }, crate::mech::NEAR, crate::mech::FX_LIGHT_CLAMP,
-            fog[0], fog[1], fog[2], fog[3], fog_rgb[0], fog_rgb[1], fog_rgb[2], 0.0,
-        ];
-        let mut u = u.to_vec();
+        let mut u = Vec::with_capacity(160);
+        u.extend_from_slice(&[
+            t[0],
+            t[1],
+            t[2],
+            t[3],
+            t[4],
+            if tone_curve.is_some() { 1.0 } else { 0.0 },
+            crate::mech::NEAR,
+            crate::mech::FX_LIGHT_CLAMP,
+            fog[0],
+            fog[1],
+            fog[2],
+            fog[3],
+            fog_rgb[0],
+            fog_rgb[1],
+            fog_rgb[2],
+            0.0,
+        ]);
         u.extend(self.sun_cascades.local.iter().flatten().flatten().copied());
         u.extend(self.sun_cascades.sphere.iter().flatten().copied());
         u.extend(self.sun_cascades.rect.iter().flatten().copied());
@@ -1368,190 +854,266 @@ impl WorldGuiPass {
         u.extend(f.light[2]);
         u.extend(f.light[3]);
         u.extend(f.right);
-        rs.queue.write_buffer(&self.tone_buf, 0, bytemuck::cast_slice(&u));
-        // (storage bindings can't be empty)
-        let st = wgpu::BufferUsages::STORAGE;
+        d3d11::update_dynamic(ctx, &self.tone_cb, bytemuck::cast_slice(&u));
+
+        // Structured buffers can't be empty.
         let pad = [FxGlass::default()];
         let [g0, g1] = &mut self.glass;
-        fill(device, &rs.queue, g0, st, bytemuck::cast_slice(if f.glass.is_empty() { &pad } else { &f.glass }));
-        fill(device, &rs.queue, g1, st, bytemuck::cast_slice(if f.glass_idx.is_empty() { &[0u32][..] } else { &f.glass_idx }));
+        fill_structured(
+            device,
+            ctx,
+            g0,
+            std::mem::size_of::<FxGlass>() as u32,
+            bytemuck::cast_slice(if f.glass.is_empty() { &pad } else { &f.glass }),
+        );
+        fill_structured(
+            device,
+            ctx,
+            g1,
+            std::mem::size_of::<u32>() as u32,
+            bytemuck::cast_slice(if f.glass_idx.is_empty() { &[0u32][..] } else { &f.glass_idx }),
+        );
         let (Some(g0), Some(g1)) = (&self.glass[0], &self.glass[1]) else { return None };
-        let depth_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("world gui depth"),
-            layout: &self.depth_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth) },
-                wgpu::BindGroupEntry { binding: 1, resource: self.tone_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.sun_atlas) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.sun_sampler) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.sun_grid) },
-                wgpu::BindGroupEntry { binding: 5, resource: self.lights.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: g0.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: g1.as_entire_binding() },
-            ],
-        });
-        // A bind group per egui texture (and sampler).
+        let glass_srv = g0.srv.clone();
+        let glass_idx_srv = g1.srv.clone();
+
         self.frame += 1;
-        // (effects' textures unused for a while are let go)
         let frame = self.frame;
-        self.mips.retain(|_, (_, _, used)| frame - *used < 600);
-        let egui = rs.renderer.read();
-        self.tex_groups.retain(|_, (_, _, used)| frame - *used < 600);
-        // (kept from frame to frame while egui's texture for the id is the
-        // same one: making the bind groups again each frame was most of
-        // this pass's CPU time)
-        let group = |this: &mut Self, id: egui::TextureId, wrap: bool| -> Option<wgpu::BindGroup> {
-            let (tex, native_gen) = match egui.texture(&id).and_then(|t| t.texture.clone()) {
-                Some(t) => (t, None),
-                None => {
-                    let (t, g) = native(id)?;
-                    (t, Some(g))
-                }
-            };
-            let mipped = tex.size().width.max(tex.size().height) > 1;
-            // (the font atlas changes in place: its copy is refilled once a
-            // frame; a ViewportFrame's image when it was drawn again)
-            let native_new = native_gen.is_some_and(|g| this.native_seen.insert(id, g) != Some(g));
+        self.mips.retain(|_, c| frame - c.used < 600);
+        self.tex_cache.retain(|_, (_, _, _, _, used)| frame - *used < 600);
+
+        let group = |this: &mut Self,
+                     id: egui::TextureId,
+                     wrap: bool|
+         -> Option<(ID3D11ShaderResourceView, ID3D11SamplerState)> {
+            let (src_srv, size) = rs.texture_srv(id)?;
+            let src_raw = src_srv.as_raw() as usize;
+            let gen_opt = native_gen(id);
+            let native_new = gen_opt.is_some_and(|g| this.native_seen.insert(id, g) != Some(g));
             let live = id == egui::TextureId::default() || native_new;
-            let kept = match this.tex_groups.get_mut(&(id, wrap)) {
-                Some((t, bg, used)) if *t == tex => Some((bg.clone(), std::mem::replace(used, frame) != frame)),
-                _ => None,
-            };
-            if let Some((bg, first)) = kept {
-                if first && live && mipped {
-                    this.mipped(device, &rs.queue, &tex, true);
+            let mipped = size[0].max(size[1]) > 1;
+            if let Some((cached_raw, cached_size, view, samp, used)) =
+                this.tex_cache.get_mut(&(id, wrap))
+            {
+                if *cached_raw == src_raw && *cached_size == size {
+                    let first = std::mem::replace(used, frame) != frame;
+                    let view_out = view.clone();
+                    let samp_out = samp.clone();
+                    if first && live && mipped {
+                        let new_view = this.mipped(device, ctx, id, &src_srv, size, true);
+                        if let Some((_, _, v, _, _)) = this.tex_cache.get_mut(&(id, wrap)) {
+                            *v = new_view.clone();
+                        }
+                        return Some((new_view, samp_out));
+                    }
+                    return Some((view_out, samp_out));
                 }
-                return Some(bg);
             }
-            let (view, sampler) = if mipped {
-                (this.mipped(device, &rs.queue, &tex, live), if wrap { &this.sampler_mip_wrap } else { &this.sampler_mip })
+            let (view, samp) = if mipped {
+                (
+                    this.mipped(device, ctx, id, &src_srv, size, live),
+                    if wrap {
+                        this.sampler_mip_wrap.clone()
+                    } else {
+                        this.sampler_mip.clone()
+                    },
+                )
             } else {
-                (tex.create_view(&Default::default()), if wrap { &this.sampler_wrap } else { &this.sampler })
+                (
+                    src_srv,
+                    if wrap {
+                        this.sampler_wrap.clone()
+                    } else {
+                        this.sampler.clone()
+                    },
+                )
             };
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("world gui texture"),
-                layout: &this.tex_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-                ],
-            });
-            this.tex_groups.insert((id, wrap), (tex, bg.clone(), frame));
-            Some(bg)
+            this.tex_cache
+                .insert((id, wrap), (src_raw, size, view.clone(), samp.clone(), frame));
+            Some((view, samp))
         };
+
         let mut vertices: Vec<GuiVertex> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
-        let mut draws: Vec<(Kind, wgpu::BindGroup, u32, u32)> = Vec::new();
+        let mut draws: Vec<(Kind, ID3D11ShaderResourceView, ID3D11SamplerState, u32, u32)> = Vec::new();
         for b in batches {
             let Some(id) = b.texture else { continue };
             if b.indices.is_empty() {
                 continue;
             }
-            let Some(bg) = group(self, id, b.wrap) else { continue };
+            let Some((srv, samp)) = group(self, id, b.wrap) else { continue };
             let base = vertices.len() as u32;
             let start = indices.len() as u32;
             vertices.extend_from_slice(&b.vertices);
             indices.extend(b.indices.iter().map(|i| base + i));
-            draws.push((Kind::Gui, bg, start, indices.len() as u32));
+            draws.push((Kind::Gui, srv, samp, start, indices.len() as u32));
         }
         // Effects after the world GUIs, far to near. (An untextured effect
-        // reads egui's white texel: a 1×1 white texture, not the font
-        // atlas, whose mips would be refilled every frame for it.)
+        // reads a 1×1 white texture instead of the font atlas, so its mips
+        // needn't be refilled every frame for it.)
         for d in &f.draws {
-            let bg = if d.texture == egui::TextureId::default() { Some(self.white.clone()) } else { group(self, d.texture, d.wrap) };
-            let Some(bg) = bg else { continue };
-            draws.push((if d.particles { Kind::Particles } else { Kind::Strip }, bg, d.start, d.end));
+            let tex = if d.texture == egui::TextureId::default() {
+                Some((self.white_srv.clone(), self.sampler.clone()))
+            } else {
+                group(self, d.texture, d.wrap)
+            };
+            let Some((srv, samp)) = tex else { continue };
+            draws.push((
+                if d.particles { Kind::Particles } else { Kind::Strip },
+                srv,
+                samp,
+                d.start,
+                d.end,
+            ));
         }
-        drop(egui);
         if draws.is_empty() {
             return None;
         }
-        let (q, v, i) = (&rs.queue, wgpu::BufferUsages::VERTEX, wgpu::BufferUsages::INDEX);
+        let vb_flag = D3D11_BIND_VERTEX_BUFFER.0 as u32;
+        let ib_flag = D3D11_BIND_INDEX_BUFFER.0 as u32;
         let [b0, b1, b2, b3, b4] = &mut self.bufs;
-        fill(device, q, b0, v, bytemuck::cast_slice(&vertices));
-        fill(device, q, b1, i, bytemuck::cast_slice(&indices));
-        fill(device, q, b2, v, bytemuck::cast_slice(&f.strips));
-        fill(device, q, b3, i, bytemuck::cast_slice(&f.indices));
-        fill(device, q, b4, v, bytemuck::cast_slice(&f.particles));
-        Some(Upload { depth_bg, draws })
+        fill_dyn(device, ctx, b0, vb_flag, bytemuck::cast_slice(&vertices));
+        fill_dyn(device, ctx, b1, ib_flag, bytemuck::cast_slice(&indices));
+        fill_dyn(device, ctx, b2, vb_flag, bytemuck::cast_slice(&f.strips));
+        fill_dyn(device, ctx, b3, ib_flag, bytemuck::cast_slice(&f.indices));
+        fill_dyn(device, ctx, b4, vb_flag, bytemuck::cast_slice(&f.particles));
+        Some(Upload {
+            glass_srv,
+            glass_idx_srv,
+            draws,
+        })
     }
 
-    fn record(&self, pass: &mut wgpu::RenderPass<'_>, gui: &wgpu::RenderPipeline, up: &Upload) {
-        pass.set_bind_group(0, &up.depth_bg, &[]);
-        let mut bound = None;
-        for (kind, bg, start, end) in &up.draws {
-            if bound != Some(*kind) {
-                let [b0, b1, b2, b3, b4] = &self.bufs;
-                match kind {
-                    Kind::Gui => {
-                        let (Some(vb), Some(ib)) = (b0, b1) else { continue };
-                        pass.set_pipeline(gui);
-                        pass.set_vertex_buffer(0, vb.slice(..));
-                        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &self,
+        ctx: &ID3D11DeviceContext,
+        target_rtv: &ID3D11RenderTargetView,
+        size: [u32; 2],
+        depth_srv: &ID3D11ShaderResourceView,
+        msaa: bool,
+        is_fx: bool,
+        up: &Upload,
+    ) {
+        d3d11::set_viewport(ctx, 0.0, 0.0, size[0] as f32, size[1] as f32);
+        let ps = match (is_fx, msaa) {
+            (false, false) => &self.ps_gui_1x,
+            (false, true) => &self.ps_gui_msaa,
+            (true, false) => &self.ps_fx_1x,
+            (true, true) => &self.ps_fx_msaa,
+        };
+        let blend = if is_fx { &self.blend_fx } else { &self.blend_gui };
+        unsafe {
+            ctx.OMSetRenderTargets(Some(&[Some(target_rtv.clone())]), None);
+            ctx.RSSetState(&self.rast_state);
+            ctx.OMSetDepthStencilState(&self.depth_off, 0);
+            ctx.OMSetBlendState(blend, None, 0xffff_ffff);
+            ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx.PSSetShader(ps, None);
+
+            let cbs = [Some(self.tone_cb.clone())];
+            ctx.VSSetConstantBuffers(0, Some(&cbs));
+            ctx.PSSetConstantBuffers(0, Some(&cbs));
+
+            let s0 = [Some(self.sun_sampler.clone())];
+            ctx.VSSetSamplers(0, Some(&s0));
+            ctx.PSSetSamplers(0, Some(&s0));
+
+            let vs_srvs = [
+                Some(self.sun_grid.clone()),
+                Some(self.lights.clone()),
+                Some(up.glass_srv.clone()),
+                Some(up.glass_idx_srv.clone()),
+            ];
+            ctx.VSSetShaderResources(2, Some(&vs_srvs));
+
+            let ps_srvs = [
+                Some(depth_srv.clone()),
+                Some(self.sun_atlas.clone()),
+                Some(self.sun_grid.clone()),
+            ];
+            ctx.PSSetShaderResources(0, Some(&ps_srvs));
+
+            let mut bound = None;
+            for (kind, srv, samp, start, end) in &up.draws {
+                if bound != Some(*kind) {
+                    let [b0, b1, b2, b3, b4] = &self.bufs;
+                    match kind {
+                        Kind::Gui => {
+                            let (Some(vb), Some(ib)) = (b0, b1) else { continue };
+                            ctx.IASetInputLayout(&self.il_gui);
+                            ctx.VSSetShader(&self.vs_gui, None);
+                            let stride = std::mem::size_of::<GuiVertex>() as u32;
+                            let vbs = [Some(vb.buf.clone())];
+                            ctx.IASetVertexBuffers(0, 1, Some(vbs.as_ptr()), Some(&stride), Some(&0));
+                            ctx.IASetIndexBuffer(&ib.buf, DXGI_FORMAT_R32_UINT, 0);
+                        }
+                        Kind::Strip => {
+                            let (Some(vb), Some(ib)) = (b2, b3) else { continue };
+                            ctx.IASetInputLayout(&self.il_strip);
+                            ctx.VSSetShader(&self.vs_strip, None);
+                            let stride = std::mem::size_of::<FxVertex>() as u32;
+                            let vbs = [Some(vb.buf.clone())];
+                            ctx.IASetVertexBuffers(0, 1, Some(vbs.as_ptr()), Some(&stride), Some(&0));
+                            ctx.IASetIndexBuffer(&ib.buf, DXGI_FORMAT_R32_UINT, 0);
+                        }
+                        Kind::Particles => {
+                            let Some(vb) = b4 else { continue };
+                            ctx.IASetInputLayout(&self.il_particle);
+                            ctx.VSSetShader(&self.vs_particle, None);
+                            let stride = std::mem::size_of::<FxParticle>() as u32;
+                            let vbs = [Some(vb.buf.clone())];
+                            ctx.IASetVertexBuffers(0, 1, Some(vbs.as_ptr()), Some(&stride), Some(&0));
+                        }
                     }
-                    Kind::Strip => {
-                        let (Some(vb), Some(ib)) = (b2, b3) else { continue };
-                        pass.set_pipeline(&self.strip_pipeline);
-                        pass.set_vertex_buffer(0, vb.slice(..));
-                        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                    }
-                    Kind::Particles => {
-                        let Some(vb) = b4 else { continue };
-                        pass.set_pipeline(&self.particle_pipeline);
-                        pass.set_vertex_buffer(0, vb.slice(..));
-                    }
+                    bound = Some(*kind);
                 }
-                bound = Some(*kind);
+                ctx.PSSetShaderResources(6, Some(&[Some(srv.clone())]));
+                ctx.PSSetSamplers(1, Some(&[Some(samp.clone())]));
+                let tris = match kind {
+                    Kind::Particles => 2 * (end - start),
+                    _ => (end - start) / 3,
+                };
+                crate::runtime::domains::services::perf::draw(
+                    crate::runtime::domains::services::perf::UI3D,
+                    1,
+                    tris as u64,
+                );
+                match kind {
+                    Kind::Particles => ctx.DrawInstanced(6, end - start, 0, *start),
+                    _ => ctx.DrawIndexed(end - start, *start, 0),
+                }
             }
-            pass.set_bind_group(1, bg, &[]);
-            let tris = match kind {
-                Kind::Particles => 2 * (end - start),
-                _ => (end - start) / 3,
-            };
-            crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::UI3D, 1, tris as u64);
-            match kind {
-                Kind::Particles => pass.draw(0..6, *start..*end),
-                _ => pass.draw_indexed(*start..*end, 0, 0..1),
-            }
+
+            ctx.OMSetRenderTargets(None, None);
+            ctx.VSSetShaderResources(2, Some(&[None, None, None, None]));
         }
+        d3d11::unbind_ps_srvs(ctx, 0, 8);
     }
 
-    /// Draws the world GUIs among `batches` onto `target` (the shown view),
-    /// tested against `depth`. Effects go through `effects`.
+    /// Draws the world GUIs among `batches` onto `target_rtv` (the shown view),
+    /// tested against `depth_srv`. Effects go through `effects`.
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
-        rs: &egui_wgpu::RenderState,
-        target: &wgpu::TextureView,
-        depth: &wgpu::TextureView,
+        rs: &RenderState,
+        target_rtv: &ID3D11RenderTargetView,
+        size: [u32; 2],
+        depth_srv: &ID3D11ShaderResourceView,
+        msaa: bool,
         batches: &[GuiBatch],
         tone_curve: Option<[f32; 5]>,
         fog: [f32; 4],
         fog_rgb: [f32; 3],
     ) {
-        let Some(up) = self.upload(rs, depth, batches, None, tone_curve, fog, fog_rgb) else { return };
-        let mut enc = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world gui") });
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("world gui"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            self.record(&mut pass, &self.pipeline, &up);
-        }
-        crate::gpu_timing::submit(&rs.device, &rs.queue, "gpu: world gui", [enc.finish()]);
+        let Some(up) = self.upload(rs, batches, None, tone_curve, fog, fog_rgb) else { return };
+        crate::gpu_timing::scope(&rs.device, &rs.context, "gpu: world gui", || {
+            self.record(&rs.context, target_rtv, size, depth_srv, msaa, false, &up);
+        });
     }
 
-    /// Draws world GUIs and effects into the scene's HDR image `hdr`
-    /// (linear light, before postprocessing), blended in the
+    /// Draws world GUIs and effects into the scene's HDR image (`hdr_rtv` / `hdr_srv`,
+    /// linear light, before postprocessing), blended in the
     /// square root of linear light as Studio blends them: the image is
     /// copied into that space, the effects drawn over it far to near, and
     /// squared back. False when there were none (the view needn't be
@@ -1559,10 +1121,12 @@ impl WorldGuiPass {
     #[allow(clippy::too_many_arguments)]
     pub fn effects(
         &mut self,
-        rs: &egui_wgpu::RenderState,
-        hdr: &wgpu::TextureView,
+        rs: &RenderState,
+        hdr_rtv: &ID3D11RenderTargetView,
+        hdr_srv: &ID3D11ShaderResourceView,
         size: [u32; 2],
-        depth: &wgpu::TextureView,
+        depth_srv: &ID3D11ShaderResourceView,
+        msaa: bool,
         batches: &[GuiBatch],
         fx: Option<&FxFrame>,
         tone_curve: Option<[f32; 5]>,
@@ -1571,65 +1135,72 @@ impl WorldGuiPass {
     ) -> bool {
         let up = {
             let _b = crate::bench::scope("fx_upload");
-            self.upload(rs, depth, batches, fx, tone_curve, fog, fog_rgb)
+            self.upload(rs, batches, fx, tone_curve, fog, fog_rgb)
         };
         let Some(up) = up else { return false };
         let _b = crate::bench::scope("fx_encode");
         let device = &rs.device;
-        if self.fx_tex.as_ref().is_none_or(|(s, _)| *s != size) {
-            let view = device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some("world gui effects buffer"),
-                    size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
+        let ctx = &rs.context;
+        if self.fx_tex.as_ref().is_none_or(|(s, _, _)| *s != size) {
+            let tex = d3d11::create_tex2d(
+                device,
+                &Tex2dSpec {
+                    width: size[0],
+                    height: size[1],
+                    mips: 1,
+                    array_size: 1,
                     format: FX_FORMAT,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    view_formats: &[],
-                })
-                .create_view(&Default::default());
-            self.fx_tex = Some((size, view));
+                    samples: 1,
+                    bind_flags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+                    misc_flags: 0,
+                },
+                None,
+            );
+            let rtv = d3d11::create_rtv(device, &tex, FX_FORMAT, 0, false);
+            let srv = d3d11::create_srv_2d(device, &tex, FX_FORMAT, false, 0, 1);
+            self.fx_tex = Some((size, rtv, srv));
         }
-        let Some((_, buf)) = self.fx_tex.as_ref() else { return false };
-        let source = |v: &wgpu::TextureView| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("world gui effects buffer"),
-                layout: &self.fx_bgl,
-                entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(v) }],
-            })
-        };
-        let (from_hdr, from_buf) = (source(hdr), source(buf));
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world gui effects") });
-        let mut step = |label: &str, view: &wgpu::TextureView, f: &mut dyn FnMut(&mut wgpu::RenderPass<'_>)| {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(label),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            f(&mut pass);
-        };
-        step("effects in", buf, &mut |p| {
-            p.set_pipeline(&self.fx_in);
-            p.set_bind_group(0, &from_hdr, &[]);
-            p.draw(0..3, 0..1);
+        let Some((_, fx_rtv, fx_srv)) = self.fx_tex.as_ref() else { return false };
+
+        crate::gpu_timing::scope(device, ctx, "gpu: world gui effects", || {
+            d3d11::set_viewport(ctx, 0.0, 0.0, size[0] as f32, size[1] as f32);
+            unsafe {
+                ctx.IASetInputLayout(None);
+                ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                ctx.VSSetShader(&self.vs_glass_mask, None);
+                ctx.RSSetState(&self.rast_state);
+                ctx.OMSetDepthStencilState(&self.depth_off, 0);
+                ctx.OMSetBlendState(&self.blend_opaque, None, 0xffff_ffff);
+
+                // Effects in: sqrt(max(hdr, 0)) -> fx_tex.
+                ctx.OMSetRenderTargets(Some(&[Some(fx_rtv.clone())]), None);
+                ctx.PSSetShader(&self.ps_glass_in, None);
+                ctx.PSSetShaderResources(7, Some(&[Some(hdr_srv.clone())]));
+                ctx.Draw(3, 0);
+                ctx.OMSetRenderTargets(None, None);
+            }
+            d3d11::unbind_ps_srvs(ctx, 7, 1);
+
+            // World GUIs and effects blended over fx_tex.
+            self.record(ctx, fx_rtv, size, depth_srv, msaa, true, &up);
+
+            // Effects out: square fx_tex -> hdr_rtv.
+            d3d11::set_viewport(ctx, 0.0, 0.0, size[0] as f32, size[1] as f32);
+            unsafe {
+                ctx.IASetInputLayout(None);
+                ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                ctx.VSSetShader(&self.vs_glass_mask, None);
+                ctx.RSSetState(&self.rast_state);
+                ctx.OMSetDepthStencilState(&self.depth_off, 0);
+                ctx.OMSetBlendState(&self.blend_opaque, None, 0xffff_ffff);
+                ctx.OMSetRenderTargets(Some(&[Some(hdr_rtv.clone())]), None);
+                ctx.PSSetShader(&self.ps_glass_out, None);
+                ctx.PSSetShaderResources(7, Some(&[Some(fx_srv.clone())]));
+                ctx.Draw(3, 0);
+                ctx.OMSetRenderTargets(None, None);
+            }
+            d3d11::unbind_ps_srvs(ctx, 7, 1);
         });
-        step("effects", buf, &mut |p| self.record(p, &self.fx_pipeline, &up));
-        step("effects out", hdr, &mut |p| {
-            p.set_pipeline(&self.fx_out);
-            p.set_bind_group(0, &from_buf, &[]);
-            p.draw(0..3, 0..1);
-        });
-        drop(step);
-        crate::gpu_timing::submit(&rs.device, &rs.queue, "gpu: world gui effects", [enc.finish()]);
         true
     }
 }
