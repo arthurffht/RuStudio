@@ -50,6 +50,8 @@ pub struct MenuState {
     pub lua: Vec<String>,
     /// The Volume slider's level before the first change (MasterVolume × 10).
     volume: Option<u32>,
+    /// Last Manual Graphics Quality (`1..=10`) chosen in this session.
+    quality_manual: Option<u8>,
     /// The view has let go of the cursor for this opening of the menu
     /// (viewport.rs: free_cursor_for_menu); false again once it closes.
     pub cursor_freed: bool,
@@ -159,6 +161,7 @@ struct Asked {
     volume: Option<u32>,
     inverted: Option<bool>,
     fullscreen: Option<bool>,
+    quality: Option<u8>,
 }
 
 impl Editor {
@@ -421,16 +424,20 @@ impl Editor {
 
     fn menu_apply(&mut self, ctx: &egui::Context, asked: Asked, rects: HashMap<&'static str, Rect>) {
         let now = self.menu_clock();
-        if let Some(on) = asked.fullscreen {
-            if on != self.ui.fullscreen {
-                self.ui.fullscreen = on;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
-            }
+        let fs_sync = asked.fullscreen.filter(|&on| on != self.ui.fullscreen);
+        if let Some(on) = fs_sync {
+            self.ui.fullscreen = on;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
         }
         let keep = self.harness.keeps_game_settings();
         let Some(s) = self.play.as_mut() else { return };
         let g = &mut s.game;
         g.menu.rects = rects;
+        if let Some(on) = fs_sync {
+            g.menu.lua.push(format!(
+                "UserSettings():GetService(\"UserGameSettings\").Fullscreen = {on}"
+            ));
+        }
         if let Some(p) = asked.page {
             match p {
                 MenuPage::ConfirmReset | MenuPage::ConfirmLeave => {
@@ -484,6 +491,25 @@ impl Editor {
         if let Some(on) = asked.inverted {
             g.menu.lua.push(format!(
                 "UserSettings():GetService(\"UserGameSettings\").CameraYInverted = {on}"
+            ));
+        }
+        if let Some(q) = asked.quality {
+            let q = q.min(10);
+            if q > 0 {
+                g.menu.quality_manual = Some(q);
+            }
+            if keep {
+                crate::game_settings::set_graphics_quality(q);
+            } else {
+                crate::game_settings::set_graphics_quality_runtime(q);
+            }
+            let item = if q == 0 {
+                "Automatic".to_string()
+            } else {
+                format!("QualityLevel{q}")
+            };
+            g.menu.lua.push(format!(
+                "UserSettings():GetService(\"UserGameSettings\").SavedQualityLevel = Enum.SavedQualitySetting.{item}"
             ));
         }
         if asked.close || asked.reset || asked.leave {
@@ -875,6 +901,7 @@ impl Editor {
         let vol = num(ugs("MasterVolume")).unwrap_or(crate::audio::master_volume() as f64);
         let inverted = matches!(ugs("CameraYInverted"), Some(mlua::Value::Boolean(true)));
         let full = self.ui.fullscreen;
+        let quality = crate::game_settings::graphics_quality();
         let label_f = font(&ctx, 16.0 * NOMINAL, Weight::Medium);
         let w = view.width();
         let row = |n: usize| Rect::from_min_size(top + Vec2::new(0.0, 50.0 * n as f32), Vec2::new(w, 50.0));
@@ -897,7 +924,7 @@ impl Editor {
             Pos2::new(r.max.x - 0.6 * w, r.min.y + 3.0),
             Pos2::new(r.max.x - 80.0, r.max.y - 3.0),
         );
-        if let Some(x) = self.menu_slider(ui, p, slider, "sens", step, interactive) {
+        if let Some(x) = self.menu_slider(ui, p, slider, "sens", step, 0, true, interactive) {
             asked.sensitivity = Some(x);
         }
         let tb = Rect::from_min_size(
@@ -917,7 +944,7 @@ impl Editor {
         let r = label(p, n, "Volume");
         let level = (vol * 10.0 + 0.5).floor().clamp(0.0, 10.0) as u32;
         let slider = Rect::from_min_max(Pos2::new(r.max.x - 0.6 * w, r.min.y), r.max);
-        if let Some(x) = self.menu_slider(ui, p, slider, "vol", level, interactive) {
+        if let Some(x) = self.menu_slider(ui, p, slider, "vol", level, 0, true, interactive) {
             asked.volume = Some(x);
         }
         n += 1;
@@ -931,12 +958,43 @@ impl Editor {
             asked.fullscreen = Some(i == 0);
         }
         n += 1;
+        let r = label(p, n, "Graphics Mode");
+        if let Some(i) = self.menu_selector(
+            ui,
+            p,
+            r,
+            w,
+            "gmode",
+            &["Automatic", "Manual"],
+            usize::from(quality > 0),
+            interactive,
+        ) {
+            if i == 0 {
+                asked.quality = Some(0);
+            } else {
+                let manual = self
+                    .play
+                    .as_ref()
+                    .and_then(|s| s.game.menu.quality_manual)
+                    .unwrap_or(5)
+                    .clamp(1, 10);
+                asked.quality = Some(manual);
+            }
+        }
+        n += 1;
+        let r = label(p, n, "Graphics Quality");
+        let slider = Rect::from_min_max(Pos2::new(r.max.x - 0.6 * w, r.min.y), r.max);
+        if let Some(x) = self.menu_slider(ui, p, slider, "gqual", quality as u32, 1, quality > 0, interactive) {
+            asked.quality = Some(x.clamp(1, 10) as u8);
+        }
+        n += 1;
         50.0 * n as f32
     }
 
     /// Utility CreateNewSlider: Less / More arrows (32 wide) round `steps`
     /// bars 24 tall and 4 apart, IGM_Selected up to the value, Flint after;
     /// the end bars rounded. Returns a new value when clicked.
+    #[allow(clippy::too_many_arguments)]
     fn menu_slider(
         &mut self,
         ui: &mut egui::Ui,
@@ -944,6 +1002,8 @@ impl Editor {
         r: Rect,
         id: &'static str,
         value: u32,
+        min_step: u32,
+        enabled: bool,
         interactive: bool,
     ) -> Option<u32> {
         const STEPS: u32 = 10;
@@ -953,9 +1013,16 @@ impl Editor {
         let more = Rect::from_min_size(Pos2::new(r.max.x - arrow_w, r.min.y), Vec2::new(arrow_w, r.height()));
         let steps = Rect::from_center_size(r.center(), Vec2::new(r.width() - 100.0, r.height()));
         let mut out = None;
+        let can_edit = interactive && enabled;
         for (ar, img, dir) in [(less, LESS, -1i32), (more, MORE, 1)] {
             let resp = ui.interact(ar, ui.id().with(("game_menu_slider", id, dir)), Sense::click());
-            let c = if interactive && resp.hovered() { Color32::WHITE } else { ARROW };
+            let c = if !enabled {
+                ARROW.gamma_multiply(0.35)
+            } else if can_edit && resp.hovered() {
+                Color32::WHITE
+            } else {
+                ARROW
+            };
             if let Some((tex, _)) = self.gui.texture(&ctx, &mut self.assets, None, img) {
                 p.image(
                     tex,
@@ -964,16 +1031,16 @@ impl Editor {
                     c,
                 );
             }
-            if interactive && resp.clicked() {
-                out = Some((value as i32 + dir).clamp(0, STEPS as i32) as u32);
+            if can_edit && resp.clicked() {
+                out = Some((value as i32 + dir).clamp(min_step as i32, STEPS as i32) as u32);
             }
         }
         let sw = steps.width() / STEPS as f32;
         let resp = ui.interact(steps, ui.id().with(("game_menu_steps", id)), Sense::click_and_drag());
-        if interactive && (resp.clicked() || resp.dragged()) {
+        if can_edit && (resp.clicked() || resp.dragged()) {
             if let Some(q) = resp.interact_pointer_pos() {
                 let i = ((q.x - steps.min.x) / sw).floor() as i32 + 1;
-                out = Some(i.clamp(1, STEPS as i32) as u32);
+                out = Some(i.clamp(min_step.max(1) as i32, STEPS as i32) as u32);
             }
         }
         let shown = out.unwrap_or(value);
@@ -982,7 +1049,13 @@ impl Editor {
                 Pos2::new(steps.min.x + (i - 1) as f32 * sw + 2.0, steps.center().y - 12.0),
                 Vec2::new(sw - 4.0, 24.0),
             );
-            let c = if i <= shown { SELECTED } else { FLINT };
+            let c = if !enabled {
+                FLINT.gamma_multiply(0.55)
+            } else if i <= shown {
+                SELECTED
+            } else {
+                FLINT
+            };
             let cr = match i {
                 1 => CornerRadius { nw: RADIUS as u8, sw: RADIUS as u8, ne: 0, se: 0 },
                 STEPS => CornerRadius { nw: 0, sw: 0, ne: RADIUS as u8, se: RADIUS as u8 },

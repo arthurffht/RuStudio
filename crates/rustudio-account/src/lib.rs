@@ -1,7 +1,7 @@
 //! Roblox account layer for rustudio (docs/AUTH.md).
 //!
-//! One sign-in: the `.ROBLOSECURITY` session cookie, from the login keyring
-//! (or imported from `~/.config/rustudio/roblox-cookie`). Signed in means
+//! One sign-in: the `.ROBLOSECURITY` session cookie, from Windows Credential
+//! Manager (or imported from `%APPDATA%\rustudio\roblox-cookie`). Signed in means
 //! `users.roblox.com/v1/users/authenticated` accepted it. Over the session:
 //! the profile, the avatar description, the account's experiences, asset
 //! and place downloads, and state-changing calls with the X-CSRF-TOKEN

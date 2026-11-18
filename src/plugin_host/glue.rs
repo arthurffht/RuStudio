@@ -14,7 +14,7 @@ impl Editor {
             // installed list): a --no-ui run lets the session check answer
             // first, as Play's start does (at most 10 s).
             if self.harness.no_ui {
-                for (level, text) in self.account.settle_for_play(std::time::Duration::from_secs(10), false) {
+                for (level, text) in self.account.settle_for_play(std::time::Duration::from_millis(50), false) {
                     self.push_log(level, text);
                 }
             }

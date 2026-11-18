@@ -1044,37 +1044,59 @@ fn face_file(
 }
 
 /// Fonts for glyphs a game font lacks, in order: Studio's Builder Sans and
-/// Source Sans Pro, its Noto UI script faces (content/fonts), then broad
-/// symbol fonts installed on the system (Noto Sans Symbols 1 / 2, DejaVu Sans).
+/// Source Sans Pro, its Noto UI/CJK script faces (content/fonts and
+/// PlatformContent/pc/fonts), then Windows system fallback faces.
 pub(crate) fn fallback_fonts() -> &'static [&'static [u8]] {
-    static FONTS: std::sync::OnceLock<Vec<&'static [u8]>> = std::sync::OnceLock::new();
-    FONTS.get_or_init(|| {
+    static FONTS: std::sync::OnceLock<std::sync::RwLock<(u64, &'static [&'static [u8]])>> =
+        std::sync::OnceLock::new();
+    let load = || -> &'static [&'static [u8]] {
         let content = crate::assets::content_dir().join("fonts");
         let mut files: Vec<std::path::PathBuf> = ["BuilderSans-Regular.otf", "SourceSansPro-Regular.ttf"]
             .iter()
             .map(|f| content.join(f))
             .collect();
-        let mut scripts: Vec<std::path::PathBuf> = std::fs::read_dir(&content)
-            .map(|d| {
-                d.flatten()
-                    .map(|e| e.path())
-                    .filter(|p| {
-                        p.file_name()
+        let platform_fonts = content
+            .canonicalize()
+            .ok()
+            .as_deref()
+            .unwrap_or(&content)
+            .parent()
+            .and_then(|c| c.parent())
+            .map(|r| r.join("PlatformContent/pc/fonts"));
+        let mut scripts: Vec<std::path::PathBuf> = Vec::new();
+        for dir in [Some(content), platform_fonts].into_iter().flatten() {
+            if let Ok(d) = std::fs::read_dir(&dir) {
+                scripts.extend(d.flatten().map(|e| e.path()).filter(|p| {
+                    p.is_file()
+                        && p.file_name()
                             .and_then(|n| n.to_str())
-                            .is_some_and(|n| n.starts_with("NotoSans") || n.starts_with("NotoNaskh"))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+                            .is_some_and(|n| n.starts_with("Noto"))
+                }));
+            }
+        }
         scripts.sort();
+        scripts.dedup();
         files.extend(scripts);
         files.extend(crate::platform::fallback_font_files().iter().map(std::path::PathBuf::from));
-        files
+        let loaded: Vec<&'static [u8]> = files
             .iter()
             .filter_map(|p| std::fs::read(p).ok())
             .map(|b| &*Box::leak(b.into_boxed_slice()))
-            .collect()
-    })
+            .collect();
+        Box::leak(loaded.into_boxed_slice())
+    };
+    let gen = crate::studio_content::content_generation();
+    let lock = FONTS.get_or_init(|| std::sync::RwLock::new((gen, load())));
+    if let Ok(guard) = lock.read() {
+        if guard.0 == gen {
+            return guard.1;
+        }
+    }
+    let fresh = load();
+    if let Ok(mut guard) = lock.write() {
+        *guard = (gen, fresh);
+    }
+    fresh
 }
 
 impl Gui {

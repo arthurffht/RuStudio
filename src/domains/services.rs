@@ -124,6 +124,7 @@ pub const METHODS: &[(&str, &str)] = &[
     ("SetOnboardingCompleted", "UserGameSettings"),
     ("GetFFlag", "GlobalSettings"),
     ("GetFVariable", "GlobalSettings"),
+    ("GetMaxQualityLevel", "RenderSettings"),
     ("ResolveModulePath", "ScriptService"),
     ("GetOrCreateUniqueIdRemoteCommand", "UniqueIdLookupService"),
     ("GetDataInRange", "MicroProfilerService"),
@@ -559,9 +560,13 @@ fn call_inner(lua: &Lua, name: &str, owner: &str, class: &str, this: Ref, args: 
             arg_str(args, 1, "string")?;
             Err(rt_err("Invalid onboarding ID"))
         }
-        ("UserGameSettings", "InFullScreen") => ok(Value::Boolean(false)),
+        ("UserGameSettings", "InFullScreen") => {
+            let full = matches!(ugs(lua)?.raw_get::<Value>("Fullscreen")?, Value::Boolean(true));
+            ok(Value::Boolean(full))
+        }
         ("UserGameSettings", "InStudioMode") => ok(Value::Boolean(true)),
         ("UserGameSettings", _) => nothing(),
+        ("RenderSettings", "GetMaxQualityLevel") => ok(Value::Integer(21)),
         ("GlobalSettings", _) => {
             let f = arg_str(args, 1, "string")?;
             Err(rt_err(format!("Flag {f} does not exist")))
@@ -1189,6 +1194,9 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
                 None => Value::Nil,
             }
         }
+        "SavedQualityLevel" if class == "UserGameSettings" => {
+            enum_val(lua, "SavedQualitySetting", crate::game_settings::graphics_quality() as u32)?
+        }
         // UserSettings():GetService("UserGameSettings"): the values live in
         // library.luau's table, which the engine reads (RotationType, the
         // game menu's sliders).
@@ -1264,16 +1272,22 @@ fn stats_prop(lua: &Lua, key: &str) -> mlua::Result<Option<Value>> {
             let physics = key.starts_with("Physics");
             Value::Number(perf::kbps(to_client, physics))
         }
-        // The renderer draws the client's view: a server (Run, or Play's
-        // server side) has nothing drawn, as in Studio's Run test.
+        // The renderer draws the client's view and the editor viewport: a
+        // server (Run, or Play's server side) has nothing drawn, as in Studio's Run test.
         _ if key.starts_with("Render") || key.ends_with("Count") => {
-            if world(lua)?.side != Side::Client {
+            let w = world(lua)?;
+            if w.side != Side::Client && w.mode != RunMode::Edit {
                 return Ok(Some(if key.ends_with("Count") { Value::Integer(0) } else { Value::Number(0.0) }));
             }
+            drop(w);
             let f = perf::frame();
+            let gpu_s = {
+                let g = crate::gpu_timing::last_gpu_frame_seconds();
+                if g > 0.0 { g } else { f.gpu_s }
+            };
             match key {
                 "RenderCPUFrameTime" => Value::Number(f.cpu_s),
-                "RenderGPUFrameTime" => Value::Number(f.gpu_s),
+                "RenderGPUFrameTime" => Value::Number(gpu_s),
                 "SceneDrawcallCount" => Value::Integer(f.n[0] as i64),
                 "SceneTriangleCount" => Value::Integer(f.n[1] as i64),
                 "ShadowsDrawcallCount" => Value::Integer(f.n[2] as i64),
@@ -1493,6 +1507,26 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
         // follows (type check, Changed).
         _ if class == "UserGameSettings" => {
             let t = ugs(lua)?;
+            if key == "SavedQualityLevel" {
+                let mut a = MultiValue::new();
+                a.push_back(Value::Nil);
+                a.push_back(value.clone());
+                let q = enum_arg(&a, 1, "SavedQualitySetting")?;
+                let v = enum_val(lua, "SavedQualitySetting", q)?;
+                let old = crate::game_settings::graphics_quality() as u32;
+                t.raw_set(key, v)?;
+                if cfg!(test) {
+                    crate::game_settings::set_graphics_quality_runtime(q as u8);
+                } else {
+                    crate::game_settings::set_graphics_quality(q as u8);
+                }
+                if q != old {
+                    let mut w = world(lua)?;
+                    w.fire(r, "Changed", vec![Value::String(lua.create_string(key)?)]);
+                    w.fire(r, "Changed:SavedQualityLevel", vec![]);
+                }
+                return Ok(true);
+            }
             if !t.raw_get::<Value>(key)?.is_nil() {
                 let mut a = MultiValue::new();
                 a.push_back(Value::Nil);
@@ -1504,17 +1538,20 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
                     },
                     _ => value.clone(),
                 };
-                // RobloxScript members (MasterVolume, CameraYInverted…): the
+                // RobloxScript members (MasterVolume, CameraYInverted, Fullscreen…): the
                 // reflection database lists them as unscriptable, so the
                 // normal write would refuse them as read-only. The identity
                 // check already passed; finish the write here.
                 if crate::runtime::security::member_write_secured(class, key) {
                     let changed = t.raw_get::<Value>(key)? != v;
-                    t.raw_set(key, v)?;
+                    t.raw_set(key, v.clone())?;
                     if changed {
                         let mut w = world(lua)?;
                         w.fire(r, "Changed", vec![Value::String(lua.create_string(key)?)]);
                         w.fire(r, &format!("Changed:{key}"), vec![]);
+                        if key == "Fullscreen" {
+                            w.fire(r, "FullscreenChanged", vec![v]);
+                        }
                     }
                     return Ok(true);
                 }

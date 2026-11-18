@@ -1,5 +1,5 @@
-//! Roblox account window (docs/AUTH.md): one sign-in, the session cookie from the
-//! login keyring (imported once from ~/.config/rustudio/roblox-cookie).
+//! Roblox account window (docs/AUTH.md): one sign-in, the session cookie from
+//! Windows Credential Manager (or imported once from %APPDATA%\rustudio\roblox-cookie).
 //! Network and keyring work runs on background threads; results come back
 //! over a channel and are polled each frame. The cookie never reaches this
 //! module: it stays inside rustudio_account's Session.
@@ -200,23 +200,24 @@ impl AccountUi {
         })
     }
 
-    /// Before Play: lets a session check still running finish, then the
-    /// avatar load, up to `max` (Studio only plays signed in, and its first
-    /// character already wears the account's avatar). Returns the log lines.
-    /// `avatar`: wait for the avatar too (a character spawns at once);
-    /// otherwise the session's identity is enough and the avatar reaches the
-    /// running Play when it arrives (Editor::play_tick).
+    /// Before Play: drains already-finished session/avatar results immediately,
+    /// returning without blocking if signed out, not restoring, or already settled.
+    /// Waits at most `min(max, 50ms)` cooperatively so the Win32 UI thread never freezes.
     pub fn settle_for_play(&mut self, max: std::time::Duration, avatar: bool) -> Vec<(Level, String)> {
+        let mut logs = self.poll();
+        if !self.restored || matches!(self.state, SessionState::SignedOut(_)) {
+            return logs;
+        }
+        let wait_cap = max.min(std::time::Duration::from_millis(50));
         let t0 = std::time::Instant::now();
-        let mut logs = Vec::new();
         loop {
-            logs.extend(self.poll());
-            let checking = matches!(self.state, SessionState::Checking(_)) && self.restored;
+            let checking = matches!(self.state, SessionState::Checking(_));
             let avatar_pending = avatar && self.signed_in() && self.avatar.is_none() && self.busy();
-            if !(checking || avatar_pending) || t0.elapsed() >= max {
+            if !(checking || avatar_pending) || t0.elapsed() >= wait_cap {
                 return logs;
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            logs.extend(self.poll());
         }
     }
 
@@ -530,6 +531,17 @@ impl AccountUi {
         });
     }
 
+    /// Opt-in import of Roblox Studio's Windows Credential Manager login.
+    fn import_from_roblox_studio(&mut self) {
+        self.add_error = None;
+        self.adding_pending = true;
+        self.state = SessionState::Checking(None);
+        self.connect("Importing session from Roblox Studio", true, move |cfg| {
+            let raw = read_roblox_studio_cookie()?;
+            Client::sign_in_with(cfg, &raw)
+        });
+    }
+
     /// Signs the active account out and forgets it on this computer; other
     /// saved accounts stay for switching.
     pub fn sign_out(&mut self) {
@@ -699,6 +711,7 @@ impl Editor {
             SignOut,
             Retry,
             BrowserSignIn,
+            ImportStudio,
         }
         let mut todo: Option<Do> = None;
         let a = &mut self.account;
@@ -826,6 +839,21 @@ impl Editor {
                     );
                     if browser.clicked() {
                         todo = Some(Do::BrowserSignIn);
+                    }
+                    ui.add_space(8.0);
+                    let studio_import = ui.add_enabled(
+                        !a.busy(),
+                        egui::Button::new(RichText::new("Import from Roblox Studio (Windows)").color(theme::TEXT))
+                            .min_size(egui::vec2(ui.available_width(), 26.0)),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Reads your Roblox Studio credential (note: cookie rotation is shared with Studio)")
+                            .size(11.5)
+                            .color(theme::TEXT_DIM),
+                    );
+                    if studio_import.clicked() {
+                        todo = Some(Do::ImportStudio);
                     }
                 }
                 ui.add_space(10.0);
@@ -959,6 +987,7 @@ impl Editor {
             Some(Do::SignOut) => a.sign_out(),
             Some(Do::Retry) => a.sign_in(),
             Some(Do::BrowserSignIn) => a.browser_sign_in(),
+            Some(Do::ImportStudio) => a.import_from_roblox_studio(),
             None => {}
         }
     }
@@ -1002,4 +1031,92 @@ fn pop_row(ui: &mut egui::Ui, icon: &str, label: &str, enabled: bool) -> egui::R
     crate::ti::paint(ui.painter(), ir, icon, if enabled { theme::TEXT_DIM } else { theme::DIVIDER });
     ui.painter().text(egui::pos2(r.min.x + 52.0, r.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(13.0), c);
     resp.on_hover_cursor(if enabled { egui::CursorIcon::PointingHand } else { egui::CursorIcon::Default })
+}
+
+fn decode_cred_blob(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let decoded = if bytes.len() >= 2 && bytes.len().is_multiple_of(2) && bytes.get(1) == Some(&0) {
+        let words: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&words)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    let trimmed = decoded.trim_matches('\0').trim().to_string();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+fn read_cred_blob(target: &str) -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Security::Credentials::{CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC};
+    let target_w: Vec<u16> = target.encode_utf16().chain([0]).collect();
+    let mut ptr: *mut CREDENTIALW = std::ptr::null_mut();
+    // SAFETY: `target_w` is NUL-terminated; `ptr` is freed via `CredFree`.
+    unsafe { CredReadW(PCWSTR(target_w.as_ptr()), CRED_TYPE_GENERIC, None, &mut ptr) }.ok()?;
+    if ptr.is_null() {
+        return None;
+    }
+    struct Guard(*mut CREDENTIALW);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` came from `CredReadW`.
+            unsafe { CredFree(self.0.cast()) };
+        }
+    }
+    let _guard = Guard(ptr);
+    // SAFETY: `CredReadW` succeeded and initialized `*ptr`.
+    let cred = unsafe { &*ptr };
+    if cred.CredentialBlob.is_null() || cred.CredentialBlobSize == 0 {
+        return None;
+    }
+    // SAFETY: `CredentialBlob` points to `CredentialBlobSize` valid bytes until `CredFree`.
+    let bytes = unsafe { std::slice::from_raw_parts(cred.CredentialBlob, cred.CredentialBlobSize as usize) };
+    decode_cred_blob(bytes)
+}
+
+fn read_roblox_studio_cookie() -> Result<String, SignedOut> {
+    let uid = read_cred_blob("https://www.roblox.com:RobloxStudioAuthuserid").ok_or_else(|| {
+        SignedOut::Rejected("No Roblox Studio sign-in found in Windows Credential Manager".into())
+    })?;
+    let uid = uid.trim();
+    if uid.is_empty() || !uid.chars().all(|c| c.is_ascii_digit()) {
+        return Err(SignedOut::Rejected(
+            "Invalid Roblox Studio user id in Windows Credential Manager".into(),
+        ));
+    }
+    let target = format!("https://www.roblox.com:RobloxStudioAuth.ROBLOSECURITY{uid}");
+    read_cred_blob(&target).ok_or_else(|| {
+        SignedOut::Rejected(
+            "No Roblox Studio session cookie found in Windows Credential Manager".into(),
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cred_blob_decodes_utf8_and_utf16() {
+        assert_eq!(decode_cred_blob(b"123456\0").as_deref(), Some("123456"));
+        let wide: Vec<u8> = "98765\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(decode_cred_blob(&wide).as_deref(), Some("98765"));
+        assert_eq!(decode_cred_blob(b""), None);
+    }
+
+    #[test]
+    fn settle_for_play_never_blocks_when_signed_out_or_unrestored() {
+        let mut ui = AccountUi::new();
+        let t0 = std::time::Instant::now();
+        ui.settle_for_play(std::time::Duration::from_secs(20), true);
+        assert!(t0.elapsed() < std::time::Duration::from_millis(200));
+        ui.drop_session();
+        let t1 = std::time::Instant::now();
+        ui.settle_for_play(std::time::Duration::from_secs(20), true);
+        assert!(t1.elapsed() < std::time::Duration::from_millis(200));
+    }
 }

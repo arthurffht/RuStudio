@@ -3922,7 +3922,8 @@ fn device_prop(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option
             stored_or(lua, r, key, |l| Ok(Value::String(l.create_string("")?)))
         }
         ("Lighting", "ClockTime") => Ok(Some(Value::Number(clock_hours(lua, r)? as f64))),
-        ("GuiService", "IsModalDialog" | "IsWindows") => b(false),
+        ("GuiService", "IsModalDialog") => b(false),
+        ("GuiService", "IsWindows") => b(true),
         ("GuiService", "TouchControlsEnabled") => {
             stored_or(lua, r, key, |_| Ok(Value::Boolean(true)))
         }

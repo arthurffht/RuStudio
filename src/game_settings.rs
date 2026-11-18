@@ -29,6 +29,10 @@ pub fn graphics_quality() -> u8 {
     GRAPHICS_QUALITY.load(Ordering::Relaxed).min(10)
 }
 
+pub fn set_graphics_quality_runtime(q: u8) {
+    GRAPHICS_QUALITY.store(q.min(10), Ordering::Relaxed);
+}
+
 pub fn set_graphics_quality(q: u8) {
     let clamped = q.min(10);
     GRAPHICS_QUALITY.store(clamped, Ordering::Relaxed);
@@ -87,6 +91,12 @@ impl GameSettings {
         if let Some(on) = self.inverted {
             v.push(format!("{ugs}.CameraYInverted = {on}"));
         }
+        if self.graphics_quality > 0 {
+            let q = self.graphics_quality.min(10);
+            v.push(format!(
+                "{ugs}.SavedQualityLevel = Enum.SavedQualitySetting.QualityLevel{q}"
+            ));
+        }
         v
     }
 }
@@ -110,6 +120,18 @@ mod tests {
                 format!("{ugs}.MouseSensitivity = 0.37"),
                 format!("{ugs}.MasterVolume = 0.2"),
                 format!("{ugs}.CameraYInverted = true"),
+            ]
+        );
+        let manual = GameSettings { graphics_quality: 4, ..s };
+        let manual_back: GameSettings = serde_json::from_str(&serde_json::to_string(&manual).unwrap()).unwrap();
+        assert_eq!(manual_back, manual);
+        assert_eq!(
+            manual.client_lua(),
+            [
+                format!("{ugs}.MouseSensitivity = 0.37"),
+                format!("{ugs}.MasterVolume = 0.2"),
+                format!("{ugs}.CameraYInverted = true"),
+                format!("{ugs}.SavedQualityLevel = Enum.SavedQualitySetting.QualityLevel4"),
             ]
         );
         assert!(GameSettings::default().client_lua().is_empty());

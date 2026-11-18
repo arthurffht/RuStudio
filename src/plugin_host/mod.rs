@@ -620,7 +620,7 @@ fn studio_place_name(doc: &mut Document) {
 /// `return 1+1` → 2 there; Play DataModels keep refusing it).
 fn edit_loadstring(rt: &Runtime) -> mlua::Result<()> {
     let lua = &rt.lua;
-    let f = lua.create_function(|lua, (src, name): (mlua::String, Option<String>)| {
+    let f = lua.create_function(|lua, (src, name): (mlua::LuaString, Option<String>)| {
         if crate::runtime::security::current(lua) != crate::runtime::security::PLUGIN_IDENT {
             return Err(mlua::Error::runtime("loadstring() is not available"));
         }

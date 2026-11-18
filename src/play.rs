@@ -509,7 +509,7 @@ impl Editor {
             // (No character until a script asks, with CharacterAutoLoads
             // off: the avatar download needn't hold Play's start.)
             let avatar = self.character_auto_loads();
-            for (level, text) in self.account.settle_for_play(std::time::Duration::from_secs(20), avatar) {
+            for (level, text) in self.account.settle_for_play(std::time::Duration::from_millis(50), avatar) {
                 self.push_log(level, text);
             }
         }
@@ -699,6 +699,11 @@ impl Editor {
             }
             if let Some(s) = self.play.as_mut() {
                 s.game.menu.lua.extend(saved.client_lua());
+                if self.ui.fullscreen {
+                    s.game.menu.lua.push(
+                        "UserSettings():GetService(\"UserGameSettings\").Fullscreen = true".into(),
+                    );
+                }
             }
         }
         if !defaults.is_empty() {

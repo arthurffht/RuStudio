@@ -19,7 +19,6 @@
 use mlua::{Function, Lua, MultiValue, Table, Value};
 use rbx_dom_weak::types::{Ref, Variant, VariantType};
 
-use crate::ltypes::*;
 use crate::runtime::*;
 
 #[path = "gui_input_path2d.rs"]
@@ -52,6 +51,7 @@ pub const METHODS: &[(&str, &str)] = &[
     ("RecenterUserHeadCFrame", "UserInputService"),
     ("SetNavigationGamepad", "UserInputService"),
     ("GetFocusedTextBox", "UserInputService"),
+    ("GetPlatform", "UserInputService"),
     // VirtualInput (also its non-Instance form from CreateVirtualInput)
     ("SendKey", "VirtualInput"),
     ("SendMouseButton", "VirtualInput"),
@@ -338,7 +338,7 @@ impl mlua::UserData for LObject {
     fn add_methods<M: mlua::UserDataMethods<Self>>(m: &mut M) {
         m.add_meta_method(mlua::MetaMethod::Index, |_, this, key: String| {
             if key == "ClassName" {
-                return Ok(Value::String(this.methods.raw_get::<mlua::String>("__class")?));
+                return Ok(Value::String(this.methods.raw_get::<mlua::LuaString>("__class")?));
             }
             let f: Value = this.methods.raw_get(key.as_str())?;
             if f.is_nil() || key.starts_with("__") {
@@ -379,6 +379,15 @@ pub fn call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> Option<mlua:
         .map(|(_, b)| *b)?;
     if base == "Path2D" {
         return Some(path2d::call(lua, name, this, args));
+    }
+    if base == "UserInputService" && name == "GetPlatform" {
+        return Some((|| {
+            let v = match LEnumItem::from_name("Platform", "Windows") {
+                Some(item) => enum_value(lua, item)?,
+                None => Value::Nil,
+            };
+            Ok(MultiValue::from_iter([v]))
+        })());
     }
     Some((|| {
         let m: Table = module(lua)?.get("methods")?;

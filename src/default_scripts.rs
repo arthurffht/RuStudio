@@ -53,26 +53,42 @@ pub fn studio_dir() -> Option<PathBuf> {
         let p = PathBuf::from(p);
         return has(&p).then_some(p);
     }
-    // The person's content link usually points at Studio's own content/.
-    if let Ok(target) = std::fs::canonicalize(crate::paths::data().join("rustudio/content")) {
-        if let Some(root) = target.parent() {
-            if has(root) {
-                return Some(root.to_path_buf());
+    static CACHE: std::sync::OnceLock<std::sync::RwLock<(u64, Option<PathBuf>)>> =
+        std::sync::OnceLock::new();
+    let discover = || {
+        // The person's content link usually points at Studio's own content/.
+        if let Ok(target) = std::fs::canonicalize(crate::paths::data().join("rustudio/content")) {
+            if let Some(root) = target.parent() {
+                if has(root) {
+                    return Some(root.to_path_buf());
+                }
             }
         }
-    }
-    // Roblox Studio installed on Windows (%LOCALAPPDATA%\Roblox\Versions\version-*).
-    if let Some(d) = crate::paths::installed_studio() {
-        return Some(d);
-    }
-    // Studio's content downloaded by rustudio itself (studio_content.rs).
-    if let Some(d) = crate::studio_content::installed() {
-        if has(&d) {
+        // Roblox Studio installed on Windows (`Environments\roblox-studio` or `Versions\version-*`).
+        if let Some(d) = crate::paths::installed_studio() {
             return Some(d);
         }
+        // Studio's content downloaded by rustudio itself (studio_content.rs).
+        if let Some(d) = crate::studio_content::installed() {
+            if has(&d) {
+                return Some(d);
+            }
+        }
+        let fallback = crate::paths::data().join("rustudio/studio");
+        has(&fallback).then_some(fallback)
+    };
+    let gen = crate::studio_content::content_generation();
+    let lock = CACHE.get_or_init(|| std::sync::RwLock::new((gen, discover())));
+    if let Ok(guard) = lock.read() {
+        if guard.0 == gen {
+            return guard.1.clone();
+        }
     }
-    let fallback = crate::paths::data().join("rustudio/studio");
-    has(&fallback).then_some(fallback)
+    let fresh = discover();
+    if let Ok(mut guard) = lock.write() {
+        *guard = (gen, fresh.clone());
+    }
+    fresh
 }
 
 const PLAYER_SCRIPTS: &str = "ExtraContent/scripts/PlayerScripts";

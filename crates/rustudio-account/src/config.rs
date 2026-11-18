@@ -1,7 +1,7 @@
-//! `~/.config/rustudio/account.toml`: saved experience/place bookmarks and
+//! `%APPDATA%\rustudio\account.toml`: saved experience/place bookmarks and
 //! whether the person signed out. No secret ever lives here: the session
-//! cookie is in the login keyring (see [`crate::session`]) and the
-//! publishing key in the system keyring (see [`crate::store`]).
+//! cookie is in Windows Credential Manager (see [`crate::session`]) and the
+//! publishing key in [`crate::store`].
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
