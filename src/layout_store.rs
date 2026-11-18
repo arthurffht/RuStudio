@@ -308,10 +308,92 @@ pub fn saved_popped(panels: &Panels) -> Vec<SavedPopped> {
         .collect()
 }
 
+fn hash_rect(h: &mut impl std::hash::Hasher, r: egui::Rect) {
+    use std::hash::Hash;
+    let r = if r.is_finite() { r } else { egui::Rect::ZERO };
+    r.min.x.to_bits().hash(h);
+    r.min.y.to_bits().hash(h);
+    r.max.x.to_bits().hash(h);
+    r.max.y.to_bits().hash(h);
+}
+
+fn hash_dock(h: &mut impl std::hash::Hasher, dock: &DockState<Tab>) {
+    use std::hash::Hash;
+    let mut nodes = 0usize;
+    for (surf, node) in dock.iter_all_nodes() {
+        nodes += 1;
+        surf.surface.0.hash(h);
+        surf.node.0.hash(h);
+        match node {
+            egui_dock::Node::Leaf(l) => {
+                0u8.hash(h);
+                hash_rect(h, l.rect);
+                hash_rect(h, l.viewport);
+                l.active.0.hash(h);
+                let scroll = if l.scroll.is_finite() { l.scroll } else { 0.0 };
+                scroll.to_bits().hash(h);
+                l.collapsed.hash(h);
+                for t in l.tabs() {
+                    if let Some(st) = SavedTab::from_tab(t) {
+                        std::mem::discriminant(&st).hash(h);
+                    }
+                }
+            }
+            egui_dock::Node::Vertical(s) => {
+                1u8.hash(h);
+                hash_rect(h, s.rect);
+                let f = if s.fraction.is_finite() { s.fraction } else { 0.5 };
+                f.to_bits().hash(h);
+                s.fully_collapsed.hash(h);
+                s.collapsed_leaf_count.hash(h);
+            }
+            egui_dock::Node::Horizontal(s) => {
+                2u8.hash(h);
+                hash_rect(h, s.rect);
+                let f = if s.fraction.is_finite() { s.fraction } else { 0.5 };
+                f.to_bits().hash(h);
+                s.fully_collapsed.hash(h);
+                s.collapsed_leaf_count.hash(h);
+            }
+            egui_dock::Node::Empty => 3u8.hash(h),
+        }
+    }
+    nodes.hash(h);
+}
+
+fn hash_home(h: &mut impl std::hash::Hasher, home: &Home) {
+    use std::hash::Hash;
+    match home {
+        Home::Topology(s) => {
+            0u8.hash(h);
+            s.hash(h);
+        }
+        Home::Window(s) => {
+            1u8.hash(h);
+            s.hash(h);
+        }
+        Home::With(v) => {
+            2u8.hash(h);
+            v.hash(h);
+        }
+        Home::Split { next_to, vertical, first, fraction } => {
+            3u8.hash(h);
+            next_to.hash(h);
+            vertical.hash(h);
+            first.hash(h);
+            fraction.to_bits().hash(h);
+        }
+    }
+}
+
 /// Writes the layout when it changes (every couple of seconds) and on exit.
 pub struct Saver {
     /// The JSON last written (or read), to skip unchanged writes.
     last: Option<String>,
+    /// Fingerprint of the layout state last serialized/checked.
+    last_hash: Option<u64>,
+    /// Whether the state hash changed since the last serialized comparison.
+    dirty: bool,
     /// When the file was last written.
     written: Instant,
     /// The last un-maximized, windowed geometry (what to restore to).
@@ -322,22 +404,87 @@ impl Saver {
     pub fn new(loaded: Option<&Layout>) -> Self {
         Saver {
             last: loaded.and_then(|l| serde_json::to_string_pretty(l).ok()),
+            last_hash: None,
+            dirty: false,
             written: Instant::now() - SAVE_EVERY,
             normal: loaded.and_then(|l| l.window),
         }
+    }
+
+    fn state_hash(&self, dock: &DockState<Tab>, panels: &Panels, ed: &Editor) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        VERSION.hash(&mut h);
+        if let Some(w) = self.normal {
+            1u8.hash(&mut h);
+            w.size[0].to_bits().hash(&mut h);
+            w.size[1].to_bits().hash(&mut h);
+            w.pos.map(|p| [p[0].to_bits(), p[1].to_bits()]).hash(&mut h);
+            w.maximized.hash(&mut h);
+        } else {
+            0u8.hash(&mut h);
+        }
+        hash_dock(&mut h, dock);
+        let mut popped_count = 0usize;
+        for w in &panels.popped {
+            if w.dock.iter_all_tabs().any(|(_, t)| SavedTab::from_tab(t).is_some()) {
+                popped_count += 1;
+                w.key.hash(&mut h);
+                hash_dock(&mut h, &w.dock);
+                w.size[0].to_bits().hash(&mut h);
+                w.size[1].to_bits().hash(&mut h);
+                w.pos.map(|p| [p[0].to_bits(), p[1].to_bits()]).hash(&mut h);
+            }
+        }
+        popped_count.hash(&mut h);
+        let mut homes_acc = panels.homes.len() as u64;
+        for (k, v) in &panels.homes {
+            let mut eh = std::collections::hash_map::DefaultHasher::new();
+            k.hash(&mut eh);
+            hash_home(&mut eh, v);
+            homes_acc ^= eh.finish();
+        }
+        homes_acc.hash(&mut h);
+        ed.ui.zoom.to_bits().hash(&mut h);
+        std::mem::discriminant(&ed.ui.tab).hash(&mut h);
+        std::mem::discriminant(&ed.ui.run_type).hash(&mut h);
+        ed.show_grid.hash(&mut h);
+        ed.ui.grid_size.to_bits().hash(&mut h);
+        ed.ui.show_gui.hash(&mut h);
+        ed.snap_move.hash(&mut h);
+        ed.move_inc.to_bits().hash(&mut h);
+        ed.snap_rotate.hash(&mut h);
+        ed.rotate_inc.to_bits().hash(&mut h);
+        ed.local_space.hash(&mut h);
+        ed.physical_drag.hash(&mut h);
+        ed.collisions.hash(&mut h);
+        ed.join_surfaces.hash(&mut h);
+        ed.use_bounding_boxes.hash(&mut h);
+        ed.part_snap.hash(&mut h);
+        ed.align_dragged.hash(&mut h);
+        h.finish()
     }
 
     /// Call every frame. A change is written at most every SAVE_EVERY; one
     /// that has to wait asks for a frame then (egui only redraws on input).
     pub fn tick(&mut self, ctx: &egui::Context, dock: &DockState<Tab>, panels: &Panels, ed: &Editor) {
         self.track_window(ctx);
-        let text = self.text(dock, panels, ed);
-        if self.last.as_deref() == Some(text.as_str()) {
+        let h = self.state_hash(dock, panels, ed);
+        if self.last_hash == Some(h) && !self.dirty {
             return;
+        }
+        if self.last_hash != Some(h) {
+            self.last_hash = Some(h);
+            self.dirty = true;
         }
         let since = self.written.elapsed();
         if since < SAVE_EVERY {
             ctx.request_repaint_after(SAVE_EVERY - since);
+            return;
+        }
+        let text = self.text(dock, panels, ed);
+        self.dirty = false;
+        if self.last.as_deref() == Some(text.as_str()) {
             return;
         }
         self.write(text);
@@ -375,6 +522,8 @@ impl Saver {
     /// Writes now if anything changed (on exit).
     pub fn save(&mut self, dock: &DockState<Tab>, panels: &Panels, ed: &Editor) {
         let text = self.text(dock, panels, ed);
+        self.last_hash = Some(self.state_hash(dock, panels, ed));
+        self.dirty = false;
         if self.last.as_deref() != Some(text.as_str()) {
             self.write(text);
         }

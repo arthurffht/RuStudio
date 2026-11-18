@@ -390,31 +390,9 @@ pub const MENUS: &[(&str, &[M])] = &[
     ("Help", HELP),
 ];
 
-/// A shortcut as this system writes it. The tables use Studio's Windows
-/// names, and "Ctrl" is the command key (egui's COMMAND): on macOS
-/// "Ctrl+Shift+S" shows as "⇧⌘S" and "Alt+P" as "⌥P", in Apple's modifier
-/// order (⌥⇧⌘), like Studio for Mac; elsewhere unchanged.
-pub fn shortcut_label(s: &str) -> std::borrow::Cow<'_, str> {
-    if !cfg!(target_os = "macos") || s.is_empty() {
-        return s.into();
-    }
-    mac_shortcut_label(s).into()
-}
-
-fn mac_shortcut_label(s: &str) -> String {
-    let parts: Vec<&str> = s.split('+').collect();
-    let (key, mods) = (parts[parts.len() - 1], &parts[..parts.len() - 1]);
-    let mut out = String::new();
-    for (name, sym) in [("Alt", "⌥"), ("Shift", "⇧"), ("Ctrl", "⌘")] {
-        if mods.contains(&name) {
-            out.push_str(sym);
-        }
-    }
-    out.push_str(match key {
-        "Del" => "⌫",
-        k => k,
-    });
-    out
+/// A shortcut as Windows writes it.
+pub const fn shortcut_label(s: &str) -> &str {
+    s
 }
 
 /// Shortcut text ("Ctrl+Shift+V", "Alt+P", "F5", "Del") → egui shortcut.
@@ -447,28 +425,31 @@ pub fn parse_shortcut(s: &str) -> Option<KeyboardShortcut> {
 
 /// Every (shortcut, action) in the menus, most modifiers first (so
 /// Ctrl+Shift+V is taken before Ctrl+V).
-pub fn menu_shortcuts() -> Vec<(KeyboardShortcut, &'static str)> {
-    fn walk(items: &'static [M], out: &mut Vec<(KeyboardShortcut, &'static str)>) {
-        for m in items {
-            match m {
-                I(_, sc, a) => {
-                    if let Some(k) = parse_shortcut(sc) {
-                        out.push((k, a));
+pub fn menu_shortcuts() -> &'static [(KeyboardShortcut, &'static str)] {
+    static SHORTCUTS: std::sync::OnceLock<Vec<(KeyboardShortcut, &'static str)>> = std::sync::OnceLock::new();
+    SHORTCUTS.get_or_init(|| {
+        fn walk(items: &'static [M], out: &mut Vec<(KeyboardShortcut, &'static str)>) {
+            for m in items {
+                match m {
+                    I(_, sc, a) => {
+                        if let Some(k) = parse_shortcut(sc) {
+                            out.push((k, a));
+                        }
                     }
+                    Sub(_, items) => walk(items, out),
+                    S => {}
                 }
-                Sub(_, items) => walk(items, out),
-                S => {}
             }
         }
-    }
-    let mut out = Vec::new();
-    for (_, items) in MENUS {
-        walk(items, &mut out);
-    }
-    out.sort_by_key(|(k, _)| {
-        std::cmp::Reverse(k.modifiers.command as u8 + k.modifiers.shift as u8 + k.modifiers.alt as u8)
-    });
-    out
+        let mut out = Vec::new();
+        for (_, items) in MENUS {
+            walk(items, &mut out);
+        }
+        out.sort_by_key(|(k, _)| {
+            std::cmp::Reverse(k.modifiers.command as u8 + k.modifiers.shift as u8 + k.modifiers.alt as u8)
+        });
+        out
+    })
 }
 
 pub fn menu_rect_key(title: &str) -> &'static str {
@@ -506,15 +487,6 @@ pub fn run_type_key(t: RunType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn mac_shortcut_labels() {
-        assert_eq!(mac_shortcut_label("Ctrl+Shift+S"), "⇧⌘S");
-        assert_eq!(mac_shortcut_label("Ctrl+Alt+F6"), "⌥⌘F6");
-        assert_eq!(mac_shortcut_label("Alt+P"), "⌥P");
-        assert_eq!(mac_shortcut_label("F5"), "F5");
-        assert_eq!(mac_shortcut_label("Del"), "⌫");
-    }
 
     /// Every menu shortcut parses.
     #[test]

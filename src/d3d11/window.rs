@@ -8,7 +8,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{E_INVALIDARG, HWND};
+use windows::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMWCP_ROUND, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR,
+    DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWINDOWATTRIBUTE,
+};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -98,6 +103,35 @@ pub fn window_hwnd(window: &Window) -> Result<HWND, String> {
     }
 }
 
+fn set_dwm_attr<T>(hwnd: HWND, attr: DWMWINDOWATTRIBUTE, value: &T) -> windows::core::Result<()> {
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            attr,
+            (value as *const T).cast(),
+            std::mem::size_of::<T>() as u32,
+        )
+    }
+}
+
+fn apply_dwm_dark_chrome(hwnd: HWND) {
+    let dark: windows::core::BOOL = true.into();
+    if set_dwm_attr(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark)
+        .is_err_and(|e| e.code() == E_INVALIDARG)
+    {
+        // Windows 10 1903/1909 used undocumented attribute 19 before 20 was standardized.
+        let _ = set_dwm_attr(hwnd, DWMWINDOWATTRIBUTE(19), &dark);
+    }
+    let corner = DWMWCP_ROUND;
+    let _ = set_dwm_attr(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner);
+    let caption: u32 = 0x0030_2927;
+    let _ = set_dwm_attr(hwnd, DWMWA_CAPTION_COLOR, &caption);
+    let text: u32 = 0x00E6_E1DF;
+    let _ = set_dwm_attr(hwnd, DWMWA_TEXT_COLOR, &text);
+    let border: u32 = 0x0041_3735;
+    let _ = set_dwm_attr(hwnd, DWMWA_BORDER_COLOR, &border);
+}
+
 struct ViewportSlot {
     ids: egui::ViewportIdPair,
     class: egui::ViewportClass,
@@ -110,6 +144,8 @@ struct ViewportSlot {
     deferred_commands: Vec<egui::ViewportCommand>,
     actions_requested: Vec<egui_winit::ActionRequested>,
     cursor_visible: bool,
+    cursor_grabbed: bool,
+    right_mouse_down: bool,
     initial_visible: bool,
     shown_once: bool,
 }
@@ -134,6 +170,8 @@ impl ViewportSlot {
             deferred_commands: Vec::new(),
             actions_requested: Vec::new(),
             cursor_visible: true,
+            cursor_grabbed: false,
+            right_mouse_down: false,
             initial_visible,
             shown_once: false,
         }
@@ -148,6 +186,9 @@ impl ViewportSlot {
         for cmd in &commands {
             match cmd {
                 egui::ViewportCommand::CursorVisible(v) => self.cursor_visible = *v,
+                egui::ViewportCommand::CursorGrab(g) => {
+                    self.cursor_grabbed = !matches!(g, egui::viewport::CursorGrab::None);
+                }
                 egui::ViewportCommand::Close => requested_close = true,
                 _ => {}
             }
@@ -191,7 +232,9 @@ impl ViewportSlot {
 
         let window = egui_winit::create_window(egui_ctx, event_loop, &create_builder)
             .map_err(|e| format!("Failed to create window for {:?}: {e}", self.ids.this))?;
+        window.set_theme(Some(winit::window::Theme::Dark));
         let hwnd = window_hwnd(&window)?;
+        apply_dwm_dark_chrome(hwnd);
         let phys = window.inner_size();
         let swapchain = Swapchain::new(rs, hwnd, phys.width.max(1), phys.height.max(1))?;
 
@@ -260,6 +303,31 @@ impl D3d11WindowRunner {
             let Some(&id) = shared.viewport_from_window.get(&window_id) else {
                 return Ok(false);
             };
+            let Some(vp) = shared.viewports.get(&id) else {
+                return Ok(false);
+            };
+            let Some(window) = vp.window.as_ref() else {
+                return Ok(false);
+            };
+            let minimized = window.is_minimized() == Some(true);
+            let close_pending = vp
+                .info
+                .events
+                .iter()
+                .any(|e| matches!(e, egui::ViewportEvent::Close));
+            if minimized && vp.shown_once && !close_pending {
+                return Ok(false);
+            }
+            let inner = window.inner_size();
+            if id == egui::ViewportId::ROOT
+                && shared.vsync
+                && !minimized
+                && effective_swapchain_size(inner.width, inner.height).is_some()
+            {
+                if let Some(sc) = vp.swapchain.as_ref() {
+                    sc.wait_frame_latency();
+                }
+            }
             id
         };
 
@@ -540,16 +608,26 @@ impl D3d11WindowRunner {
                 return true;
             }
             let shared = self.shared.borrow();
-            let window = shared
+            let vp = shared
                 .viewport_from_window
                 .get(&win_id)
-                .and_then(|vp_id| shared.viewports.get(vp_id))
-                .and_then(|vp| vp.window.clone());
-            if let Some(window) = window {
-                if is_invisible_or_minimized(&window) {
-                    invisible_windows.push(win_id);
-                } else {
-                    due_visible.push(window);
+                .and_then(|vp_id| shared.viewports.get(vp_id));
+            if let Some(vp) = vp {
+                if let Some(window) = vp.window.clone() {
+                    let minimized = window.is_minimized() == Some(true);
+                    let close_pending = vp
+                        .info
+                        .events
+                        .iter()
+                        .any(|e| matches!(e, egui::ViewportEvent::Close));
+                    if minimized && vp.shown_once && !close_pending {
+                        return false;
+                    }
+                    if is_invisible_or_minimized(&window) {
+                        invisible_windows.push(win_id);
+                    } else {
+                        due_visible.push(window);
+                    }
                 }
             }
             false
@@ -844,14 +922,17 @@ impl ApplicationHandler<UserEvent> for D3d11WindowRunner {
                     shared
                         .viewports
                         .get(&viewport_id)
-                        .and_then(|vp| vp.window.as_ref())
-                        .map(|w| {
+                        .and_then(|vp| {
+                            let w = vp.window.as_ref()?;
+                            if w.is_minimized() == Some(true) && vp.shown_once {
+                                return None;
+                            }
                             let throttled = if is_invisible_or_minimized(w) {
                                 when.max(Instant::now() + INVISIBLE_WINDOW_REPAINT_INTERVAL)
                             } else {
                                 when
                             };
-                            (w.id(), throttled)
+                            Some((w.id(), throttled))
                         })
                 };
                 if let Some((win_id, throttled)) = win_and_pass {
@@ -870,12 +951,16 @@ impl ApplicationHandler<UserEvent> for D3d11WindowRunner {
         if let DeviceEvent::MouseMotion { delta } = event {
             let win_to_repaint = {
                 let mut shared = self.shared.borrow_mut();
-                let target_id = shared.focused_viewport.unwrap_or(egui::ViewportId::ROOT);
+                let Some(target_id) = shared.focused_viewport else {
+                    return;
+                };
                 let mut repaint_win = None;
                 if let Some(vp) = shared.viewports.get_mut(&target_id) {
-                    if let Some(egui_state) = vp.egui_state.as_mut() {
-                        if egui_state.on_mouse_motion(delta) || !vp.cursor_visible {
-                            repaint_win = vp.window.as_ref().map(|w| w.id());
+                    if vp.cursor_grabbed || !vp.cursor_visible || vp.right_mouse_down {
+                        if let Some(egui_state) = vp.egui_state.as_mut() {
+                            if egui_state.on_mouse_motion(delta) || !vp.cursor_visible {
+                                repaint_win = vp.window.as_ref().map(|w| w.id());
+                            }
                         }
                     }
                 }
@@ -927,8 +1012,22 @@ impl ApplicationHandler<UserEvent> for D3d11WindowRunner {
                     WindowEvent::Focused(focused) => {
                         if *focused {
                             *focused_viewport = Some(viewport_id);
-                        } else if *focused_viewport == Some(viewport_id) {
-                            *focused_viewport = None;
+                        } else {
+                            if *focused_viewport == Some(viewport_id) {
+                                *focused_viewport = None;
+                            }
+                            if let Some(vp) = viewports.get_mut(&viewport_id) {
+                                vp.right_mouse_down = false;
+                            }
+                        }
+                    }
+                    WindowEvent::MouseInput {
+                        state,
+                        button: winit::event::MouseButton::Right,
+                        ..
+                    } => {
+                        if let Some(vp) = viewports.get_mut(&viewport_id) {
+                            vp.right_mouse_down = *state == winit::event::ElementState::Pressed;
                         }
                     }
                     WindowEvent::Resized(phys) => {

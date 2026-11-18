@@ -224,6 +224,33 @@ pub struct OutputSelection {
     press: Option<(f64, egui::Pos2, u8)>,
 }
 
+#[derive(Default)]
+struct LogCache {
+    gen: u64,
+    built_gen: u64,
+    len: usize,
+    first_hash: u64,
+    last_hash: u64,
+    messages: Option<MessageFilter>,
+    contexts: Option<ContextFilter>,
+    filter: String,
+    line_h_bits: u32,
+    line_counts: Vec<usize>,
+    shown: Vec<usize>,
+    tops: Vec<f32>,
+    total_h: f32,
+}
+
+fn hash_line(l: Option<&LogLine>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let Some(l) = l else { return 0 };
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    l.at.hash(&mut h);
+    (l.level as u8).hash(&mut h);
+    l.text.hash(&mut h);
+    h.finish()
+}
+
 pub struct OutputState {
     pub messages: MessageFilter,
     pub contexts: ContextFilter,
@@ -232,6 +259,7 @@ pub struct OutputState {
     pub show_context: bool,
     pub show_source: bool,
     pub sel: OutputSelection,
+    cache: LogCache,
 }
 
 impl OutputState {
@@ -242,12 +270,19 @@ impl OutputState {
         shift(&mut s.anchor);
         shift(&mut s.head);
         s.drag = None;
+        self.cache.gen = self.cache.gen.wrapping_add(1);
     }
     pub fn log_cleared(&mut self) {
         let s = &mut self.sel;
         s.anchor = (0, 0);
         s.head = (0, 0);
         s.drag = None;
+        self.cache.gen = self.cache.gen.wrapping_add(1);
+        self.cache.len = 0;
+        self.cache.line_counts.clear();
+        self.cache.shown.clear();
+        self.cache.tops.clear();
+        self.cache.total_h = 0.0;
     }
 }
 
@@ -261,36 +296,42 @@ impl Default for OutputState {
             show_context: false,
             show_source: true,
             sel: OutputSelection::default(),
+            cache: LogCache::default(),
         }
     }
 }
 
-fn wanted(st: &OutputState, s: &Shown, l: &LogLine) -> bool {
-    let kind_ok = match st.messages {
+fn wanted_with_filter(messages: MessageFilter, contexts: ContextFilter, filter_lc: &str, s: &Shown, l: &LogLine) -> bool {
+    let kind_ok = match messages {
         MessageFilter::All => true,
         MessageFilter::Output => s.kind == Kind::Print,
         MessageFilter::Info => s.kind == Kind::Info,
         MessageFilter::Warnings => s.kind == Kind::Warn,
         MessageFilter::Errors => s.kind == Kind::Error,
     };
-    let ctx_ok = match st.contexts {
+    let ctx_ok = match contexts {
         ContextFilter::All => true,
         ContextFilter::Server => s.context == Context::Server,
         ContextFilter::Client => s.context == Context::Client,
     };
-    let text_ok = st.filter.is_empty() || l.text.to_lowercase().contains(&st.filter.to_lowercase());
+    let text_ok = filter_lc.is_empty() || l.text.to_lowercase().contains(filter_lc);
     kind_ok && ctx_ok && text_ok
 }
 
-/// The line as one LayoutJob in Studio's colours (bold for warnings / errors).
-pub fn line_job(st: &OutputState, l: &LogLine, s: &Shown) -> egui::text::LayoutJob {
+fn line_job_with(
+    show_timestamp: bool,
+    show_context: bool,
+    show_source: bool,
+    l: &LogLine,
+    s: &Shown,
+) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let mono = mono_font();
     let plain = |c: Color32| egui::TextFormat { font_id: mono.clone(), color: c, line_height: Some(line_h()), ..Default::default() };
-    if st.show_timestamp {
+    if show_timestamp {
         job.append(&format!("{}  ", l.at), 0.0, plain(PRINT));
     }
-    if st.show_context && s.context != Context::None {
+    if show_context && s.context != Context::None {
         let c = if s.context == Context::Server { "Server" } else { "Client" };
         job.append(&format!("{c} - "), 0.0, plain(PRINT));
     }
@@ -301,12 +342,17 @@ pub fn line_job(st: &OutputState, l: &LogLine, s: &Shown) -> egui::text::LayoutJ
         fmt.font_id = FontId::new(mono_px(), egui::FontFamily::Name("mono-bold".into()));
     }
     job.append(s.message, 0.0, fmt);
-    if st.show_source {
+    if show_source {
         if let Some(src) = &s.source {
             job.append(&format!(" - {src}"), 0.0, plain(PRINT));
         }
     }
     job
+}
+
+/// The line as one LayoutJob in Studio's colours (bold for warnings / errors).
+pub fn line_job(st: &OutputState, l: &LogLine, s: &Shown) -> egui::text::LayoutJob {
+    line_job_with(st.show_timestamp, st.show_context, st.show_source, l, s)
 }
 
 impl Editor {
@@ -369,34 +415,98 @@ impl Editor {
 
 /// The lines, drawn and selectable as one text; returns how many were drawn.
 pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usize {
-    // Unfiltered (the usual case) needs no per-line parse every frame.
+    let lh = line_h();
+    let lh_bits = lh.to_bits();
+    let len = log.len();
+    let first_hash = hash_line(log.first());
+    let last_hash = hash_line(log.last());
     let unfiltered = st.messages == MessageFilter::All && st.contexts == ContextFilter::All && st.filter.is_empty();
-    let shown: Vec<usize> = (0..log.len())
-        .filter(|i| {
-            if unfiltered {
-                return true;
+
+    let filters_same = st.cache.messages == Some(st.messages)
+        && st.cache.contexts == Some(st.contexts)
+        && st.cache.filter == st.filter
+        && st.cache.line_h_bits == lh_bits;
+    let log_same = st.cache.built_gen == st.cache.gen
+        && st.cache.len == len
+        && st.cache.first_hash == first_hash
+        && st.cache.last_hash == last_hash
+        && st.cache.line_counts.len() == len;
+
+    if !(log_same && filters_same) {
+        let can_append = filters_same
+            && st.cache.built_gen == st.cache.gen
+            && len > st.cache.len
+            && st.cache.len > 0
+            && st.cache.line_counts.len() == st.cache.len
+            && st.cache.first_hash == first_hash
+            && hash_line(log.get(st.cache.len - 1)) == st.cache.last_hash
+            && st.cache.tops.len() == st.cache.shown.len() + 1;
+
+        if can_append {
+            let filter_lc = st.filter.to_lowercase();
+            let mut y = st.cache.total_h;
+            if st.cache.tops.is_empty() {
+                st.cache.tops.push(0.0);
             }
-            let l = &log[*i];
-            wanted(st, &parse(l), l)
-        })
-        .collect();
-    let text_of = |st: &OutputState, i: usize| line_job(st, &log[i], &parse(&log[i])).text;
-    // A message can span lines (stack traces, banners): each takes
-    // line_h() per line; `tops` are the running offsets.
-    let mut tops = Vec::with_capacity(shown.len() + 1);
-    let mut y = 0.0;
-    for &i in &shown {
-        tops.push(y);
-        y += line_h() * (log[i].text.matches('\n').count() + 1) as f32;
+            for i in st.cache.len..len {
+                let l = &log[i];
+                let lc = l.text.matches('\n').count() + 1;
+                st.cache.line_counts.push(lc);
+                if unfiltered || wanted_with_filter(st.messages, st.contexts, &filter_lc, &parse(l), l) {
+                    st.cache.shown.push(i);
+                    y += lh * lc as f32;
+                    st.cache.tops.push(y);
+                }
+            }
+            st.cache.total_h = y;
+            st.cache.len = len;
+            st.cache.first_hash = first_hash;
+            st.cache.last_hash = last_hash;
+        } else {
+            if !log_same {
+                st.cache.line_counts.clear();
+                st.cache.line_counts.reserve(len);
+                for l in log {
+                    st.cache.line_counts.push(l.text.matches('\n').count() + 1);
+                }
+                st.cache.built_gen = st.cache.gen;
+                st.cache.len = len;
+                st.cache.first_hash = first_hash;
+                st.cache.last_hash = last_hash;
+            }
+            let filter_lc = st.filter.to_lowercase();
+            st.cache.shown.clear();
+            st.cache.tops.clear();
+            let mut y = 0.0;
+            st.cache.tops.push(0.0);
+            for (i, l) in log.iter().enumerate() {
+                if unfiltered || wanted_with_filter(st.messages, st.contexts, &filter_lc, &parse(l), l) {
+                    st.cache.shown.push(i);
+                    y += lh * st.cache.line_counts[i] as f32;
+                    st.cache.tops.push(y);
+                }
+            }
+            st.cache.total_h = y;
+            st.cache.messages = Some(st.messages);
+            st.cache.contexts = Some(st.contexts);
+            st.cache.filter = st.filter.clone();
+            st.cache.line_h_bits = lh_bits;
+        }
     }
-    tops.push(y);
+
+    let show_timestamp = st.show_timestamp;
+    let show_context = st.show_context;
+    let show_source = st.show_source;
+    let OutputState { cache, sel, .. } = st;
+    let shown = &cache.shown;
+    let tops = &cache.tops;
+    let total = cache.total_h;
     let id = egui::Id::new("output_text");
     let mut drawn = 0;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .stick_to_bottom(true)
         .show_viewport(ui, |ui, viewport| {
-            let total = *tops.last().unwrap_or(&0.0);
             let (content, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), total), Sense::hover());
             let view = ui.clip_rect();
             // Under the lines (they only sense hover), above nothing: the
@@ -412,10 +522,10 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
                 let i = shown[k];
                 let l = &log[i];
                 let s = parse(l);
-                let galley = ui.fonts_mut(|f| f.layout_job(line_job(st, l, &s)));
+                let galley = ui.fonts_mut(|f| f.layout_job(line_job_with(show_timestamp, show_context, show_source, l, &s)));
                 let top = content.min.y + tops[k];
                 // One monospace space wide, then one more space.
-                let bar = egui::Rect::from_min_size(egui::pos2(content.min.x, top), Vec2::new(space, line_h()));
+                let bar = egui::Rect::from_min_size(egui::pos2(content.min.x, top), Vec2::new(space, lh));
                 let bar_color = match s.context {
                     Context::Server => Some(SERVER_BAR),
                     Context::Client => Some(CLIENT_BAR),
@@ -453,7 +563,6 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
                 (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.interact_pos(), i.time, i.modifiers.shift)
             });
             let text_on = |line: usize| rows.iter().find(|r| r.0 == line).map(|r| r.4.text().to_string());
-            let sel = &mut st.sel;
             let hit = ptr.and_then(|p| at(p).map(|c| (p, c)));
             if let (true, Some((p, c))) = (pressed && resp.hovered(), hit) {
                 ui.memory_mut(|m| m.request_focus(id));
@@ -498,7 +607,7 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
                     0.0
                 };
                 if dy != 0.0 {
-                    ui.scroll_with_delta(Vec2::new(0.0, dy.clamp(-line_h() * 2.0, line_h() * 2.0)));
+                    ui.scroll_with_delta(Vec2::new(0.0, dy.clamp(-lh * 2.0, lh * 2.0)));
                     ui.ctx().request_repaint();
                 }
             }
@@ -531,9 +640,9 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
                         let (sa, sb) = (a.max(start), b.min(start + len));
                         let runs_on = b > start + len && (start + len < n || *i < hi.0);
                         if sa <= sb && (sa < sb || runs_on) {
-                            let y = top + line_h() * k as f32;
+                            let y = top + lh * k as f32;
                             let end = x(sb) + if runs_on { *space } else { 0.0 };
-                            let r = egui::Rect::from_min_max(egui::pos2(x(sa), y), egui::pos2(end, y + line_h()));
+                            let r = egui::Rect::from_min_max(egui::pos2(x(sa), y), egui::pos2(end, y + lh));
                             shapes.push(egui::Shape::rect_filled(r, 0.0, fill));
                         }
                         start += len + 1;
@@ -553,18 +662,18 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
             )
         });
         if let (true, Some(&f), Some(&l)) = (all, shown.first(), shown.last()) {
-            st.sel.anchor = (f, 0);
-            st.sel.head = (l, text_of(st, l).chars().count());
+            sel.anchor = (f, 0);
+            sel.head = (l, line_job_with(show_timestamp, show_context, show_source, &log[l], &parse(&log[l])).text.chars().count());
         }
         if esc {
-            st.sel.head = st.sel.anchor;
+            sel.head = sel.anchor;
         }
         if copy {
-            let (lo, hi) = if st.sel.anchor <= st.sel.head { (st.sel.anchor, st.sel.head) } else { (st.sel.head, st.sel.anchor) };
+            let (lo, hi) = if sel.anchor <= sel.head { (sel.anchor, sel.head) } else { (sel.head, sel.anchor) };
             if lo != hi {
                 let mut out = String::new();
                 for &i in shown.iter().filter(|&&i| i >= lo.0 && i <= hi.0) {
-                    let t = text_of(st, i);
+                    let t = line_job_with(show_timestamp, show_context, show_source, &log[i], &parse(&log[i])).text;
                     let n = t.chars().count();
                     let a = if i == lo.0 { lo.1.min(n) } else { 0 };
                     let b = if i == hi.0 { hi.1.min(n) } else { n };

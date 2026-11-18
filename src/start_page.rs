@@ -22,7 +22,6 @@ use rustudio_account::{parse_place_ref, CloudApi, CreatorKind, Experience, Exper
 
 use crate::app::{Editor, PendingAction};
 use crate::cloud_ui::Paged;
-use crate::doc::Document;
 use crate::theme;
 use templates::{Kind, Source, TemplateInfo};
 
@@ -56,6 +55,7 @@ pub struct StartPage {
     expanded: HashSet<String>,
     /// A sidebar click: scroll that section's header into view.
     jump: Option<String>,
+    active_nav: Option<String>,
     search: String,
     url: String,
     url_error: Option<String>,
@@ -99,6 +99,7 @@ impl Default for StartPage {
             collapsed: HashSet::new(),
             expanded: HashSet::new(),
             jump: None,
+            active_nav: None,
             search: String::new(),
             url: String::new(),
             url_error: None,
@@ -348,6 +349,9 @@ impl Editor {
             return false;
         }
         let ctx = ui.ctx().clone();
+        if crate::studio_content::take_fonts_ready() {
+            crate::ti::install(&ctx);
+        }
         self.account.restore();
         self.start.poll(&ctx);
         if !self.start.templates_asked {
@@ -404,10 +408,11 @@ impl Editor {
             .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin { left: 28, right: 20, top: 20, bottom: 12 }))
             .show(ui, |ui| self.start_body(ui, &mut todo));
 
-        for d in todo {
+            for d in todo {
             match d {
                 Do::Jump(k) => {
                     self.start.collapsed.remove(&k);
+                    self.start.active_nav = Some(k.clone());
                     self.start.jump = Some(k);
                 }
                 Do::Toggle(k) => {
@@ -466,34 +471,83 @@ impl Editor {
                     todo.push(Do::Account);
                 }
                 ui.add_space(8.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.start.search)
-                        .hint_text("🔍  Search")
-                        .desired_width(240.0),
+                let (r, _) = ui.allocate_exact_size(Vec2::new(240.0, 26.0), Sense::hover());
+                let sid = egui::Id::new("start_search_edit");
+                let focused = ui.memory(|m| m.has_focus(sid));
+                ui.painter().rect(
+                    r,
+                    5.0,
+                    theme::PANEL_DARK,
+                    Stroke::new(1.0, if focused { theme::SELECT } else { theme::DIVIDER }),
+                    egui::StrokeKind::Inside,
                 );
+                crate::ti::paint(
+                    ui.painter(),
+                    Rect::from_center_size(Pos2::new(r.min.x + 13.0, r.center().y), Vec2::splat(14.0)),
+                    "search",
+                    theme::TEXT_DIM,
+                );
+                let right_pad = if self.start.search.is_empty() { 6.0 } else { 22.0 };
+                let text_r = Rect::from_min_max(
+                    Pos2::new(r.min.x + 24.0, r.min.y + 2.0),
+                    Pos2::new(r.max.x - right_pad, r.max.y - 2.0),
+                );
+                let te = egui::TextEdit::singleline(&mut self.start.search)
+                    .id(sid)
+                    .hint_text("Search")
+                    .frame(egui::Frame::NONE)
+                    .desired_width(text_r.width())
+                    .vertical_align(egui::Align::Center);
+                let resp = ui.put(text_r, te);
+                if !self.start.search.is_empty() {
+                    let xr = Rect::from_center_size(Pos2::new(r.max.x - 11.0, r.center().y), Vec2::splat(14.0));
+                    let x = ui.interact(xr, egui::Id::new("start_search_clear"), Sense::click())
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    crate::ti::paint(ui.painter(), xr, "x", if x.hovered() { Color32::WHITE } else { theme::TEXT_DIM });
+                    if x.clicked() {
+                        self.start.search.clear();
+                        resp.request_focus();
+                    }
+                }
             });
         });
     }
 
     fn start_nav(&mut self, ui: &mut egui::Ui, todo: &mut Vec<Do>) {
-        ui.spacing_mut().item_spacing.y = 2.0;
+        ui.spacing_mut().item_spacing.y = 3.0;
         let w = ui.available_width();
-        let big = |ui: &mut egui::Ui, text: &str, fill: Color32| {
-            ui.add_sized(
-                [w, 34.0],
-                egui::Button::new(RichText::new(text).color(Color32::WHITE).strong())
-                    .fill(fill)
-                    .corner_radius(CornerRadius::same(4)),
-            )
+        let big = |ui: &mut egui::Ui, icon: &str, text: &str, fill: Color32, hover: Color32| {
+            let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::click());
+            let bg = if resp.hovered() { hover } else { fill };
+            ui.painter().rect_filled(r, CornerRadius::same(6), bg);
+            let ir = Rect::from_center_size(Pos2::new(r.min.x + 18.0, r.center().y), Vec2::splat(16.0));
+            crate::ti::paint(ui.painter(), ir, icon, Color32::WHITE);
+            ui.painter().text(
+                Pos2::new(ir.max.x + 8.0, r.center().y),
+                egui::Align2::LEFT_CENTER,
+                text,
+                egui::FontId::proportional(13.5),
+                Color32::WHITE,
+            );
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            resp
         };
-        if big(ui, "+  New Experience", theme::ACCENT).on_hover_text(format!("A new Baseplate place ({})", crate::studio_ui::shortcut_label("Ctrl+N"))).clicked() {
+        if big(ui, "plus", "New Experience", theme::ACCENT, theme::ACCENT.gamma_multiply(1.12))
+            .on_hover_text(format!("A new Baseplate place ({})", crate::studio_ui::shortcut_label("Ctrl+N")))
+            .clicked()
+        {
             todo.push(Do::Template(self.start.default_template()));
         }
-        ui.add_space(6.0);
-        if big(ui, "Open from File…", theme::PANEL_ALT).on_hover_text(crate::studio_ui::shortcut_label("Ctrl+O")).clicked() {
+        ui.add_space(4.0);
+        if big(ui, "file-3d", "Open from File…", theme::PANEL_ALT, theme::ACTIVE_TAB)
+            .on_hover_text(crate::studio_ui::shortcut_label("Ctrl+O"))
+            .clicked()
+        {
             todo.push(Do::OpenFile(None));
         }
-        if big(ui, "Open Folder…", theme::PANEL_ALT)
+        if big(ui, "folder", "Open Folder…", theme::PANEL_ALT, theme::ACTIVE_TAB)
             .on_hover_text("A *.project.json folder (files are the truth)")
             .clicked()
         {
@@ -502,11 +556,11 @@ impl Editor {
         ui.add_space(14.0);
         ui.label(RichText::new("JUMP TO").small().color(theme::TEXT_DIM));
         ui.add_space(4.0);
-        let mut entries: Vec<(String, String, bool)> = vec![
-            ("recent".into(), "Recent".into(), false),
-            ("files".into(), "Recent Files".into(), false),
-            ("mine".into(), "My Experiences".into(), false),
-            ("shared".into(), "Shared with Me".into(), false),
+        let mut entries: Vec<(String, String, &'static str, bool)> = vec![
+            ("recent".into(), "Recent".into(), "clock", false),
+            ("files".into(), "Recent Files".into(), "files", false),
+            ("mine".into(), "My Experiences".into(), "user", false),
+            ("shared".into(), "Shared with Me".into(), "users", false),
         ];
         if let Some(Ok(groups)) = &self.start.groups {
             for g in groups {
@@ -517,13 +571,13 @@ impl Editor {
                     .map(|p| &p.list)
                     .is_none_or(|l| matches!(l, None | Some(Ok(_))) && !matches!(l, Some(Ok(v)) if v.is_empty()));
                 if has && g.can_edit != Some(false) {
-                    entries.push((format!("group:{}", g.id), g.name.clone(), true));
+                    entries.push((format!("group:{}", g.id), g.name.clone(), "users-group", true));
                 }
             }
         }
         egui::ScrollArea::vertical().id_salt("start_nav_scroll").max_height(ui.available_height() - 24.0).show(ui, |ui| {
             let mut groups_said = false;
-            for (key, label, indent) in entries {
+            for (key, label, icon, indent) in entries {
                 if indent && !groups_said {
                     groups_said = true;
                     ui.add_space(2.0);
@@ -533,18 +587,30 @@ impl Editor {
                     });
                 }
                 let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 28.0), Sense::click());
-                if resp.hovered() {
-                    ui.painter().rect_filled(r, CornerRadius::same(4), theme::HOVER_BG);
+                let active = self.start.active_nav.as_deref() == Some(key.as_str());
+                if active {
+                    ui.painter().rect_filled(r, CornerRadius::same(6), theme::ACTIVE_TAB);
+                    ui.painter().rect_filled(
+                        Rect::from_min_size(Pos2::new(r.min.x + 2.0, r.min.y + 6.0), Vec2::new(2.5, r.height() - 12.0)),
+                        CornerRadius::same(2),
+                        theme::ACCENT,
+                    );
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(r, CornerRadius::same(6), theme::HOVER_BG);
                 }
-                let x = r.min.x + if indent { 26.0 } else { 12.0 };
-                let font = egui::FontId::proportional(if indent { 13.0 } else { 14.0 });
+                let icon_x = r.min.x + if indent { 22.0 } else { 12.0 };
+                let icon_r = Rect::from_center_size(Pos2::new(icon_x + 7.0, r.center().y), Vec2::splat(14.0));
+                let fg = if active { Color32::WHITE } else if indent { theme::TEXT_DIM } else { theme::TEXT };
+                crate::ti::paint(ui.painter(), icon_r, icon, fg);
+                let x = icon_r.max.x + 8.0;
+                let font = egui::FontId::proportional(if indent { 13.0 } else { 13.5 });
                 let text = elide(ui.painter(), &label, &font, r.max.x - x - 6.0);
                 ui.painter().text(
                     Pos2::new(x, r.center().y),
                     egui::Align2::LEFT_CENTER,
                     text,
                     font,
-                    if indent { theme::TEXT_DIM } else { theme::TEXT },
+                    fg,
                 );
                 if resp.clicked() {
                     todo.push(Do::Jump(key));
@@ -880,15 +946,13 @@ impl Editor {
                 p.extension().and_then(|e| e.to_str()).unwrap_or("")
             };
             let badge = Rect::from_min_size(r.min + Vec2::new(8.0, 6.0), Vec2::new(28.0, 28.0));
-            ui.painter().rect_filled(badge, CornerRadius::same(4), theme::PANEL_ALT);
-            let tag = if p.is_dir() { "DIR".to_string() } else { kind.to_uppercase().chars().take(5).collect() };
-            ui.painter().text(
-                badge.center(),
-                egui::Align2::CENTER_CENTER,
-                tag,
-                egui::FontId::proportional(8.5),
-                theme::TEXT,
-            );
+            ui.painter().rect_filled(badge, CornerRadius::same(6), theme::PANEL_ALT);
+            let (icon_name, icon_col) = if p.is_dir() {
+                ("folder", Color32::from_rgb(235, 190, 95))
+            } else {
+                ("file-3d", theme::SELECT)
+            };
+            crate::ti::paint(ui.painter(), badge.shrink(5.0), icon_name, icon_col);
             ui.painter().text(
                 Pos2::new(badge.max.x + 12.0, r.min.y + 13.0),
                 egui::Align2::LEFT_CENTER,
@@ -1135,12 +1199,15 @@ fn card(ui: &mut egui::Ui, title: &str, sub: &str, thumb: impl FnOnce(&egui::Pai
     let (r, resp) = ui.allocate_exact_size(Vec2::new(CARD_W, CARD_H), Sense::click());
     let p = ui.painter().with_clip_rect(r);
     let hov = resp.hovered();
-    p.rect_filled(r, CornerRadius::same(6), if hov { theme::ACTIVE_TAB } else { theme::PANEL_DARK });
+    p.rect_filled(r, CornerRadius::same(8), if hov { theme::ACTIVE_TAB } else { theme::PANEL_DARK });
     let tr = Rect::from_min_size(r.min, Vec2::new(CARD_W, THUMB_H));
     thumb(&p.with_clip_rect(tr), tr);
-    if hov {
-        p.rect_stroke(r, CornerRadius::same(6), Stroke::new(1.5, theme::SELECT), egui::StrokeKind::Inside);
-    }
+    let border = if hov {
+        Stroke::new(1.5, theme::SELECT)
+    } else {
+        Stroke::new(1.0, Color32::from_rgb(0x2e, 0x31, 0x3a))
+    };
+    p.rect_stroke(r, CornerRadius::same(8), border, egui::StrokeKind::Inside);
     let font = egui::FontId::proportional(13.5);
     let title = elide(&p, title, &font, CARD_W - 20.0);
     p.text(Pos2::new(r.min.x + 10.0, tr.max.y + 16.0), egui::Align2::LEFT_CENTER, title, font, theme::TEXT);
@@ -1165,22 +1232,55 @@ fn elide(p: &egui::Painter, s: &str, font: &egui::FontId, max: f32) -> String {
     format!("{out}…")
 }
 
-/// The experience's icon, centred on a blurred-looking fill; a letter tile
-/// until it loads.
+/// The experience's icon, centred on a subtle Studio backdrop; a procedural
+/// sky/grid card with a Tabler icon until the thumbnail loads.
 fn icon_thumb(p: &egui::Painter, r: Rect, icon: Option<egui::TextureId>, name: &str) {
-    p.rect_filled(r, CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }, theme::PANEL_ALT);
-    let side = r.height() - 16.0;
-    let ir = Rect::from_center_size(r.center(), Vec2::splat(side));
+    let top_radius = CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 };
+    p.rect_filled(r, top_radius, theme::PANEL_ALT);
     match icon {
         Some(t) => {
+            let side = r.height() - 16.0;
+            let ir = Rect::from_center_size(r.center(), Vec2::splat(side));
             p.image(t, ir, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
         }
         None => {
-            let h = name.bytes().fold(7u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
-            let c = Color32::from_rgb(60 + (h % 90) as u8, 70 + ((h >> 8) % 80) as u8, 110 + ((h >> 16) % 100) as u8);
-            p.rect_filled(ir, CornerRadius::same(6), c);
-            let letter: String = name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
-            p.text(ir.center(), egui::Align2::CENTER_CENTER, letter, egui::FontId::proportional(36.0), Color32::WHITE);
+            let h = name.bytes().fold(2166136261u32, |a, b| a.wrapping_mul(16777619) ^ b as u32);
+            let palettes = [
+                (Color32::from_rgb(30, 44, 72), Color32::from_rgb(20, 24, 34), Color32::from_rgb(92, 165, 255)),
+                (Color32::from_rgb(28, 48, 58), Color32::from_rgb(19, 24, 31), Color32::from_rgb(89, 210, 190)),
+                (Color32::from_rgb(44, 36, 66), Color32::from_rgb(22, 22, 32), Color32::from_rgb(183, 135, 242)),
+                (Color32::from_rgb(48, 40, 32), Color32::from_rgb(23, 22, 27), Color32::from_rgb(255, 168, 72)),
+            ];
+            let (sky_top, sky_bot, accent) = palettes[(h as usize) % palettes.len()];
+            let mut mesh = egui::Mesh::default();
+            mesh.colored_vertex(r.left_top(), sky_top);
+            mesh.colored_vertex(r.right_top(), sky_top);
+            mesh.colored_vertex(r.right_bottom(), sky_bot);
+            mesh.colored_vertex(r.left_bottom(), sky_bot);
+            mesh.add_triangle(0, 1, 2);
+            mesh.add_triangle(0, 2, 3);
+            p.add(egui::Shape::mesh(mesh));
+
+            // Subtle baseplate grid across the card.
+            let grid_col = Color32::from_rgba_unmultiplied(255, 255, 255, 16);
+            let step = 16.0;
+            let mut x = r.min.x + 8.0;
+            while x < r.max.x {
+                p.line_segment([Pos2::new(x, r.min.y), Pos2::new(x, r.max.y)], Stroke::new(1.0, grid_col));
+                x += step;
+            }
+            let mut y = r.min.y + 8.0;
+            while y < r.max.y {
+                p.line_segment([Pos2::new(r.min.x, y), Pos2::new(r.max.x, y)], Stroke::new(1.0, grid_col));
+                y += step;
+            }
+
+            let badge = Rect::from_center_size(r.center(), Vec2::splat(44.0));
+            p.rect_filled(badge, CornerRadius::same(10), Color32::from_rgba_unmultiplied(18, 20, 26, 170));
+            p.rect_stroke(badge, CornerRadius::same(10), Stroke::new(1.0, Color32::from_rgb(0x2e, 0x31, 0x3a)), egui::StrokeKind::Inside);
+            let icons = ["cube", "mountain", "sparkles", "world", "layout-grid"];
+            let glyph = icons[((h >> 4) as usize) % icons.len()];
+            crate::ti::paint(p, badge.shrink(10.0), glyph, accent);
         }
     }
 }
@@ -1188,6 +1288,7 @@ fn icon_thumb(p: &egui::Painter, r: Rect, icon: Option<egui::TextureId>, name: &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::doc::Document;
 
     use super::templates::{self, TemplateInfo};
 

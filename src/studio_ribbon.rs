@@ -20,18 +20,6 @@ fn divider(ui: &mut egui::Ui) {
 
 /// Studio's ribbon button: a 24-px icon over an 11-px label.
 pub fn ribbon_button(ui: &mut egui::Ui, icon: &str, label: &str, active: bool, enabled: bool) -> egui::Response {
-    let font = egui::FontId::proportional(11.5);
-    let tw = ui.fonts_mut(|f| f.layout_no_wrap(label.into(), font.clone(), theme::TEXT).size().x);
-    let w = (tw + 10.0).max(48.0);
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 50.0), sense);
-    let p = ui.painter();
-    let icon_r = Rect::from_center_size(r.center() - Vec2::new(0.0, 8.0), Vec2::splat(24.0));
-    if active {
-        p.rect_filled(icon_r.expand(5.0), 4.0, theme::ACTIVE_TAB.gamma_multiply(1.5));
-    } else if enabled && resp.hovered() {
-        p.rect_filled(r, 4.0, theme::HOVER_BG);
-    }
     let col = if !enabled {
         theme::TEXT_DIM.gamma_multiply(0.8)
     } else if active {
@@ -39,10 +27,31 @@ pub fn ribbon_button(ui: &mut egui::Ui, icon: &str, label: &str, active: bool, e
     } else {
         theme::TEXT
     };
+    let font = egui::FontId::proportional(11.5);
+    let galley = ui.fonts_mut(|f| f.layout_no_wrap(label.into(), font, col));
+    let tw = galley.size().x;
+    let w = (tw + 10.0).max(48.0);
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 50.0), sense);
+    let p = ui.painter();
+    let btn_r = r.shrink2(Vec2::new(1.0, 2.0));
+    if active {
+        p.rect_filled(btn_r, 6.0, theme::ACCENT.gamma_multiply(0.22));
+        p.rect_stroke(
+            btn_r,
+            6.0,
+            egui::Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.65)),
+            egui::StrokeKind::Inside,
+        );
+    } else if enabled && resp.hovered() {
+        p.rect_filled(btn_r, 6.0, theme::HOVER_BG);
+    }
+    let icon_r = Rect::from_center_size(r.center() - Vec2::new(0.0, 8.0), Vec2::splat(24.0));
     let icon_color = ribbon_icon_color(icon);
     let icon_color = if enabled { icon_color } else { icon_color.gamma_multiply(0.55) };
     crate::ti::paint(p, icon_r, icon, icon_color);
-    p.text(egui::pos2(r.center().x, r.max.y - 7.0), egui::Align2::CENTER_CENTER, label, font, col);
+    let text_pos = egui::pos2(r.center().x - galley.size().x * 0.5, r.max.y - 7.0 - galley.size().y * 0.5);
+    p.galley(text_pos, galley, col);
     resp
 }
 
@@ -94,6 +103,7 @@ impl Editor {
         let full = ui.max_rect();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+            let pill_slot = ui.painter().add(egui::Shape::Noop);
             let mut picked = None;
             let resp = egui::ComboBox::from_id_salt("run_type")
                 .width(80.0)
@@ -110,6 +120,7 @@ impl Editor {
                 })
                 .response;
             self.ui_rects.insert("test.type", resp.rect);
+            let pill_left = resp.rect;
             if let Some(t) = picked {
                 self.ui.run_type = t;
             }
@@ -126,12 +137,23 @@ impl Editor {
             }
             let resp = top_icon(ui, "player-pause-filled", theme::TEXT, false).on_hover_text("Pause: not in rustudio yet");
             self.ui_rects.insert("test.pause", resp.rect);
-            let resp = top_icon(ui, "player-stop-filled", Color32::from_rgb(200, 60, 60), mode.is_some())
+            let stop_resp = top_icon(ui, "player-stop-filled", Color32::from_rgb(200, 60, 60), mode.is_some())
                 .on_hover_text("Stop (Shift+F5)");
-            self.ui_rects.insert("test.stop", resp.rect);
-            if mode.is_some() && resp.clicked() {
+            self.ui_rects.insert("test.stop", stop_resp.rect);
+            if mode.is_some() && stop_resp.clicked() {
                 self.stop_play();
             }
+            let pill_rect = pill_left.union(stop_resp.rect).expand2(Vec2::new(3.0, 0.0));
+            ui.painter().set(
+                pill_slot,
+                egui::Shape::Rect(egui::epaint::RectShape::new(
+                    pill_rect,
+                    6.0,
+                    theme::PANEL_DARK,
+                    egui::Stroke::new(1.0, Color32::from_rgb(0x2c, 0x2e, 0x38)),
+                    egui::StrokeKind::Inside,
+                )),
+            );
             top_icon(ui, "device-mobile", theme::TEXT, false).on_hover_text("Device Simulator: not in rustudio yet");
 
             // The tabs, centred like Studio's.
@@ -149,10 +171,18 @@ impl Editor {
                 } else {
                     Color32::TRANSPARENT
                 };
-                ui.painter().rect_filled(r, 4.0, bg);
+                ui.painter().rect_filled(r, 6.0, bg);
+                if active {
+                    ui.painter().rect_filled(
+                        Rect::from_min_size(egui::pos2(r.min.x + 12.0, r.max.y - 2.0), egui::vec2(r.width() - 24.0, 2.0)),
+                        1.0,
+                        theme::ACCENT,
+                    );
+                }
                 let col = if active { theme::TEXT } else { theme::TEXT.gamma_multiply(0.75) };
                 let font = egui::FontId::proportional(13.0);
-                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, t.label(), font, col);
+                let galley = ui.fonts_mut(|f| f.layout_no_wrap(t.label().into(), font, col));
+                ui.painter().galley(r.center() - galley.size() * 0.5, galley, col);
                 self.ui_rects.insert(tab_rect_key(t), r);
                 if resp.clicked() {
                     self.ui.tab = t;
@@ -185,9 +215,36 @@ impl Editor {
                 };
                 if top_icon(ui, "users-group", theme::TEXT, false).on_hover_text(tc).clicked() {self.cloud.live_collaborators_open=true;}
                 top_icon(ui, "share", theme::TEXT, false).on_hover_text("Share: not in rustudio yet");
-                if ui.button("Collaborate").clicked() {self.cloud.live_collaborators_open=true;}
+                let collab_galley = ui.fonts_mut(|f| {
+                    f.layout_no_wrap("Collaborate".into(), egui::FontId::proportional(12.5), theme::TEXT)
+                });
+                let collab_w = 10.0 + 14.0 + 5.0 + collab_galley.size().x + 10.0;
+                let (cr, cresp) = ui.allocate_exact_size(Vec2::new(collab_w, 24.0), Sense::click());
+                let cfill = if cresp.hovered() { theme::HOVER_BG } else { theme::PANEL_DARK };
+                ui.painter().rect_filled(cr, 12.0, cfill);
+                ui.painter().rect_stroke(
+                    cr,
+                    12.0,
+                    egui::Stroke::new(1.0, Color32::from_rgb(0x36, 0x39, 0x45)),
+                    egui::StrokeKind::Inside,
+                );
+                let icon_r = Rect::from_center_size(
+                    egui::pos2(cr.min.x + 10.0 + 7.0, cr.center().y),
+                    Vec2::splat(14.0),
+                );
+                crate::ti::paint(ui.painter(), icon_r, "users", theme::TEXT);
+                let text_pos = egui::pos2(icon_r.max.x + 5.0, cr.center().y - collab_galley.size().y * 0.5);
+                ui.painter().galley(text_pos, collab_galley, theme::TEXT);
+                if cresp.clicked() {
+                    self.cloud.live_collaborators_open = true;
+                }
             });
         });
+        ui.painter().hline(
+            ui.clip_rect().x_range(),
+            full.max.y + 3.5,
+            egui::Stroke::new(1.0, Color32::from_rgb(0x24, 0x26, 0x2e)),
+        );
     }
 
     fn ribbon_tools(&mut self, ui: &mut egui::Ui, act: &mut Option<String>) {
@@ -477,14 +534,14 @@ impl Editor {
     /// more than zero.
     fn snap_widget(&mut self, ui: &mut egui::Ui) {
         ui.vertical(|ui| {
-            ui.add_space(6.0);
+            ui.add_space(3.0);
             ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.snap_move, "").on_hover_text("Snap moves to the grid");
                 let (r, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
                 crate::ti::paint(ui.painter(), r, "arrows-move", theme::TEXT_DIM);
                 let dv = egui::DragValue::new(&mut self.move_inc).range(0.01..=512.0).speed(0.1).suffix(" studs");
-                if ui.add(dv).changed() && self.move_inc > 0.0 {
+                if ui.add_sized([74.0, 20.0], dv).changed() && self.move_inc > 0.0 {
                     self.snap_move = true;
                 }
             });
@@ -493,7 +550,7 @@ impl Editor {
                 let (r, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
                 crate::ti::paint(ui.painter(), r, "rotate", theme::TEXT_DIM);
                 let dv = egui::DragValue::new(&mut self.rotate_inc).range(0.1..=180.0).speed(0.5).suffix("°");
-                if ui.add(dv).changed() && self.rotate_inc > 0.0 {
+                if ui.add_sized([74.0, 20.0], dv).changed() && self.rotate_inc > 0.0 {
                     self.snap_rotate = true;
                 }
             });
