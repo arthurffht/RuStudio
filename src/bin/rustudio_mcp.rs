@@ -27,7 +27,8 @@ use protocol::{
 use serde_json::{json, Map, Value};
 
 const BRIDGE_IO_TIMEOUT: Duration = Duration::from_secs(125);
-const PING_TIMEOUT: Duration = Duration::from_millis(800);
+const PING_TIMEOUT: Duration = Duration::from_secs(5);
+const CATALOG_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Wire framing detected from the incoming stdio stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -639,8 +640,8 @@ fn handle_bridge_tool(name: &str, args: &Value, session: &mut BridgeSession) -> 
     }
 }
 
-fn ping_port(port: u16) -> Result<(u32, u16, String, String), String> {
-    match send_bridge_to_port(port, BridgeRequest::Ping, PING_TIMEOUT)? {
+fn ping_port_timeout(port: u16, timeout: Duration) -> Result<(u32, u16, String, String), String> {
+    match send_bridge_to_port(port, BridgeRequest::Ping, timeout)? {
         BridgeResponse::Pong {
             pid,
             port,
@@ -650,6 +651,10 @@ fn ping_port(port: u16) -> Result<(u32, u16, String, String), String> {
         BridgeResponse::Error { message, .. } => Err(message),
         _ => Err("unexpected response to Ping".into()),
     }
+}
+
+fn ping_port(port: u16) -> Result<(u32, u16, String, String), String> {
+    ping_port_timeout(port, PING_TIMEOUT)
 }
 
 fn collect_instances_payload(session: &BridgeSession) -> Value {
@@ -795,8 +800,8 @@ fn tool_studio_launch(args: &Value, session: &mut BridgeSession) -> ToolCallResu
     let timeout_secs = args
         .get("timeout_secs")
         .and_then(|v| v.as_f64())
-        .unwrap_or(15.0)
-        .clamp(1.0, 60.0);
+        .unwrap_or(30.0)
+        .clamp(1.0, 120.0);
 
     let explicit_port = match args.get("port").filter(|v| !v.is_null()) {
         Some(v) => match v.as_u64().and_then(|n| u16::try_from(n).ok()).filter(|&p| p > 0) {
@@ -898,7 +903,9 @@ fn tool_studio_launch(args: &Value, session: &mut BridgeSession) -> ToolCallResu
             .or(explicit_port);
 
         if let Some(port) = candidate_port {
-            if let Ok((pid, pong_port, title, mode)) = ping_port(port) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let ping_wait = remaining.clamp(Duration::from_millis(200), PING_TIMEOUT);
+            if let Ok((pid, pong_port, title, mode)) = ping_port_timeout(port, ping_wait) {
                 if pid == child_pid || explicit_port.is_some() {
                     if select {
                         session.selected_pid = Some(pid);
@@ -1128,7 +1135,7 @@ fn list_all_tools(session: &BridgeSession) -> Vec<ToolDef> {
         .resolve_target(None)
         .ok()
         .and_then(|(port, _, _)| {
-            send_bridge_to_port(port, BridgeRequest::ListTools, Duration::from_secs(3)).ok()
+            send_bridge_to_port(port, BridgeRequest::ListTools, CATALOG_TIMEOUT).ok()
         })
         .and_then(|resp| match resp {
             BridgeResponse::Tools { tools } if !tools.is_empty() => Some(tools),
@@ -1174,7 +1181,7 @@ fn list_all_resources(session: &BridgeSession) -> Vec<ResourceDef> {
         .resolve_target(None)
         .ok()
         .and_then(|(port, _, _)| {
-            send_bridge_to_port(port, BridgeRequest::ListResources, Duration::from_secs(3)).ok()
+            send_bridge_to_port(port, BridgeRequest::ListResources, CATALOG_TIMEOUT).ok()
         })
         .and_then(|resp| match resp {
             BridgeResponse::Resources { resources } if !resources.is_empty() => Some(resources),
@@ -1194,7 +1201,7 @@ fn list_all_prompts(session: &BridgeSession) -> Vec<PromptDef> {
         .resolve_target(None)
         .ok()
         .and_then(|(port, _, _)| {
-            send_bridge_to_port(port, BridgeRequest::ListPrompts, Duration::from_secs(3)).ok()
+            send_bridge_to_port(port, BridgeRequest::ListPrompts, CATALOG_TIMEOUT).ok()
         })
         .and_then(|resp| match resp {
             BridgeResponse::Prompts { prompts } if !prompts.is_empty() => Some(prompts),
@@ -1239,7 +1246,7 @@ fn bridge_native_tools() -> Vec<ToolDef> {
                     "fixed_dt": { "type": ["string", "number"], "description": "Deterministic simulation timestep (e.g. '1/60' or 0.0166667)." },
                     "no_plugins": { "type": "boolean", "description": "Disable loading user/installed Studio plugins." },
                     "select": { "type": "boolean", "description": "Automatically select the launched instance for this MCP session (default: true)." },
-                    "timeout_secs": { "type": "number", "description": "Maximum seconds to wait for bridge readiness (default: 15, max: 60)." }
+                    "timeout_secs": { "type": "number", "description": "Maximum seconds to wait for bridge readiness (default: 30, max: 120)." }
                 }
             }),
         ),
