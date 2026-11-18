@@ -4145,15 +4145,6 @@ impl Editor {
         }
     }
 
-    /// This frame's lighting: shader constants, local lights, and whether
-    /// to draw the sun's shadow map.
-    pub fn frame_lighting(
-        &mut self,
-        rect: Rect,
-    ) -> (crate::render::Globals, Vec<crate::render::LightRaw>, bool, [crate::sun_shadow::Cascade; crate::sun_shadow::CASCADES]) {
-        self.frame_lighting_quality(rect, mech::QUALITY_LEVEL_MAX)
-    }
-
     fn frame_lighting_quality(
         &mut self,
         rect: Rect,

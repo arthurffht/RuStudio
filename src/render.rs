@@ -1133,6 +1133,7 @@ struct Target {
     /// The tone-mapped image egui shows.
     display_tex: ID3D11Texture2D,
     display_rtv: ID3D11RenderTargetView,
+    #[allow(dead_code)]
     display_srv: ID3D11ShaderResourceView,
 }
 

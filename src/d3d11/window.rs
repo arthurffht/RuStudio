@@ -321,7 +321,7 @@ impl D3d11WindowRunner {
             let inner = window.inner_size();
             if id == egui::ViewportId::ROOT
                 && shared.vsync
-                && !minimized
+                && !is_invisible_or_minimized(&window)
                 && effective_swapchain_size(inner.width, inner.height).is_some()
             {
                 if let Some(sc) = vp.swapchain.as_ref() {
@@ -600,7 +600,7 @@ impl D3d11WindowRunner {
 
     fn check_redraw_requests(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
-        let mut invisible_windows = Vec::new();
+        let mut invisible_windows: Vec<(WindowId, bool)> = Vec::new();
         let mut due_visible = Vec::new();
 
         self.next_repaints.retain(|&win_id, &mut repaint_time| {
@@ -624,7 +624,7 @@ impl D3d11WindowRunner {
                         return false;
                     }
                     if is_invisible_or_minimized(&window) {
-                        invisible_windows.push(win_id);
+                        invisible_windows.push((win_id, vp.initial_visible));
                     } else {
                         due_visible.push(window);
                     }
@@ -638,13 +638,18 @@ impl D3d11WindowRunner {
         }
 
         // Invisible or minimized windows on Windows do not receive RedrawRequested.
-        for win_id in &invisible_windows {
-            match self.run_ui_and_paint(event_loop, *win_id) {
+        let mut throttled_any = false;
+        for &(win_id, throttle_hidden) in &invisible_windows {
+            match self.run_ui_and_paint(event_loop, win_id) {
                 Ok(true) => {
                     self.finish_exit(event_loop);
                     return;
                 }
-                Ok(false) => {}
+                Ok(false) => {
+                    if throttle_hidden {
+                        throttled_any = true;
+                    }
+                }
                 Err(err) => {
                     self.exit_error = Some(err);
                     self.finish_exit(event_loop);
@@ -653,12 +658,14 @@ impl D3d11WindowRunner {
             }
         }
 
-        if !invisible_windows.is_empty() {
+        if throttled_any {
             let throttled = Instant::now() + INVISIBLE_WINDOW_REPAINT_INTERVAL;
-            for win_id in invisible_windows {
-                self.next_repaints
-                    .entry(win_id)
-                    .and_modify(|t| *t = (*t).min(throttled));
+            for &(win_id, throttle_hidden) in &invisible_windows {
+                if throttle_hidden {
+                    self.next_repaints
+                        .entry(win_id)
+                        .and_modify(|t| *t = (*t).min(throttled));
+                }
             }
         }
 
@@ -927,7 +934,7 @@ impl ApplicationHandler<UserEvent> for D3d11WindowRunner {
                             if w.is_minimized() == Some(true) && vp.shown_once {
                                 return None;
                             }
-                            let throttled = if is_invisible_or_minimized(w) {
+                            let throttled = if vp.initial_visible && is_invisible_or_minimized(w) {
                                 when.max(Instant::now() + INVISIBLE_WINDOW_REPAINT_INTERVAL)
                             } else {
                                 when
