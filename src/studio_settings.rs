@@ -1204,7 +1204,7 @@ mod tests {
         assert_eq!(count("Selection"), 25);
         assert_eq!(count("Diagnostics"), 8);
         assert_eq!(count("Network"), 13);
-        assert_eq!(count("Rendering"), 11);
+        assert_eq!(count("Rendering"), 12);
         // Studio's defaults as Vinegar answered them.
         assert_eq!(DEFS[index("Studio", "Camera Speed").unwrap()].default_val(), Val::Num(1.5));
         assert_eq!(shown(&DEFS[index("Studio", "Select Color").unwrap()], &DEFS[index("Studio", "Select Color").unwrap()].default_val()), "[25, 153, 255]");

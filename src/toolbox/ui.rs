@@ -112,12 +112,7 @@ pub fn lane_cards(w: f32) -> (usize, f32) {
 }
 
 pub fn open_url(url: &str) {
-    #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    crate::platform::open_url(url);
 }
 
 /// Popups drawn in the panel's dark style (Areas take the context's
@@ -1823,16 +1818,42 @@ fn breadcrumb(ui: &mut egui::Ui, parts: &[&str], cmds: &mut Vec<Cmd>) {
 }
 
 fn signed_out(ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
-    ui.add_space(40.0);
+    ui.add_space(28.0);
+    let card_w = (ui.available_width() - 16.0).clamp(180.0, 320.0);
     ui.vertical_centered(|ui| {
-        let (r, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
-        icon(ui.painter(), r, "lock", theme::TEXT_DIM);
-        ui.label(egui::RichText::new("Sign in to use the Toolbox").font(bold(14.0)).color(theme::TEXT));
-        ui.add(egui::Label::new(egui::RichText::new("Browse the Creator Store, your inventory and your creations after you sign in to Roblox.").size(12.5).color(theme::TEXT_DIM)).wrap());
-        ui.add_space(8.0);
-        if ui.add(egui::Button::new(egui::RichText::new("Sign In").color(Color32::WHITE)).fill(theme::ACCENT)).clicked() {
-            cmds.push(Cmd::SignIn);
-        }
+        egui::Frame::new()
+            .fill(theme::PANEL_DARK)
+            .stroke(Stroke::new(1.0, theme::DIVIDER))
+            .corner_radius(8.0)
+            .inner_margin(egui::Margin::symmetric(16, 20))
+            .show(ui, |ui| {
+                ui.set_width(card_w - 32.0);
+                ui.vertical_centered(|ui| {
+                    let (badge, _) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::hover());
+                    ui.painter().circle_filled(badge.center(), 24.0, theme::PANEL_ALT);
+                    ui.painter().circle_stroke(badge.center(), 24.0, Stroke::new(1.0, theme::DIVIDER));
+                    icon(ui.painter(), badge.shrink(12.0), "lock", theme::ACCENT);
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("Sign in to use the Toolbox").font(bold(14.0)).color(theme::TEXT));
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("Browse the Creator Store, your inventory and your creations after you sign in to Roblox.")
+                                .size(12.0)
+                                .color(theme::TEXT_DIM),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(12.0);
+                    let btn = egui::Button::new(egui::RichText::new("Sign In").size(13.0).strong().color(Color32::WHITE))
+                        .fill(theme::ACCENT)
+                        .corner_radius(6.0)
+                        .min_size(Vec2::new(112.0, 30.0));
+                    if ui.add(btn).clicked() {
+                        cmds.push(Cmd::SignIn);
+                    }
+                });
+            });
     });
 }
 

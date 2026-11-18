@@ -24,7 +24,7 @@ const E_MESHPARTDETAILLEVEL: &[(&str, u32, &str)] = &[("DistanceBased", 0, "Dist
 const E_GRAPHICSMODE: &[(&str, u32, &str)] = &[("Automatic", 1, "Automatic"), ("Direct3D11", 2, "Direct3D11"), ("OpenGL", 4, "OpenGL"), ("Metal", 5, "Metal"), ("Vulkan", 6, "Vulkan"), ("NoGraphics", 9, "NoGraphics")];
 const E_FRAMERATEMANAGERMODE: &[(&str, u32, &str)] = &[("Automatic", 0, "Automatic"), ("On", 1, "On"), ("Off", 2, "Off")];
 
-/// 218 rows, in the dialog's order.
+/// 219 rows, in the dialog's order.
 pub const DEFS: &[Def] = &[
     Def { page: "Studio", cat: "Camera", label: "Camera Speed", class: "Studio", prop: "Camera Speed", kind: Kind::Float, dflt: Dflt::N(1.5) },
     Def { page: "Studio", cat: "Camera", label: "Pan Speed", class: "Studio", prop: "Camera Pan Speed", kind: Kind::Float, dflt: Dflt::N(1.0) },
@@ -234,6 +234,7 @@ pub const DEFS: &[Def] = &[
     Def { page: "Physics", cat: "Display", label: "Show fluid forces for selected or hovered mechanisms", class: "PhysicsSettings", prop: "ShowFluidForcesForSelectedOrHoveredMechanisms", kind: Kind::Bool, dflt: Dflt::B(false) },
     Def { page: "Physics", cat: "Display", label: "Fluid Force Draw Scale", class: "PhysicsSettings", prop: "FluidForceDrawScale", kind: Kind::Float, dflt: Dflt::N(1.0) },
     Def { page: "Rendering", cat: "Performance", label: "Editor Quality Level", class: "RenderSettings", prop: "EditQualityLevel", kind: Kind::Enum("QualityLevel", E_QUALITYLEVEL), dflt: Dflt::E(21) },
+    Def { page: "Rendering", cat: "Performance", label: "Quality Level", class: "RenderSettings", prop: "QualityLevel", kind: Kind::Enum("QualityLevel", E_QUALITYLEVEL), dflt: Dflt::E(0) },
     Def { page: "Rendering", cat: "Debug", label: "Mesh Detail Level", class: "RenderSettings", prop: "MeshPartDetailLevel", kind: Kind::Enum("MeshPartDetailLevel", E_MESHPARTDETAILLEVEL), dflt: Dflt::E(0) },
     Def { page: "Rendering", cat: "Debug", label: "Render CSG Triangles Debug", class: "RenderSettings", prop: "RenderCSGTrianglesDebug", kind: Kind::Bool, dflt: Dflt::B(false) },
     Def { page: "Rendering", cat: "Debug", label: "Show Bounding Boxes", class: "RenderSettings", prop: "ShowBoundingBoxes", kind: Kind::Bool, dflt: Dflt::B(false) },

@@ -1619,7 +1619,7 @@ pub fn install_constructors(lua: &Lua) -> mlua::Result<()> {
             continue;
         }
         let mut fns = Vec::new();
-        for pair in t.pairs::<mlua::String, Value>() {
+        for pair in t.pairs::<mlua::LuaString, Value>() {
             let (k, v) = pair?;
             if let Value::Function(f) = v {
                 fns.push((k, f));

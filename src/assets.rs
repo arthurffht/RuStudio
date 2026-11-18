@@ -73,15 +73,56 @@ pub fn content_dir() -> PathBuf {
             return PathBuf::from(p);
         }
     }
-    let link = crate::paths::data().join("rustudio/content");
-    if !link.exists() {
-        // No link to a Studio install: Studio installed on this Mac, else
-        // the copy rustudio downloaded.
-        if let Some(d) = crate::paths::installed_studio().or_else(crate::studio_content::installed) {
-            return d.join("content");
+    static CACHE: std::sync::OnceLock<std::sync::RwLock<(u64, PathBuf)>> = std::sync::OnceLock::new();
+    let compute = || {
+        let link = crate::paths::data().join("rustudio/content");
+        if !link.exists() {
+            // No link to a Studio install: Studio installed on Windows,
+            // rustudio's downloaded copy, or Roblox Player as fallback.
+            if let Some(d) = crate::paths::installed_studio()
+                .or_else(crate::studio_content::installed)
+                .or_else(crate::paths::installed_player)
+            {
+                return d.join("content");
+            }
+        }
+        link
+    };
+    let gen = crate::studio_content::content_generation();
+    let lock = CACHE.get_or_init(|| std::sync::RwLock::new((gen, compute())));
+    if let Ok(guard) = lock.read() {
+        if guard.0 == gen {
+            return guard.1.clone();
         }
     }
-    link
+    let fresh = compute();
+    if let Ok(mut guard) = lock.write() {
+        *guard = (gen, fresh.clone());
+    }
+    fresh
+}
+
+fn studio_root_for(base: &Path) -> Option<PathBuf> {
+    static ROOT: std::sync::OnceLock<std::sync::RwLock<(u64, PathBuf, Option<PathBuf>)>> =
+        std::sync::OnceLock::new();
+    let compute = |b: &Path| {
+        b.canonicalize()
+            .ok()
+            .and_then(|c| c.parent().map(Path::to_path_buf))
+            .or_else(|| b.parent().map(Path::to_path_buf))
+    };
+    let gen = crate::studio_content::content_generation();
+    let lock = ROOT.get_or_init(|| std::sync::RwLock::new((gen, base.to_path_buf(), compute(base))));
+    if let Ok(guard) = lock.read() {
+        if guard.0 == gen && guard.1 == base {
+            return guard.2.clone();
+        }
+    }
+    let fresh = compute(base);
+    if let Ok(mut guard) = lock.write() {
+        *guard = (gen, base.to_path_buf(), fresh.clone());
+    }
+    fresh
 }
 
 /// The asset cache folder: RUSTUDIO_CACHE_DIR, else ~/.cache/rustudio.
@@ -276,18 +317,24 @@ fn legacy_content(rest: &str) -> Option<u64> {
     legacy_lookup(table, rest)
 }
 
-/// The legacy table less the files `content` (or its PlatformContent/pc)
-/// still has.
+/// The legacy table less the files `content` (or its PlatformContent/pc /
+/// ExtraContent) still has.
 fn legacy_table(content: &Path) -> HashMap<String, u64> {
-    let platform = content
+    let root = content
         .canonicalize()
         .ok()
-        .and_then(|c| c.parent().map(|p| p.join("PlatformContent/pc")));
+        .and_then(|c| c.parent().map(Path::to_path_buf));
+    let platform = root.as_ref().map(|p| p.join("PlatformContent/pc"));
+    let extra = root.as_ref().map(|p| p.join("ExtraContent"));
     include_str!("../assets/legacy-content.tsv")
         .lines()
         .filter(|l| !l.starts_with('#'))
         .filter_map(|l| l.split_once('\t'))
-        .filter(|(p, _)| !content.join(p).is_file() && !platform.as_ref().is_some_and(|d| d.join(p).is_file()))
+        .filter(|(p, _)| {
+            !content.join(p).is_file()
+                && !platform.as_ref().is_some_and(|d| d.join(p).is_file())
+                && !extra.as_ref().is_some_and(|d| d.join(p).is_file())
+        })
         .filter_map(|(p, id)| Some((p.to_ascii_lowercase(), id.trim().parse().ok()?)))
         .collect()
 }
@@ -309,18 +356,19 @@ pub fn resolve(id: &str, doc_dir: Option<&Path>) -> Option<PathBuf> {
         {
             return None;
         }
-        let p = content_dir().join(rest);
-        // Like Studio: what isn't in content/ may be in the platform
-        // content beside it (PlatformContent/pc/textures/sky/... holds the
+        let base = content_dir();
+        let p = base.join(rest);
+        // Like Studio: what isn't in content/ may be in PlatformContent/pc/ or
+        // ExtraContent/ beside it (PlatformContent/pc/textures/sky/... holds the
         // default skybox).
         if !p.exists() {
-            if let Some(alt) = content_dir()
-                .canonicalize()
-                .ok()
-                .and_then(|c| c.parent().map(|s| s.join("PlatformContent/pc").join(rest)))
-                .filter(|a| a.is_file())
-            {
-                return Some(alt);
+            if let Some(root) = studio_root_for(&base) {
+                for sub in ["PlatformContent/pc", "ExtraContent"] {
+                    let alt = root.join(sub).join(rest);
+                    if alt.is_file() {
+                        return Some(alt);
+                    }
+                }
             }
             // The retired death sound: Studio plays sounds/oof.ogg (its 2022
             // replacement) for it; rustudio plays the classic Oof once fetched.
@@ -330,7 +378,7 @@ pub fn resolve(id: &str, doc_dir: Option<&Path>) -> Option<PathBuf> {
                     return Some(classic);
                 }
                 crate::studio_content::fetch_classic_oof_once();
-                let oof = content_dir().join("sounds/oof.ogg");
+                let oof = base.join("sounds/oof.ogg");
                 if oof.is_file() {
                     return Some(oof);
                 }

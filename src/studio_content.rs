@@ -21,12 +21,18 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 static FONTS_READY: AtomicBool = AtomicBool::new(false);
+static CONTENT_GEN: AtomicU64 = AtomicU64::new(1);
+
+pub fn content_generation() -> u64 {
+    CONTENT_GEN.load(Ordering::Acquire)
+}
 
 pub fn notify_fonts_ready() {
+    CONTENT_GEN.fetch_add(1, Ordering::Release);
     FONTS_READY.store(true, Ordering::Release);
 }
 
@@ -247,6 +253,7 @@ pub fn install(progress: &dyn Fn(&str)) -> Result<String, String> {
     }
     let _ = std::fs::remove_dir_all(&dest);
     std::fs::rename(&partial, &dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    notify_fonts_ready();
     progress(&format!("installed in {}", dest.display()));
     Ok(version)
 }

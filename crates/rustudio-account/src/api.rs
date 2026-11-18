@@ -171,7 +171,11 @@ mod asset_tests {
 pub fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
-        .user_agent(concat!("rustudio/", env!("CARGO_PKG_VERSION")))
+        .timeout_global(Some(std::time::Duration::from_secs(25)))
+        .user_agent(concat!(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) rustudio/",
+            env!("CARGO_PKG_VERSION")
+        ))
         .build()
         .into()
 }
@@ -226,7 +230,7 @@ impl SignedOut {
     pub fn describe(&self) -> String {
         match self {
             SignedOut::NoCookie => format!(
-                "signed out (no session: put the .ROBLOSECURITY value in {} with mode 600)",
+                "signed out (no session: sign in to Roblox or put the .ROBLOSECURITY value in {})",
                 session::cookie_file().display()
             ),
             SignedOut::Rejected(why) => why.clone(),
