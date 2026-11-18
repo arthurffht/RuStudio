@@ -59,37 +59,6 @@ struct Vpx {
     destroy: unsafe extern "C" fn(*mut c_void) -> c_int,
 }
 
-#[cfg(unix)]
-fn vpx() -> Option<&'static Vpx> {
-    static LIB: OnceLock<Option<Vpx>> = OnceLock::new();
-    LIB.get_or_init(|| unsafe {
-        let mut h = std::ptr::null_mut();
-        for name in crate::platform::shared_library_names("vpx", &["12", "11", "9"]) {
-            h = libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
-            if !h.is_null() {
-                break;
-            }
-        }
-        if h.is_null() {
-            return None;
-        }
-        let sym = |n: &std::ffi::CStr| {
-            let p = libc::dlsym(h, n.as_ptr() as *const c_char);
-            (!p.is_null()).then_some(p)
-        };
-        Some(Vpx {
-            vp8: std::mem::transmute::<*mut c_void, _>(sym(c"vpx_codec_vp8_dx")?),
-            vp9: std::mem::transmute::<*mut c_void, _>(sym(c"vpx_codec_vp9_dx")?),
-            init: std::mem::transmute::<*mut c_void, _>(sym(c"vpx_codec_dec_init_ver")?),
-            decode: std::mem::transmute::<*mut c_void, _>(sym(c"vpx_codec_decode")?),
-            get_frame: std::mem::transmute::<*mut c_void, _>(sym(c"vpx_codec_get_frame")?),
-            destroy: std::mem::transmute::<*mut c_void, _>(sym(c"vpx_codec_destroy")?),
-        })
-    })
-    .as_ref()
-}
-
-#[cfg(not(unix))]
 fn vpx() -> Option<&'static Vpx> {
     None
 }
@@ -291,34 +260,6 @@ struct Opus {
     destroy: unsafe extern "C" fn(*mut c_void),
 }
 
-#[cfg(unix)]
-fn opus() -> Option<&'static Opus> {
-    static LIB: OnceLock<Option<Opus>> = OnceLock::new();
-    LIB.get_or_init(|| unsafe {
-        let mut h = std::ptr::null_mut();
-        for name in crate::platform::shared_library_names("opus", &["0"]) {
-            h = libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
-            if !h.is_null() {
-                break;
-            }
-        }
-        if h.is_null() {
-            return None;
-        }
-        let sym = |n: &std::ffi::CStr| {
-            let p = libc::dlsym(h, n.as_ptr() as *const c_char);
-            (!p.is_null()).then_some(p)
-        };
-        Some(Opus {
-            create: std::mem::transmute::<*mut c_void, _>(sym(c"opus_decoder_create")?),
-            decode: std::mem::transmute::<*mut c_void, _>(sym(c"opus_decode_float")?),
-            destroy: std::mem::transmute::<*mut c_void, _>(sym(c"opus_decoder_destroy")?),
-        })
-    })
-    .as_ref()
-}
-
-#[cfg(not(unix))]
 fn opus() -> Option<&'static Opus> {
     None
 }

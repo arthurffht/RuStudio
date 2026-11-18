@@ -32,32 +32,6 @@ fn instr_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("RUSTUDIO_BENCH_INSTR").is_some())
 }
 
-/// This thread's user-space instructions retired so far (perf_event_open
-/// on itself; 0 if unavailable).
-#[cfg(target_os = "linux")]
-pub(crate) fn instructions() -> u64 {
-    thread_local! {
-        static FD: i32 = unsafe {
-            // struct perf_event_attr: type, size, config, …, flags.
-            let mut attr = [0u64; 16];
-            let a = attr.as_mut_ptr() as *mut u32;
-            *a = 0; // PERF_TYPE_HARDWARE
-            *a.add(1) = 128; // size
-            attr[1] = 1; // PERF_COUNT_HW_INSTRUCTIONS
-            attr[5] = (1 << 5) | (1 << 6); // exclude_kernel | exclude_hv
-            libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0) as i32
-        };
-    }
-    FD.with(|fd| {
-        if *fd < 0 {
-            return 0;
-        }
-        let mut v = 0u64;
-        unsafe { libc::read(*fd, &mut v as *mut u64 as *mut libc::c_void, 8) };
-        v
-    })
-}
-
 /// Windows has no per-thread instruction counter without admin-only
 /// profilers: this thread's CPU cycles instead (QueryThreadCycleTime), which
 /// like instructions don't stretch while the thread waits for a core. The
@@ -71,7 +45,7 @@ pub(crate) fn instructions() -> u64 {
     cycles
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(windows))]
 pub(crate) fn instructions() -> u64 {
     0
 }
@@ -418,14 +392,6 @@ fn take_sections() -> Vec<(&'static str, f64, u64)> {
 /// CPU time this thread has used, in ms (not the time it waited for a core:
 /// on a busy machine frame times stretch, this much less so).
 fn thread_cpu_ms() -> f64 {
-    #[cfg(unix)]
-    {
-        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        // SAFETY: a valid timespec out-pointer and a clock id the OS defines.
-        if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } == 0 {
-            return ts.tv_sec as f64 * 1000.0 + ts.tv_nsec as f64 / 1e6;
-        }
-    }
     // (kernel + user time in 100 ns units, advanced at the scheduler's tick:
     // fine for a bench's total, not for one frame)
     #[cfg(windows)]
@@ -440,8 +406,7 @@ fn thread_cpu_ms() -> f64 {
             return ms(kernel) + ms(user);
         }
     }
-    // (NaN: null in the report, "not supported on this platform")
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(windows))]
     return f64::NAN;
     0.0
 }

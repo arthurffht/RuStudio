@@ -80,12 +80,15 @@ trap {
 }
 $Prefix = [IO.Path]::GetFullPath($Prefix)
 $shortcutPath = Join-Path $ProgramsDirectory 'rustudio.lnk'
-$files = @('rustudio.exe', 'api-dump.json', 'LICENSE-MIT', 'LICENSE-APACHE', 'README.md', 'install.ps1', 'uninstall.cmd')
+$files = @('rustudio.exe', 'rustudio-mcp.exe', 'api-dump.json', 'LICENSE-MIT', 'LICENSE-APACHE', 'README.md', 'install.ps1', 'uninstall.cmd')
 $exe = Join-Path $Prefix 'rustudio.exe'
-# Fail before copying if the installed executable is still running.
-if (Test-Path $exe) {
-    $stream = [IO.File]::Open($exe, 'Open', 'ReadWrite', 'None')
-    $stream.Dispose()
+$mcpExe = Join-Path $Prefix 'rustudio-mcp.exe'
+# Fail before copying if an installed executable is still running.
+foreach ($bin in @($exe, $mcpExe)) {
+    if (Test-Path $bin) {
+        $stream = [IO.File]::Open($bin, 'Open', 'ReadWrite', 'None')
+        $stream.Dispose()
+    }
 }
 if ($Uninstall) {
     if (Test-Path $shortcutPath) {

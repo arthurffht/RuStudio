@@ -1,6 +1,6 @@
-//! `RUSTUDIO_CONTROL=PATH`: drive a running rustudio over a Unix socket, so
-//! comparison captures (Studio vs rustudio, from the same camera) don't
-//! restart it for every picture.
+//! `RUSTUDIO_CONTROL=127.0.0.1:PORT` (or `PORT`): drive a running rustudio over
+//! localhost TCP, so comparison captures (Studio vs rustudio, from the same camera)
+//! don't restart it for every picture.
 //!
 //! One command per line, one reply line each:
 //!
@@ -22,7 +22,7 @@
 //! - `quit` → `ok`, then rustudio closes.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -66,10 +66,18 @@ struct Shot {
 }
 
 impl Control {
-    /// Listens on `path` (a stale socket file there is replaced).
-    pub fn listen(path: &str) -> std::io::Result<Control> {
-        let _ = std::fs::remove_file(path);
-        let listener = UnixListener::bind(path)?;
+    /// Listens on `127.0.0.1:PORT` (`addr` may be `PORT`, `:PORT`, or `127.0.0.1:PORT`).
+    pub fn listen(addr: &str) -> std::io::Result<Control> {
+        let trimmed = addr.trim();
+        let bind_addr = if trimmed.parse::<u16>().is_ok() {
+            format!("127.0.0.1:{trimmed}")
+        } else if let Some(rest) = trimmed.strip_prefix(':') {
+            format!("127.0.0.1:{rest}")
+        } else {
+            trimmed.to_string()
+        };
+        let listener = TcpListener::bind(&bind_addr)?;
+        let local = listener.local_addr()?;
         let (tx, rx) = channel::<(String, Sender<String>)>();
         std::thread::Builder::new().name("control".into()).spawn(move || {
             for stream in listener.incoming().flatten() {
@@ -89,7 +97,7 @@ impl Control {
                 });
             }
         })?;
-        eprintln!("[control] listening on {path}");
+        eprintln!("[control] listening on {local}");
         Ok(Control { rx, moved_at: 0, shot: None, fit: None, lower_in: 2 })
     }
 }

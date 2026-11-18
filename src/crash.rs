@@ -1,26 +1,24 @@
-//! Crash reports: a panic (any thread) or a fatal signal writes
-//! `~/.cache/rustudio/crash/<timestamp>-<pid>.txt` with a backtrace, and the
-//! next start lists any report it hasn't mentioned yet in Output. A crash is
-//! never silent, even when rustudio was started from a launcher with no
-//! terminal.
+//! Crash reports: a panic (any thread) or an unhandled Windows SEH exception
+//! writes `%LOCALAPPDATA%\rustudio\crash\<timestamp>-<pid>.txt` with a
+//! backtrace, and the next start lists any report it hasn't mentioned yet in
+//! Output. A crash is never silent, even when rustudio was started with no
+//! console.
 
 use std::backtrace::Backtrace;
-use std::ffi::CString;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Where reports go.
+/// Where reports go (`%LOCALAPPDATA%\rustudio\crash`).
 pub fn dir() -> PathBuf {
     crate::paths::cache().join("rustudio").join("crash")
 }
 
-/// The report file named for this process (made at install, so the signal
-/// handler needs no allocation to find it).
-static SIGNAL_PATH: OnceLock<CString> = OnceLock::new();
+/// Pre-computed report path for this process.
+static CRASH_PATH: OnceLock<PathBuf> = OnceLock::new();
 /// The first fatal event writes the report; a panic that then aborts must
-/// not overwrite its own report with the abort's.
+/// not overwrite its own report.
 static WRITTEN: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
@@ -74,10 +72,11 @@ fn write_report(body: &str) -> Option<PathBuf> {
     Some(path)
 }
 
-/// Install the panic hook and the fatal-signal handlers. Call first in main.
+/// Install the panic hook and the Windows SEH unhandled exception filter.
+/// Call first in main.
 pub fn install() {
     let path = dir().join(format!("{}-{}.txt", stamp(), std::process::id()));
-    let _ = SIGNAL_PATH.set(CString::new(path.to_string_lossy().as_bytes()).unwrap_or_default());
+    let _ = CRASH_PATH.set(path);
 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -111,116 +110,45 @@ pub fn install() {
     }));
 
     let _ = std::fs::create_dir_all(dir());
-    // SAFETY: plain sigaction setup; the handler below only uses
-    // async-signal-safe calls until it has written the basic note.
-    #[cfg(unix)]
+    #[cfg(windows)]
     unsafe {
-        // An alternate stack, so a stack overflow can still run the handler.
-        let size = 64 * 1024;
-        let stack = libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        );
-        if stack != libc::MAP_FAILED {
-            let ss = libc::stack_t {
-                ss_sp: stack,
-                ss_flags: 0,
-                ss_size: size,
-            };
-            libc::sigaltstack(&ss, std::ptr::null_mut());
-        }
-        // (SIGTRAP: a trap instruction on arm64, e.g. Luau's __builtin_trap,
-        // which is SIGILL on x86_64.)
-        for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE, libc::SIGTRAP, libc::SIGABRT] {
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = on_signal as *const () as usize;
-            sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESETHAND;
-            libc::sigemptyset(&mut sa.sa_mask);
-            let mut old: libc::sigaction = std::mem::zeroed();
-            if libc::sigaction(sig, &sa, &mut old) == 0 {
-                OLD[slot(sig)] = old;
-            }
-        }
+        windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter(Some(
+            unhandled_exception_filter,
+        ));
     }
 }
 
-#[cfg(unix)]
-static mut OLD: [libc::sigaction; 6] = unsafe { std::mem::zeroed() };
-
-#[cfg(unix)]
-fn slot(sig: libc::c_int) -> usize {
-    match sig {
-        libc::SIGSEGV => 0,
-        libc::SIGBUS => 1,
-        libc::SIGILL => 2,
-        libc::SIGFPE => 3,
-        libc::SIGTRAP => 4,
-        _ => 5,
-    }
-}
-
-#[cfg(unix)]
-fn sig_name(sig: libc::c_int) -> &'static [u8] {
-    match sig {
-        libc::SIGSEGV => b"SIGSEGV (invalid memory access)",
-        libc::SIGBUS => b"SIGBUS",
-        libc::SIGILL => b"SIGILL",
-        libc::SIGFPE => b"SIGFPE",
-        libc::SIGTRAP => b"SIGTRAP (trap instruction)",
-        _ => b"SIGABRT (abort)",
-    }
-}
-
-#[cfg(unix)]
-extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
-    // SAFETY: async-signal-safe calls (open/write/close/alarm/sigaction) for
-    // the note; the backtrace after it is best effort under a 5 s alarm, so
-    // a lock held by the faulting thread turns into an exit, not a hang.
-    unsafe {
-        if !WRITTEN.swap(true, Ordering::SeqCst) {
-            if let Some(p) = SIGNAL_PATH.get() {
-                let fd = libc::open(p.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644);
-                if fd >= 0 {
-                    let w = |b: &[u8]| {
-                        libc::write(fd, b.as_ptr().cast(), b.len());
-                    };
-                    w(b"rustudio crashed: fatal signal ");
-                    w(sig_name(sig));
-                    w(b"\n\n");
-                    libc::alarm(5);
-                    // Not async-signal-safe; we are dying anyway.
-                    let body = format!("{}backtrace:\n{}\n", header("signal"), Backtrace::force_capture());
-                    w(body.as_bytes());
-                    libc::close(fd);
-                    libc::alarm(0);
-                }
-            }
-        }
-        // Hand the signal to whoever had it before (Rust's stack-overflow
-        // reporter, or the default action that dumps core).
-        let old = &raw const OLD;
-        let old = &(*old)[slot(sig)];
-        libc::sigaction(sig, old, std::ptr::null_mut());
-        if old.sa_sigaction != libc::SIG_DFL && old.sa_sigaction != libc::SIG_IGN {
-            if old.sa_flags & libc::SA_SIGINFO != 0 {
-                let f: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
-                    std::mem::transmute(old.sa_sigaction);
-                f(sig, info, ctx);
+#[cfg(windows)]
+unsafe extern "system" fn unhandled_exception_filter(
+    info: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    if !WRITTEN.swap(true, Ordering::SeqCst) {
+        let (code, addr) = if !info.is_null() {
+            let rec = unsafe { (*info).ExceptionRecord };
+            if !rec.is_null() {
+                unsafe { ((*rec).ExceptionCode as u32, (*rec).ExceptionAddress as usize) }
             } else {
-                let f: extern "C" fn(libc::c_int) = std::mem::transmute(old.sa_sigaction);
-                f(sig);
+                (0, 0)
             }
-            return;
+        } else {
+            (0, 0)
+        };
+        let kind = format!("Windows SEH exception {code:#010x} at {addr:#x}");
+        let bt = Backtrace::force_capture();
+        let body = format!(
+            "rustudio crashed: fatal {kind}\n\n{}backtrace:\n{bt}\n",
+            header(&kind)
+        );
+        if let Some(p) = CRASH_PATH.get() {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(p, body.as_bytes());
+        } else {
+            let _ = write_report(&body);
         }
-        if sig == libc::SIGABRT {
-            libc::raise(sig);
-        }
-        // Returning re-runs the faulting instruction under the default action.
     }
+    windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH
 }
 
 /// Reports from earlier runs not yet shown, oldest first, as Output lines.
@@ -229,10 +157,9 @@ pub fn unseen_reports() -> Vec<String> {
     let d = dir();
     let seen_file = d.join(".shown");
     let seen = std::fs::read_to_string(&seen_file).unwrap_or_default();
-    let mine = SIGNAL_PATH
+    let mine = CRASH_PATH
         .get()
-        .and_then(|p| p.to_str().ok())
-        .map(|s| s.to_string())
+        .and_then(|p| p.to_str())
         .unwrap_or_default();
     let mut found: Vec<PathBuf> = std::fs::read_dir(&d)
         .into_iter()
@@ -246,7 +173,7 @@ pub fn unseen_reports() -> Vec<String> {
                 && n.as_bytes()[..8].iter().all(u8::is_ascii_digit)
                 && n.as_bytes()[8] == b'-'
                 && !seen.lines().any(|l| l == n)
-                && p.to_str() != Some(mine.as_str())
+                && p.to_str() != Some(mine)
         })
         .collect();
     found.sort();

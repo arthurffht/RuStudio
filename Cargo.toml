@@ -9,11 +9,19 @@ version = "0.2.4"
 
 [package]
 name = "rustudio"
-description = "A native Linux/Windows game editor for Roblox place and model files"
+description = "Windows-native Roblox Studio in Rust with OmniMCP unrestricted AI engine control"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 default-run = "rustudio"
+
+[[bin]]
+name = "rustudio"
+path = "src/main.rs"
+
+[[bin]]
+name = "rustudio-mcp"
+path = "src/bin/rustudio_mcp.rs"
 
 [features]
 # `cargo test --features skip-physics-tests`: leaves out physics.rs's test module, which
@@ -23,8 +31,7 @@ skip-physics-tests = []
 [dependencies]
 rustudio-account = { path = "crates/rustudio-account" }
 rustudio-net = { path = "crates/rustudio-net" }
-libc = "0.2"
-eframe = { version = "0.36", default-features = false, features = ["wgpu", "wayland", "x11", "default_fonts", "links"] }
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "links"] }
 egui = "0.36"
 egui-wgpu = "0.36"
 egui_dock = { version = "0.21", features = ["serde"] }
@@ -62,6 +69,7 @@ blake2 = "0.10"
 blake3 = "1"
 dirs = "6"
 chrono = { version = "0.4.35", default-features = false, features = ["clock"] }
+base64 = "0.23"
 
 [profile.dev]
 opt-level = 1
@@ -75,17 +83,9 @@ inherits = "release"
 debug = "line-tables-only"
 
 [target.'cfg(windows)'.dependencies]
-# The Recycle Bin (platform.rs); thread/process CPU time, cycles and peak
-# memory for --bench / --result (bench.rs, app.rs).
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_System_ProcessStatus"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-# The Finder trash (platform.rs), the app menu and Finder's Open (macos.rs).
-objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSFileManager", "NSURL", "NSString", "NSError", "NSAppleEventDescriptor", "NSAppleEventManager", "NSNotification", "NSObject"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSMenu", "NSMenuItem", "NSEvent"] }
-# (only for EventLoopBuilderExtMacOS, on eframe's own winit)
-winit = { version = "0.30", default-features = false }
+# The Recycle Bin (platform.rs); thread/process CPU time, cycles, memory,
+# console attachment, SEH crash handler, and MCP instance liveness.
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_System_ProcessStatus", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel"] }
 
 [dev-dependencies]
 draco-core = { version = "2.3", default-features = false, features = ["decoder", "encoder"] }

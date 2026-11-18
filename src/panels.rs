@@ -486,11 +486,6 @@ pub struct Popped {
     open_pos: Option<[f32; 2]>,
     /// Raise / focus it next frame.
     pub focus: bool,
-    /// Hyprland: where the compositor had it (floating, monitor
-    /// position, size, workspace), and the saved one still to apply once
-    /// the window shows up (src/hypr.rs).
-    pub wm: Option<crate::hypr::Placement>,
-    pub wm_restore: Option<crate::hypr::Placement>,
     /// Frames in a row the window couldn't be shown (app.rs panel_windows
     /// docks its tabs back after mech::PANEL_WINDOW_MAX_FAILS).
     pub fails: u32,
@@ -500,7 +495,7 @@ impl Popped {
     pub fn new(key: String, dock: DockState<Tab>, size: [f32; 2], pos: Option<[f32; 2]>) -> Self {
         let size = sane_size(size);
         let pos = pos.filter(|p| p.iter().all(|v| v.is_finite()));
-        Popped { key, dock, size, pos, open_size: size, open_pos: pos, focus: false, wm: None, wm_restore: None, fails: 0 }
+        Popped { key, dock, size, pos, open_size: size, open_pos: pos, focus: false, fails: 0 }
     }
     pub fn viewport_id(&self) -> egui::ViewportId {
         egui::ViewportId::from_hash_of(("rustudio-panel", &self.key))
@@ -539,22 +534,6 @@ impl Popped {
         });
         if minimized {
             return;
-        }
-        // Hyprland: put a reopened window back where it was, then keep up
-        // with where the user moves it.
-        let class = self.app_id();
-        match self.wm_restore.take() {
-            Some(p) => {
-                if !crate::hypr::restore(&class, &p) {
-                    self.wm_restore = Some(p);
-                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
-                }
-            }
-            None => {
-                if let Some(p) = crate::hypr::seen(&class) {
-                    self.wm = Some(p);
-                }
-            }
         }
         if let Some(r) = inner {
             let s = r.size() * zoom;
@@ -639,8 +618,7 @@ impl Panels {
             w.focus = true;
         } else {
             retain_visible(&mut full, |t| *t == tab && main.find_tab(t).is_none());
-            let mut w = Popped::new(saved.key, full, saved.size, saved.pos);
-            w.wm_restore = saved.wm;
+            let w = Popped::new(saved.key, full, saved.size, saved.pos);
             self.popped.push(w);
         }
         true

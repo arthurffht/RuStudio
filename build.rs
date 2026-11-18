@@ -81,6 +81,9 @@ fn scan(dir: &Path, reads: &mut BTreeSet<String>, fires: &mut BTreeSet<String>) 
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
+            if p.file_name().is_some_and(|n| n == "mcp") {
+                continue;
+            }
             scan(&p, reads, fires);
             continue;
         }

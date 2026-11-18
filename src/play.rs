@@ -3406,6 +3406,10 @@ impl Editor {
         self.play.as_ref()?.other_doc.as_ref()
     }
 
+    pub fn play_other_doc_mut(&mut self) -> Option<&mut Document> {
+        self.play.as_mut()?.other_doc.as_mut()
+    }
+
     /// Status text for the toolbar / status bar.
     pub fn play_status(&self) -> Option<String> {
         let s = self.play.as_ref()?;

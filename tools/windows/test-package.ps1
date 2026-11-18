@@ -5,8 +5,11 @@ $prefix = Join-Path $root 'installed app'
 $programs = Join-Path $root 'Start Menu'
 try {
     Expand-Archive -LiteralPath $Archive -DestinationPath $root
-    $bundle = Join-Path $root 'rustudio-windows-x64'
+    $bundle = Join-Path $root 'RuStudio-windows-x64'
     $installer = Join-Path $bundle 'install.ps1'
+    if (!(Test-Path (Join-Path $bundle 'rustudio-mcp.exe'))) {
+        throw 'Bundle missing rustudio-mcp.exe'
+    }
     # LoadLibraryEx as data avoids executing application code.
     Add-Type @'
 using System;
@@ -30,12 +33,14 @@ public class IconResource {
     if ($link.IconLocation -ne "$(Join-Path $prefix 'rustudio.exe'),0") { throw 'Wrong shortcut icon' }
     if ($link.WorkingDirectory -ne $prefix) { throw 'Wrong working directory' }
     if ((Get-FileHash (Join-Path $prefix 'api-dump.json')).Hash -ne (Get-FileHash (Join-Path $bundle 'api-dump.json')).Hash) { throw 'API data missing or changed' }
+    if ((Get-FileHash (Join-Path $prefix 'rustudio-mcp.exe')).Hash -ne (Get-FileHash (Join-Path $bundle 'rustudio-mcp.exe')).Hash) { throw 'rustudio-mcp.exe missing or changed' }
     Set-Content (Join-Path $prefix 'user-project.rbxl') 'preserve'
     & $installer -Prefix $prefix -ProgramsDirectory $programs
     & (Join-Path $prefix 'install.ps1') -Uninstall -Prefix $prefix -ProgramsDirectory $programs
     & $installer -Uninstall -Prefix $prefix -ProgramsDirectory $programs
     if (Test-Path (Join-Path $programs 'rustudio.lnk')) { throw 'Shortcut remains' }
     if (Test-Path (Join-Path $prefix 'rustudio.exe')) { throw 'Executable remains' }
+    if (Test-Path (Join-Path $prefix 'rustudio-mcp.exe')) { throw 'MCP executable remains' }
     if ((Get-Content (Join-Path $prefix 'user-project.rbxl')) -ne 'preserve') { throw 'User data lost' }
     & $installer -Prefix $prefix -ProgramsDirectory $programs -NoShortcut
     if (Test-Path (Join-Path $programs 'rustudio.lnk')) { throw 'Unwanted shortcut created' }

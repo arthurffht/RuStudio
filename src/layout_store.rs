@@ -72,9 +72,6 @@ pub struct SavedPopped {
     pub size: [f32; 2],
     #[serde(default)]
     pub pos: Option<[f32; 2]>,
-    /// Hyprland's placement of it (floating, position, size, workspace).
-    #[serde(default)]
-    pub wm: Option<crate::hypr::Placement>,
 }
 
 /// The window, in logical pixels (what `ViewportBuilder` takes).
@@ -210,9 +207,7 @@ impl Layout {
                 continue;
             }
             let key = out.free_key(&w.key);
-            let mut p = Popped::new(key, dock, w.size, w.pos);
-            p.wm = w.wm.clone();
-            p.wm_restore = w.wm.clone();
+            let p = Popped::new(key, dock, w.size, w.pos);
             out.popped.push(p);
         }
         out
@@ -308,7 +303,7 @@ pub fn saved_popped(panels: &Panels) -> Vec<SavedPopped> {
         .filter_map(|w| {
             let dock = saved_dock(&w.dock);
             dock.iter_all_tabs().next()?;
-            Some(SavedPopped { key: w.key.clone(), dock, size: w.size, pos: w.pos, wm: w.wm.clone() })
+            Some(SavedPopped { key: w.key.clone(), dock, size: w.size, pos: w.pos })
         })
         .collect()
 }
@@ -494,7 +489,6 @@ mod tests {
                 dock: DockState::new(vec![SavedTab::Output]),
                 size: [1.0, f32::NAN],
                 pos: None,
-                wm: None,
             }],
             ..Default::default()
         };

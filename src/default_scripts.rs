@@ -53,19 +53,6 @@ pub fn studio_dir() -> Option<PathBuf> {
         let p = PathBuf::from(p);
         return has(&p).then_some(p);
     }
-    // Vinegar's Studio (kept current by Vinegar): its newest version folder.
-    if let Some(home) = std::env::var_os("HOME") {
-        let versions = PathBuf::from(home).join(".var/app/org.vinegarhq.Vinegar/data/vinegar/versions");
-        if let Ok(rd) = std::fs::read_dir(&versions) {
-            let newest = rd
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| has(p))
-                .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-            if let Some(p) = newest {
-                return Some(p);
-            }
-        }
-    }
     // The person's content link usually points at Studio's own content/.
     if let Ok(target) = std::fs::canonicalize(crate::paths::data().join("rustudio/content")) {
         if let Some(root) = target.parent() {
@@ -74,7 +61,7 @@ pub fn studio_dir() -> Option<PathBuf> {
             }
         }
     }
-    // Roblox Studio installed on this Mac (RobloxStudio.app).
+    // Roblox Studio installed on Windows (%LOCALAPPDATA%\Roblox\Versions\version-*).
     if let Some(d) = crate::paths::installed_studio() {
         return Some(d);
     }

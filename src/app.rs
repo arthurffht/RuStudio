@@ -184,6 +184,8 @@ pub struct Harness {
     pub installed_plugins: Vec<(u64, PathBuf)>,
     pub plugin_dirs: Vec<PathBuf>,
     pub no_plugins: bool,
+    pub mcp_port: Option<u16>,
+    pub no_mcp: bool,
     pub plugins_started: bool,
     /// StudioTestService:EndTest's value once a script ended the run.
     pub end_value: Option<String>,
@@ -325,9 +327,10 @@ pub struct Editor {
     pub draw_stats: [usize; 4],
     /// What the renderer holds per part.
     pub draw_cache: crate::viewport::DrawCache,
-    /// RUSTUDIO_CONTROL: the comparison-capture socket (src/control.rs).
-    #[cfg(unix)]
+    /// RUSTUDIO_CONTROL: the comparison-capture TCP socket (src/control.rs).
     pub control: Option<crate::control::Control>,
+    /// OmniMCP localhost TCP bridge server (src/mcp/server.rs).
+    pub mcp: Option<crate::mcp::server::McpServer>,
     /// Bumped whenever a downloaded asset arrives (parts waiting on one are redone).
     pub asset_gen: u64,
     pub draws_asset_gen: u64,
@@ -561,8 +564,8 @@ impl RustudioApp {
             play_shows_client: true,
             draw_stats: [0; 4],
             draw_cache: Default::default(),
-            #[cfg(unix)]
             control: None,
+            mcp: None,
             asset_gen: 0,
             draws_asset_gen: 0,
             material_gen: 0,
@@ -678,7 +681,6 @@ impl RustudioApp {
         ed.cloud.open_when_ready = ed.harness.open_roblox.map(|(p, copy)| (p, None, copy));
         ed.cloud.picker_when_ready = ed.harness.roblox_picker;
         ed.cloud.settings_open = ed.harness.roblox_settings;
-        #[cfg(unix)]
         if let Ok(path) = std::env::var("RUSTUDIO_CONTROL") {
             match crate::control::Control::listen(&path) {
                 Ok(c) => {
@@ -686,6 +688,17 @@ impl RustudioApp {
                     ed.clean_view = true;
                 }
                 Err(e) => eprintln!("[control] can't listen on {path}: {e}"),
+            }
+        }
+        if !ed.harness.no_mcp && std::env::var_os("RUSTUDIO_NO_MCP").is_none() {
+            match crate::mcp::server::McpServer::start(
+                egui_ctx.clone(),
+                ed.harness.mcp_port,
+                &ed.doc.title,
+                ed.doc.path.as_deref(),
+            ) {
+                Ok(s) => ed.mcp = Some(s),
+                Err(e) => eprintln!("[mcp] can't start OmniMCP server: {e}"),
             }
         }
         if let Some([x, y, z, yaw, pitch]) = ed.harness.camera {
@@ -726,7 +739,6 @@ impl RustudioApp {
         }
         // Comparison captures (src/control.rs) want the 3D view as big as the
         // other program's: the view alone, no Explorer / Properties / Output.
-        #[cfg(unix)]
         if ed.control.is_some() && layout.is_none() {
             dock = DockState::new(vec![Tab::Viewport]);
         }
@@ -1614,11 +1626,6 @@ impl Editor {
             check(sc(Modifiers::COMMAND, Key::Num3), "tool_scale");
             check(sc(Modifiers::COMMAND, Key::Num4), "tool_rotate");
             check(sc(Modifiers::NONE, Key::Delete), "delete");
-            // A Mac keyboard's delete key is Backspace (Studio for Mac
-            // deletes with it too).
-            if cfg!(target_os = "macos") {
-                check(sc(Modifiers::NONE, Key::Backspace), "delete");
-            }
             check(sc(Modifiers::NONE, Key::F2), "rename");
             check(sc(Modifiers::NONE, Key::F), "focus");
             // egui turns Ctrl+C/X/V into clipboard events.
@@ -1864,6 +1871,11 @@ impl Editor {
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new(format!("{:.0} fps", self.fps)).color(theme::TEXT_DIM));
+                if let Some(mcp) = &self.mcp {
+                    ui.separator();
+                    ui.label(RichText::new(format!("MCP :{}", mcp.port)).color(theme::TEXT_DIM))
+                        .on_hover_text(format!("OmniMCP bridge listening on 127.0.0.1:{}", mcp.port));
+                }
             });
         });
     }
@@ -2201,6 +2213,7 @@ impl RustudioApp {
 
 impl eframe::App for RustudioApp {
     fn on_exit(&mut self) {
+        self.ed.mcp = None;
         crate::studio_settings::flush();
         crate::rustudio_settings::flush();
         crate::plugin_host::widgets_ui::on_exit();
@@ -2256,11 +2269,6 @@ impl RustudioApp {
         let ctx = ui.ctx().clone();
         self.watchdog.begin(ctx.input(|i| !i.viewport().minimized.unwrap_or(false)) && (self.ed.play.is_some() || self.ed.harness.screenshot.is_some()));
         let ed = &mut self.ed;
-        // Files opened from Finder (double-click, Open With, the Dock icon).
-        #[cfg(target_os = "macos")]
-        for p in crate::macos::take_opened() {
-            ed.request(PendingAction::Open(Some(p)));
-        }
         ed.poll_file_dialogs();
         if let crate::update::Action::Restart = self.updater.show(&ctx) {
             ed.request(PendingAction::Restart);
@@ -2418,6 +2426,7 @@ impl RustudioApp {
             if ed.account.busy() || ed.assets.busy() {
                 ctx.request_repaint();
             }
+            ed.mcp_tick(&ctx);
             self.watchdog.complete();
             return;
         }
@@ -2609,8 +2618,8 @@ impl RustudioApp {
         let ctx = ctx.clone();
         let ed = &mut self.ed;
         ed.harness_tick(&ctx);
-        #[cfg(unix)]
         ed.control_tick(&ctx);
+        ed.mcp_tick(&ctx);
         ed.ui_shots_tick(&ctx);
         let work_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
         ed.last_work_ms = work_ms;
@@ -2864,15 +2873,6 @@ impl Editor {
 
 /// This process's resident memory now (MB; NaN where not supported).
 fn current_rss_mb() -> f64 {
-    #[cfg(target_os = "linux")]
-    {
-        let pages = std::fs::read_to_string("/proc/self/statm")
-            .ok()
-            .and_then(|s| s.split_whitespace().nth(1)?.parse::<f64>().ok());
-        // SAFETY: sysconf only reads a system constant.
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as f64;
-        pages.map_or(f64::NAN, |p| p * page / (1024.0 * 1024.0))
-    }
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
@@ -2886,7 +2886,7 @@ fn current_rss_mb() -> f64 {
             f64::NAN
         }
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(windows))]
     {
         f64::NAN
     }
@@ -2894,16 +2894,6 @@ fn current_rss_mb() -> f64 {
 
 /// This process's CPU time (user + system, s) and peak resident memory (MB).
 fn process_usage() -> (f64, f64) {
-    #[cfg(unix)]
-    {
-        // SAFETY: getrusage fills the struct we pass.
-        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
-        let cpu = ru.ru_utime.tv_sec as f64 + ru.ru_utime.tv_usec as f64 * 1e-6
-            + ru.ru_stime.tv_sec as f64 + ru.ru_stime.tv_usec as f64 * 1e-6;
-        // (Linux reports kilobytes)
-        (cpu, ru.ru_maxrss as f64 / 1024.0)
-    }
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::FILETIME;

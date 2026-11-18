@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const FEED: &str = "https://api.github.com/repos/rippelz/rustudio/releases/latest";
+const FEED: &str = "https://api.github.com/repos/arthurffht/RuStudio/releases/latest";
 const SNOOZE: Duration = Duration::from_secs(12 * 3600);
 
 #[derive(Clone)]
@@ -301,12 +301,8 @@ fn version_of(tag: &str) -> Option<[u64; 3]> {
 }
 
 fn asset_suffix() -> Option<&'static str> {
-    if cfg!(target_os = "macos") {
-        Some("macos-universal.zip")
-    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        Some("windows-x64.zip")
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        Some("linux-x86_64.tar.gz")
+    if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Some("RuStudio-windows-x64.zip")
     } else {
         None
     }
@@ -334,7 +330,7 @@ fn check() -> Result<Option<Release>, String> {
     let sums = assets.iter().find(|(n, _)| n == "SHA256SUMS").map(|(_, u)| u.clone());
     Ok(Some(Release {
         version: tag.trim_start_matches('v').to_string(),
-        page: feed["html_url"].as_str().unwrap_or("https://github.com/rippelz/rustudio/releases").to_string(),
+        page: feed["html_url"].as_str().unwrap_or("https://github.com/arthurffht/RuStudio/releases").to_string(),
         asset,
         sums,
     }))
@@ -370,26 +366,16 @@ fn snooze() {
     let _ = std::fs::write(f, now().to_string());
 }
 
-/// The folder whose contents an update replaces: the `.app` bundle on macOS,
-/// else the executable's folder.
+/// The folder whose contents an update replaces: the executable's folder.
 fn install_root() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().and_then(|e| e.canonicalize()).map_err(|e| format!("can't find rustudio's own file: {e}"))?;
-    if cfg!(target_os = "macos") {
-        exe.ancestors()
-            .find(|p| p.extension().is_some_and(|x| x == "app"))
-            .map(Path::to_path_buf)
-            .ok_or_else(|| "rustudio isn't running from an .app bundle".into())
-    } else {
-        exe.parent().map(Path::to_path_buf).ok_or_else(|| "rustudio's folder is unknown".into())
-    }
+    exe.parent().map(Path::to_path_buf).ok_or_else(|| "rustudio's folder is unknown".into())
 }
 
 /// Old copies an earlier update renamed out of the way.
 fn remove_leftovers() {
     let Ok(root) = install_root() else { return };
-    if cfg!(target_os = "macos") {
-        let _ = std::fs::remove_dir_all(root.with_extension("app.old"));
-    } else if let Ok(dir) = std::fs::read_dir(&root) {
+    if let Ok(dir) = std::fs::read_dir(&root) {
         for e in dir.flatten() {
             if e.file_name().to_string_lossy().ends_with(".update-old") {
                 let _ = std::fs::remove_file(e.path());
@@ -430,43 +416,25 @@ fn unpack_and_swap(data: &[u8], name: &str, stage: &Path, root: &Path) -> Result
     std::fs::write(&archive, data).map_err(|e| e.to_string())?;
     let out = stage.join("out");
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
-    let status = if cfg!(target_os = "macos") {
-        std::process::Command::new("ditto").arg("-x").arg("-k").arg(&archive).arg(&out).status()
-    } else {
-        // Windows 10+ ships bsdtar as tar.exe, which reads zip too.
-        std::process::Command::new("tar").arg("-xf").arg(&archive).arg("-C").arg(&out).status()
-    };
+    // Windows 10+ ships bsdtar as tar.exe, which reads zip too.
+    let status = std::process::Command::new("tar").arg("-xf").arg(&archive).arg("-C").arg(&out).status();
     match status {
         Ok(s) if s.success() => {}
         Ok(s) => return Err(format!("unpacking {name} failed ({s})")),
         Err(e) => return Err(format!("can't run the unpacker: {e}")),
     }
-    if cfg!(target_os = "macos") {
-        let new_app = out.join("rustudio.app");
-        if !new_app.is_dir() {
-            return Err(format!("{name} has no rustudio.app"));
-        }
-        let old = root.with_extension("app.old");
-        let _ = std::fs::remove_dir_all(&old);
-        std::fs::rename(root, &old).map_err(|e| format!("can't move {}: {e}", root.display()))?;
-        if let Err(e) = std::fs::rename(&new_app, root) {
-            let _ = std::fs::rename(&old, root);
-            return Err(format!("can't put the new app in place: {e}"));
-        }
-        return Ok(root.join("Contents/MacOS/rustudio"));
-    }
-    // Linux / Windows: one folder holding the executable and its data files.
+    // Windows: one folder holding the executables and data files.
     let folder = std::fs::read_dir(&out)
         .map_err(|e| e.to_string())?
         .flatten()
         .map(|e| e.path())
         .find(|p| p.is_dir())
-        .ok_or_else(|| format!("{name} has no folder inside"))?;
-    let exe_name = if cfg!(windows) { "rustudio.exe" } else { "rustudio" };
+        .unwrap_or_else(|| out.clone());
+    let exe_name = "rustudio.exe";
     if !folder.join(exe_name).is_file() {
         return Err(format!("{name} has no {exe_name}"));
     }
-    for file in [exe_name, "api-dump.json"] {
+    for file in [exe_name, "rustudio-mcp.exe", "api-dump.json"] {
         let src = folder.join(file);
         let dst = root.join(file);
         if !src.is_file() {

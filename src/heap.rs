@@ -7,17 +7,9 @@
 //! it, where Windows fell by 1 GB. `malloc_trim` returns the free pages; it
 //! is called at the two moments a lot was just freed.
 
-/// Returns free heap pages to the system (glibc only; nothing elsewhere,
-/// where the allocator does it by itself).
-pub fn trim() {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    {
-        // SAFETY: malloc_trim only releases memory the allocator holds free.
-        unsafe {
-            libc::malloc_trim(0);
-        }
-    }
-}
+/// Returns free heap pages to the system (no-op on Windows where the system
+/// allocator manages page decommit automatically).
+pub fn trim() {}
 
 /// Called every frame with whether assets are still loading: trims once,
 /// a second after a burst of loading ends.

@@ -1,9 +1,10 @@
-//! rustudio: a native Linux editor for Roblox place and model files.
+//! RuStudio: a Windows-native Roblox Studio editor with OmniMCP AI control.
 
 // Launch as a GUI application on Windows without opening a console window.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod grass_stream;
+mod mcp;
 mod plugin_store;
 mod toolbox;
 mod ui_pointer;
@@ -23,8 +24,6 @@ mod cmeta;
 mod studio_content;
 mod paths;
 mod platform;
-#[cfg(target_os = "macos")]
-mod macos;
 mod dtmeta;
 mod cloud_ui;
 mod join_ui;
@@ -44,7 +43,6 @@ mod bin_dump;
 mod camera;
 mod collision;
 mod collision_groups;
-#[cfg(unix)]
 mod control;
 mod coverage;
 mod crash;
@@ -54,7 +52,6 @@ mod effects;
 mod attachment;
 mod explorer;
 mod file_dialog;
-mod hypr;
 mod game_settings;
 mod studio_settings;
 mod rustudio_settings;
@@ -177,11 +174,13 @@ usage: rustudio [FILE] [--demo] [--play] [--screenshot OUT.png] [--self-test OUT
                        .frames.json / .cursor.json beside it as in the editor)
   --play-only          --no-ui --play
   --overlays           with --no-ui in Edit state: keep the editor's overlays
-  --headless           no window, no compositor, no display server (no gamescope
-                       or Xvfb needed): frames are drawn offscreen at --window
+  --headless           no window, no compositor: frames are drawn offscreen at --window
                        WxH and read back for shots; 60 frames a second (unpaced
                        with --bench). Silent unless --audio. With --no-ui or
                        --play-only only
+  --mcp-port PORT      bind the OmniMCP TCP bridge on 127.0.0.1:PORT (default:
+                       auto-pick 44777..44790)
+  --no-mcp             disable the OmniMCP TCP server on startup
   --no-render          --headless with no GPU at all: scripts, physics, sound
                        state and the harness run, nothing is drawn; --shots
                        write the log and frame times but no picture. The Output
@@ -283,189 +282,6 @@ physics (environment):
                        cover yet (rustudio names the class once when it sees one)
 ";
 
-/// Test runs (--screenshot / --self-test) re-launch themselves inside a headless
-/// gamescope so they never open a window on the user's screen.
-/// RUSTUDIO_VISIBLE_TESTS=1 keeps them on screen.
-#[cfg(target_os = "linux")]
-fn rerun_headless() -> Option<i32> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let argv: Vec<String> = std::env::args().collect();
-    let testing = is_test_run(&argv);
-    // (--headless / --no-render need no display at all: src/offscreen.rs)
-    let offscreen = argv.iter().any(|a| a == "--headless" || a == "--no-render");
-    if !testing
-        || offscreen
-        || std::env::var_os("RUSTUDIO_HEADLESS_CHILD").is_some()
-        || std::env::var_os("RUSTUDIO_VISIBLE_TESTS").is_some()
-    {
-        return None;
-    }
-    // The benchmark measures at the 1265x900 size the person asked for.
-    let h = if argv.iter().any(|a| a == "--bench") {
-        "900"
-    } else {
-        "1376"
-    };
-    // --window WxH: another window size (e.g. to give the 3D view Studio's size).
-    let (w, h) = window_arg(&argv)
-        .map(|(w, h)| (w.to_string(), h.to_string()))
-        .unwrap_or(("1265".into(), h.into()));
-    // gamescope's own lines (and its Xwayland's: swapchain notes, "failed to
-    // read Wayland events" at exit) go to a file. gamescope closes inherited
-    // descriptors, so rustudio inside writes to two FIFOs (RUSTUDIO_PARENT_OUT
-    // / _ERR, see restore_parent_fds) that this process copies to its own
-    // stdout / stderr.
-    let tmp = std::env::temp_dir().join(format!("rustudio-headless-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&tmp);
-    let gs_log = tmp.join("gamescope.log");
-    let gs_out = std::fs::File::create(&gs_log).ok();
-    load_trace::mark("headless: starting gamescope");
-    let mut cmd = std::process::Command::new("gamescope");
-    let mut pumps = Vec::new();
-    if let Some(f) = gs_out {
-        let fifos = ["out", "err"].map(|n| tmp.join(n));
-        let made = fifos.iter().all(|p| {
-            let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap_or_default();
-            // SAFETY: mkfifo on a NUL-terminated path.
-            unsafe { libc::mkfifo(c.as_ptr(), 0o600) == 0 }
-        });
-        if let (true, Ok(f2)) = (made, f.try_clone()) {
-            cmd.stdout(f)
-                .stderr(f2)
-                .env("RUSTUDIO_PARENT_OUT", &fifos[0])
-                .env("RUSTUDIO_PARENT_ERR", &fifos[1])
-                // (lsfg-vk's frame generation layer, when installed, only
-                // adds errors about its own config to a test run.)
-                .env("DISABLE_LSFGVK", "1");
-            for (i, p) in fifos.iter().enumerate() {
-                let p = p.clone();
-                let (tx, rx) = std::sync::mpsc::channel::<()>();
-                std::thread::spawn(move || {
-                    // (Line by line, leaving out the notes gamescope's Vulkan
-                    // WSI layer prints from inside rustudio's process.)
-                    if let Ok(r) = std::fs::File::open(&p) {
-                        use std::io::{BufRead, Write};
-                        let mut r = std::io::BufReader::new(r);
-                        let mut line = Vec::new();
-                        let mut wsi = false;
-                        while r.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
-                            // (its blocks continue on indented lines)
-                            wsi = line.starts_with(b"[Gamescope WSI]") || (wsi && line.starts_with(b"  "));
-                            if !wsi {
-                                let _ = if i == 0 {
-                                    let mut o = std::io::stdout().lock();
-                                    o.write_all(&line).and_then(|_| o.flush())
-                                } else {
-                                    std::io::stderr().write_all(&line)
-                                };
-                            }
-                            line.clear();
-                        }
-                    }
-                    let _ = tx.send(());
-                });
-                pumps.push((fifos[i].clone(), rx));
-            }
-        }
-    }
-    // gamescope exits 0 whatever happened to its client (a panic, or another
-    // agent's `pkill -9 -f gamescopereaper` / loose pkill patterns killing
-    // it), so a run that never wrote its screenshot looked like a success.
-    // A shell inside records rustudio's own exit status (128 + signal when
-    // killed); no status at all means the run was killed from outside.
-    let status_file = tmp.join("status");
-    let status = cmd
-        .args([
-            "--backend",
-            "headless",
-            "-W",
-            &w,
-            "-H",
-            &h,
-            "-w",
-            &w,
-            "-h",
-            &h,
-            "--",
-            "sh",
-            "-c",
-            "\"$0\" \"$@\"; echo $? > \"$RUSTUDIO_HEADLESS_STATUS\"",
-        ])
-        .args(&argv)
-        .env("RUSTUDIO_HEADLESS_CHILD", "1")
-        .env("RUSTUDIO_HEADLESS_STATUS", &status_file)
-        .status()
-        .ok(); // no gamescope: fall back to a normal window
-    let inner: Option<i32> = std::fs::read_to_string(&status_file).ok().and_then(|s| s.trim().parse().ok());
-    for (fifo, done) in pumps {
-        // (A FIFO rustudio never opened: open its write end so the copier's
-        // open returns, then let it see the end.)
-        let _ = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&fifo);
-        let _ = done.recv_timeout(std::time::Duration::from_secs(2));
-    }
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
-    let gs_text = std::fs::read_to_string(&gs_log).unwrap_or_default();
-    let _ = std::fs::remove_dir_all(&tmp);
-    let status = status?;
-    let code = match (inner, status.code()) {
-        (Some(0), _) => 0,
-        (Some(c), _) if c > 128 => {
-            eprintln!("rustudio: the test run was killed by signal {} (inside the headless gamescope)", c - 128);
-            c
-        }
-        (Some(c), _) => c,
-        (None, Some(_)) => {
-            eprintln!(
-                "rustudio: the test run inside the headless gamescope ended without an exit status \
-                 (killed from outside, e.g. a pkill of gamescope / gamescopereaper)"
-            );
-            1
-        }
-        (None, None) => {
-            eprintln!("rustudio: the headless gamescope was killed by a signal before the test run finished");
-            1
-        }
-    };
-    // A failed run shows gamescope's lines after all (it may never have
-    // started rustudio).
-    if code != 0 && !gs_text.is_empty() {
-        eprintln!("gamescope output:\n{gs_text}");
-    }
-    Some(code)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn rerun_headless() -> Option<i32> {
-    None
-}
-
-/// Inside the headless gamescope: write to the launching process's stdout /
-/// stderr (FIFOs it copies from, RUSTUDIO_PARENT_OUT / _ERR), not gamescope's.
-#[cfg(target_os = "linux")]
-fn restore_parent_fds() {
-    for (var, to) in [("RUSTUDIO_PARENT_OUT", 1), ("RUSTUDIO_PARENT_ERR", 2)] {
-        let Some(p) = std::env::var_os(var) else { continue };
-        // (Our own children, e.g. a nested test run, don't inherit it.)
-        std::env::remove_var(var);
-        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&p) {
-            use std::os::fd::IntoRawFd;
-            let fd = f.into_raw_fd();
-            // SAFETY: dup2 / close on a descriptor we just opened.
-            unsafe {
-                libc::dup2(fd, to);
-                libc::close(fd);
-            }
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn restore_parent_fds() {}
-
 /// A harness run that ends by itself (pictures, a self-test, a benchmark,
 /// a CI result, or a --no-ui run with --seconds): no window on screen.
 fn is_test_run(argv: &[String]) -> bool {
@@ -481,17 +297,23 @@ fn window_arg(argv: &[String]) -> Option<(u32, u32)> {
 }
 
 fn main() -> eframe::Result<()> {
+    // When invoked from cmd/PowerShell with CLI arguments, attach to the
+    // launching console so stdout/stderr output appears despite windows_subsystem.
+    #[cfg(windows)]
+    if std::env::args_os().nth(1).is_some() {
+        // SAFETY: attaching to parent console if one exists; harmless if none or redirected.
+        unsafe {
+            windows_sys::Win32::System::Console::AttachConsole(
+                windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+            );
+        }
+    }
     // Headless runs are silent unless --audio (before any thread starts).
     {
         let argv: Vec<String> = std::env::args().collect();
         let headless = argv.iter().any(|a| a == "--headless" || a == "--no-render");
         if headless && !argv.iter().any(|a| a == "--audio") && std::env::var_os("RUSTUDIO_NO_AUDIO").is_none() {
             std::env::set_var("RUSTUDIO_NO_AUDIO", "1");
-        }
-        // (lsfg-vk's frame generation layer, when installed, only adds
-        // errors about its own config to a run that presents nothing.)
-        if headless && std::env::var_os("DISABLE_LSFGVK").is_none() {
-            std::env::set_var("DISABLE_LSFGVK", "1");
         }
         // No update check (and so no "Update available" notice in the
         // corner) in headless and harness runs: their captures are compared
@@ -500,11 +322,10 @@ fn main() -> eframe::Result<()> {
             std::env::set_var("RUSTUDIO_NO_UPDATE_CHECK", "1");
         }
     }
-    restore_parent_fds();
     load_trace::init();
-    // First: a panic or fatal signal from here on leaves a report.
+    // First: a panic or unhandled exception from here on leaves a report.
     crash::install();
-    // RUSTUDIO_CRASH_TEST=panic|segv|thread: check the reports themselves.
+    // RUSTUDIO_CRASH_TEST=panic|thread: check the reports themselves.
     match std::env::var("RUSTUDIO_CRASH_TEST").as_deref() {
         Ok("panic") => panic!("RUSTUDIO_CRASH_TEST panic"),
         Ok("thread") => {
@@ -513,8 +334,6 @@ fn main() -> eframe::Result<()> {
                 .spawn(|| panic!("RUSTUDIO_CRASH_TEST thread panic"))
                 .map(|h| h.join());
         }
-        // SAFETY: deliberately faults, to test the signal report.
-        Ok("segv") => unsafe { libc::raise(libc::SIGSEGV); },
         _ => {}
     }
     // os.clock counts from here, as Studio's does from its process start.
@@ -668,9 +487,6 @@ fn main() -> eframe::Result<()> {
             }
         }
     }
-    if let Some(code) = rerun_headless() {
-        std::process::exit(code);
-    }
     // First launch without a Studio install: fetch Studio's built-in content
     // in the background (never in test runs, which must be reproducible).
     let test_run = is_test_run(&std::env::args().collect::<Vec<_>>());
@@ -708,6 +524,8 @@ fn main() -> eframe::Result<()> {
     let mut installed_plugins: Vec<(u64, PathBuf)> = Vec::new();
     let mut plugin_dirs: Vec<PathBuf> = Vec::new();
     let mut no_plugins = false;
+    let mut mcp_port: Option<u16> = None;
+    let mut no_mcp = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -993,6 +811,17 @@ fn main() -> eframe::Result<()> {
                 headless = true;
                 no_render = true;
             }
+            "--mcp-port" => {
+                let v = args.next().unwrap_or_default();
+                match v.parse::<u16>() {
+                    Ok(p) if p > 0 => mcp_port = Some(p),
+                    _ => {
+                        eprintln!("--mcp-port: expected port number 1..65535, got {v:?}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--no-mcp" => no_mcp = true,
             // (read at the start of main)
             "--audio" => {}
             "-h" | "--help" => {
@@ -1061,6 +890,8 @@ fn main() -> eframe::Result<()> {
         installed_plugins,
         plugin_dirs,
         no_plugins,
+        mcp_port,
+        no_mcp,
         plugins_started: false,
         end_value: None,
         run_frames: Vec::new(),
@@ -1127,6 +958,10 @@ fn main() -> eframe::Result<()> {
     let wgpu_options = egui_wgpu::WgpuConfiguration {
         wgpu_setup: {
             let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+            // egui_wgpu adds GL (`PRIMARY | GL`), which picks OpenGL over DX12
+            // WARP on older GPUs/CI VMs and fails `max_sampled_textures_per_shader_stage = 24`.
+            setup.instance_descriptor.backends = egui_wgpu::wgpu::Backends::from_env()
+                .unwrap_or(egui_wgpu::wgpu::Backends::PRIMARY);
             let descriptor = setup.device_descriptor.clone();
             setup.device_descriptor = std::sync::Arc::new(move |adapter| {
                 let mut d = descriptor(adapter);
@@ -1176,28 +1011,12 @@ fn main() -> eframe::Result<()> {
         renderer: eframe::Renderer::Wgpu,
         viewport,
         wgpu_options: wgpu_options.clone(),
-        // macOS: rustudio sets the app menu itself (macos.rs).
-        #[cfg(target_os = "macos")]
-        event_loop_builder: Some(Box::new(|b| {
-            use winit::platform::macos::EventLoopBuilderExtMacOS;
-            b.with_default_menu(false);
-        })),
         ..Default::default()
     };
-    // Files opened from Finder arrive as Apple Events, not argv.
-    #[cfg(target_os = "macos")]
-    macos::install_open_handler();
     let r = eframe::run_native(
         "rustudio",
         options,
-        Box::new(move |cc| {
-            #[cfg(target_os = "macos")]
-            {
-                macos::install_menu();
-                macos::set_wake(&cc.egui_ctx);
-            }
-            Ok(Box::new(app::RustudioApp::new(cc, open, harness, demo)))
-        }),
+        Box::new(move |cc| Ok(Box::new(app::RustudioApp::new(cc, open, harness, demo)))),
     );
     // --fail-on-error (app::Editor::finish_run); a windowed test run's exit
     // status reaches the caller through the headless wrapper's status file.
