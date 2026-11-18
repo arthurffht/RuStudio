@@ -159,14 +159,14 @@ impl SelfTest {
             }
             ok &= crate::render::material_reflectance(1088, reflectance) == 0.0;
         }
-        let shader = include_str!("../shader.wgsl");
+        let shader = include_str!("../shaders/scene.hlsl");
         for law in [
-            "mix(0.66, 1.0, (1.0 - alpha) * (1.0 - alpha))",
-            "normal * (3.0 * (1.0 - eta))",
-            "clamp(2.0 * alpha - 1.0 + a.a, 0.0, 1.0)",
-            "0.8 * (1.0 - nv) * (1.0 - nv)",
-            "dot(scene.rgb, vec3<f32>(1.0)) + 0.01",
-            "env_reflect(reflect(-v, n), rough, 1.0, true)",
+            "lerp(0.66f, 1.0f, (1.0f - alpha) * (1.0f - alpha))",
+            "normal * (3.0f * (1.0f - eta))",
+            "saturate(2.0f * alpha - 1.0f + a.a)",
+            "0.8f * (1.0f - nv) * (1.0f - nv)",
+            "dot(scene.rgb, float3(1.0f, 1.0f, 1.0f)) + 0.01f",
+            "env_reflect(reflect(-v, n), rough, 1.0f, true)",
             "env_reflect(reflect(-v, n), rough, sv, reflective)",
         ] {
             ok &= shader.contains(law);

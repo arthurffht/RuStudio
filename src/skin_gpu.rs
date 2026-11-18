@@ -247,7 +247,7 @@ impl SkinGpu {
             unsafe {
                 ctx.CSSetConstantBuffers(0, Some(&cbs));
                 ctx.CSSetShaderResources(0, Some(&srvs));
-                ctx.CSSetUnorderedAccessViews(0, Some(&uavs), None);
+                ctx.CSSetUnorderedAccessViews(0, 1, Some(uavs.as_ptr()), None);
                 ctx.Dispatch(j.corners.div_ceil(64), 1, 1);
             }
             d3d11::unbind_cs_uavs(ctx, 0, 8);

@@ -927,8 +927,8 @@ mod material_shading_contract {
     #[test]
     fn studio_neon_emission_transfer() {
         // DefaultUnifiedNeonFS.3, before exposure and composition.
-        let shader = include_str!("shader.wgsl");
-        assert!(shader.contains("const NEON_GLOW: f32 = 13.286025;"));
+        let shader = include_str!("shaders/scene.hlsl");
+        assert!(shader.contains("static const float NEON_GLOW = 13.286025f;"));
         assert!(shader.contains("c = base * base * NEON_GLOW;"));
         for (color, expected) in [(0.0_f32, 0.0_f32), (0.5, 0.83037656), (1.0, 13.286025)] {
             let studio = 4.0 * (1.35 * color).powi(4);

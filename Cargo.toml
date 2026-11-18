@@ -92,6 +92,9 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Di
 [dev-dependencies]
 draco-core = { version = "2.3", default-features = false, features = ["decoder", "encoder"] }
 
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62", features = ["Win32_Graphics_Direct3D_Fxc"] }
+
 [patch.crates-io]
 rustls = { path = "vendor/rustls" }
 # Luau 745 (crates.io luau0-src 0.23.0+luau745): its compiler reuses dead

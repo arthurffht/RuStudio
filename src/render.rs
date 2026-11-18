@@ -3340,10 +3340,10 @@ impl Renderer {
         let clouds_active = self.quality.enable_clouds && frame.sky;
         match frame.clouds.as_ref().filter(|_| clouds_active) {
             Some(look) => {
+                self.bind_scene_globals_with(ctx, &self.globals_cb);
                 let clouds = self
                     .clouds
                     .get_or_insert_with(|| crate::clouds::CloudsGpu::new(device, ctx));
-                self.bind_scene_globals_with(ctx, &self.globals_cb);
                 clouds.encode(
                     device,
                     ctx,
@@ -3607,13 +3607,6 @@ impl Renderer {
         let split = !water_runs.is_empty() || has_glass || has_neon;
         let mut calls = 0usize;
 
-        let draw_part = |key: (usize, usize), inst: &ID3D11Buffer, range: std::ops::Range<u32>, calls: &mut usize| {
-            self.draw_part_run(ctx, key, inst, range);
-            if self.meshes.get(key.0).is_some() {
-                *calls += 1;
-            }
-        };
-
         // Scene environment probe work (env_probe.rs).
         if let Some(pf) = frame.probe.as_ref() {
             for task in &pf.tasks {
@@ -3660,13 +3653,19 @@ impl Renderer {
                         unsafe {
                             ctx.RSSetState(if self.culls_back(b.key.0) { &self.rs_cull_back } else { &self.rs_cull_none });
                         }
-                        draw_part(b.key, &self.static_buf, b.start..b.start + b.count, &mut calls);
+                        self.draw_part_run(ctx, b.key, &self.static_buf, b.start..b.start + b.count);
+                        if self.meshes.get(b.key.0).is_some() {
+                            calls += 1;
+                        }
                     }
                     for r in &opaque_runs {
                         unsafe {
                             ctx.RSSetState(if self.culls_back(r.0 .0) { &self.rs_cull_back } else { &self.rs_cull_none });
                         }
-                        draw_part(r.0, &self.instance_buf, r.1..r.2, &mut calls);
+                        self.draw_part_run(ctx, r.0, &self.instance_buf, r.1..r.2);
+                        if self.meshes.get(r.0 .0).is_some() {
+                            calls += 1;
+                        }
                     }
                     if !self.terrain_chunks.is_empty() {
                         unsafe {
@@ -3697,6 +3696,13 @@ impl Renderer {
             }
         }
         crate::gpu_timing::mark(ctx, "gpu: env probe");
+
+        let draw_part = |key: (usize, usize), inst: &ID3D11Buffer, range: std::ops::Range<u32>, calls: &mut usize| {
+            self.draw_part_run(ctx, key, inst, range);
+            if self.meshes.get(key.0).is_some() {
+                *calls += 1;
+            }
+        };
 
         let encoded = !self.see.linear
             && (!surface_decal_runs.is_empty()
@@ -4096,7 +4102,7 @@ impl Renderer {
                 self.resolve_glass_depth(ctx, target);
             }
             let depth_1x_srv = if msaa { &target.glass_depth_srv } else { &target.depth_srv };
-            if let Some(c) = self.clouds.as_mut() {
+            if self.clouds.is_some() {
                 crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
                 unsafe {
                     ctx.OMSetRenderTargets(None, None);
@@ -4104,7 +4110,9 @@ impl Renderer {
                 }
                 self.bind_scene_globals_with(ctx, &self.globals_cb);
                 crate::d3d11::set_viewport(ctx, 0.0, 0.0, target.size[0] as f32, target.size[1] as f32);
-                c.composite(ctx, &target.hdr_rtv, &target.scene_copy_srv, depth_1x_srv);
+                if let Some(c) = self.clouds.as_mut() {
+                    c.composite(ctx, &target.hdr_rtv, &target.scene_copy_srv, depth_1x_srv);
+                }
                 crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
                 unsafe { ctx.OMSetRenderTargets(None, None) };
             }
