@@ -113,7 +113,6 @@ pub enum BlendMode {
     Opaque,
     AlphaBlend,
     PremulAlpha,
-    Additive,
     NoColorWrite,
 }
 
@@ -211,6 +210,10 @@ pub fn create_device() -> Result<RenderState, String> {
 
     let device = device.ok_or("D3D11CreateDevice returned null device")?;
     let context = context.ok_or("D3D11CreateDevice returned null context")?;
+    if let Ok(dxgi_device) = device.cast::<IDXGIDevice1>() {
+        // Fallback latency cap when DXGI waitable swapchain handles are unavailable.
+        let _ = unsafe { dxgi_device.SetMaximumFrameLatency(1) };
+    }
     let factory: IDXGIFactory2 = factory1
         .cast()
         .map_err(|e| format!("Cast IDXGIFactory1->IDXGIFactory2 failed: {e}"))?;
@@ -806,16 +809,6 @@ pub fn create_blend_state(device: &ID3D11Device, mode: BlendMode) -> ID3D11Blend
             DestBlend: D3D11_BLEND_INV_SRC_ALPHA,
             BlendOp: D3D11_BLEND_OP_ADD,
             SrcBlendAlpha: D3D11_BLEND_INV_DEST_ALPHA,
-            DestBlendAlpha: D3D11_BLEND_ONE,
-            BlendOpAlpha: D3D11_BLEND_OP_ADD,
-            RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
-        },
-        BlendMode::Additive => D3D11_RENDER_TARGET_BLEND_DESC {
-            BlendEnable: true.into(),
-            SrcBlend: D3D11_BLEND_ONE,
-            DestBlend: D3D11_BLEND_ONE,
-            BlendOp: D3D11_BLEND_OP_ADD,
-            SrcBlendAlpha: D3D11_BLEND_ONE,
             DestBlendAlpha: D3D11_BLEND_ONE,
             BlendOpAlpha: D3D11_BLEND_OP_ADD,
             RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,

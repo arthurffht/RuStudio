@@ -125,11 +125,6 @@ impl WaterPass {
         }
     }
 
-    /// Unbind water's PS SRV slots (`t21..=t23`) after drawing.
-    pub fn unbind(&self, ctx: &ID3D11DeviceContext) {
-        d3d11::unbind_ps_srvs(ctx, 21, 3);
-    }
-
     /// This frame's uniforms.
     pub fn uniforms(&self, look: &WaterLook, size: [u32; 2]) -> WaterRaw {
         // The normal maps play through their frames (an estimate of Studio's

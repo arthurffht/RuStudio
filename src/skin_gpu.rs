@@ -259,8 +259,4 @@ impl SkinGpu {
             ctx.CSSetShader(None, None);
         }
     }
-
-    pub fn take_bytes(&mut self) -> u64 {
-        std::mem::take(&mut self.bytes)
-    }
 }

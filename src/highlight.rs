@@ -65,7 +65,6 @@ struct Target {
     mask_ms_tex: ID3D11Texture2D,
     mask_ms_rtv: ID3D11RenderTargetView,
     mask_one_tex: ID3D11Texture2D,
-    mask_one_rtv: ID3D11RenderTargetView,
     mask_one_srv: ID3D11ShaderResourceView,
 }
 
@@ -249,7 +248,6 @@ impl HighlightPass {
                 },
                 None,
             );
-            let mask_one_rtv = d3d11::create_rtv(device, &mask_one_tex, MASK_FORMAT, 0, false);
             let mask_one_srv =
                 d3d11::create_srv_2d(device, &mask_one_tex, MASK_FORMAT, false, 0, 1);
             let (mask_ms_tex, mask_ms_rtv) = if samples > 1 {
@@ -270,7 +268,8 @@ impl HighlightPass {
                 let rtv = d3d11::create_rtv(device, &tex, MASK_FORMAT, 0, true);
                 (tex, rtv)
             } else {
-                (mask_one_tex.clone(), mask_one_rtv.clone())
+                let rtv = d3d11::create_rtv(device, &mask_one_tex, MASK_FORMAT, 0, false);
+                (mask_one_tex.clone(), rtv)
             };
             self.target = Some(Target {
                 size,
@@ -278,7 +277,6 @@ impl HighlightPass {
                 mask_ms_tex,
                 mask_ms_rtv,
                 mask_one_tex,
-                mask_one_rtv,
                 mask_one_srv,
             });
         }

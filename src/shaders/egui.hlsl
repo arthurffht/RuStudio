@@ -34,5 +34,10 @@ EguiOut vs_main(EguiIn v) {
 }
 
 float4 ps_main(EguiOut i) : SV_Target {
-    return egui_tex.Sample(egui_sampler, i.uv) * i.col;
+    float4 c = egui_tex.Sample(egui_sampler, i.uv) * i.col;
+    // Premultiplied-safe 8-bit Interleaved Gradient Noise dithering in gamma space
+    // to break visible banding across R8G8B8A8_UNORM UI gradients without changing alpha.
+    float n = (frac(52.9829189f * frac(dot(i.pos.xy, float2(0.06711056f, 0.00583715f)))) - 0.5f) / 255.0f;
+    c.rgb = saturate(c.rgb + n * c.a);
+    return c;
 }

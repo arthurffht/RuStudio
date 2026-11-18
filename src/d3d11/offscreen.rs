@@ -37,24 +37,8 @@ impl OffscreenTarget {
         }
     }
 
-    pub fn resize(&mut self, device: &ID3D11Device, width: u32, height: u32) {
-        let width = width.max(1);
-        let height = height.max(1);
-        if self.size != [width, height] {
-            *self = Self::new(device, width, height);
-        }
-    }
-
     pub fn rtv(&self) -> &ID3D11RenderTargetView {
         &self.rtv
-    }
-
-    pub fn texture(&self) -> &ID3D11Texture2D {
-        &self.tex
-    }
-
-    pub fn size(&self) -> [u32; 2] {
-        self.size
     }
 
     pub fn read_rgba8(&self, device: &ID3D11Device, ctx: &ID3D11DeviceContext) -> Vec<u8> {

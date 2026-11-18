@@ -473,13 +473,15 @@ impl Renderer {
                 ctx.OMSetRenderTargets(Some(&[Some(t.msaa_rtv.clone())]), Some(&t.depth_dsv));
             }
             self.bind_scene_globals_with(ctx, &t.globals_cb);
+            Self::bind_instance_buffer(ctx, &t.inst_buf);
+            let mut last_tex = None;
             for r in &opaque_runs {
                 self.bind_part_pipeline(ctx, false, self.culls_back(r.0 .0));
-                self.draw_part_run(ctx, r.0, &t.inst_buf, r.1..r.2);
+                self.draw_part_run(ctx, r.0, r.1..r.2, &mut last_tex);
             }
             for r in &see_runs {
                 self.bind_part_pipeline(ctx, true, self.culls_back(r.0 .0));
-                self.draw_part_run(ctx, r.0, &t.inst_buf, r.1..r.2);
+                self.draw_part_run(ctx, r.0, r.1..r.2, &mut last_tex);
             }
             unsafe {
                 ctx.OMSetRenderTargets(None, None);

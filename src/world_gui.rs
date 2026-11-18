@@ -1091,27 +1091,6 @@ impl WorldGuiPass {
         d3d11::unbind_ps_srvs(ctx, 0, 8);
     }
 
-    /// Draws the world GUIs among `batches` onto `target_rtv` (the shown view),
-    /// tested against `depth_srv`. Effects go through `effects`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn draw(
-        &mut self,
-        rs: &RenderState,
-        target_rtv: &ID3D11RenderTargetView,
-        size: [u32; 2],
-        depth_srv: &ID3D11ShaderResourceView,
-        msaa: bool,
-        batches: &[GuiBatch],
-        tone_curve: Option<[f32; 5]>,
-        fog: [f32; 4],
-        fog_rgb: [f32; 3],
-    ) {
-        let Some(up) = self.upload(rs, batches, None, tone_curve, fog, fog_rgb) else { return };
-        crate::gpu_timing::scope(&rs.device, &rs.context, "gpu: world gui", || {
-            self.record(&rs.context, target_rtv, size, depth_srv, msaa, false, &up);
-        });
-    }
-
     /// Draws world GUIs and effects into the scene's HDR image (`hdr_rtv` / `hdr_srv`,
     /// linear light, before postprocessing), blended in the
     /// square root of linear light as Studio blends them: the image is

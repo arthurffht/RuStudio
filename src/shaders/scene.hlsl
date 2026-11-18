@@ -717,6 +717,179 @@ float4 fs_part_opaque(PartOut input, bool front : SV_IsFrontFace) : SV_Target {
     return part_shade_impl(input, front, false, true);
 }
 
+// Fast low-tier part pixel shader (QualityLevel <= 3): skips PBR BRDF, detiling,
+// cotangent normal maps, indoor_tex, local_pbr/lightocc raymarching, and scene refraction.
+float4 fs_part_low(PartOut input) : SV_Target {
+    uint code = (uint)(input.extra.x + 0.5f);
+    float kind = (float)(code & 7u);
+    int layer = (int)(code >> 4u) - 1;
+    uint mode = (uint)(input.extra.w + 0.5f);
+
+    float2 muv = face_studs(input.objn, input.local, input.half_ext, input.oblique) * input.mscale.xy + input.mscale.zw;
+    if ((code & 8u) != 0u) {
+        muv = input.uv;
+    }
+    float2 mdx = ddx(muv);
+    float2 mdy = ddy(muv);
+    float2 udx = ddx(input.uv);
+    float2 udy = ddy(input.uv);
+    float3 ddx_l = ddx(input.local);
+    float3 ddy_l = ddy(input.local);
+
+    float3 n = normalize(input.normal);
+    if (dot(n, g.cam_pos.xyz - input.world) < 0.0f) {
+        n = -n;
+    }
+
+    float3 vtint = sq(input.vtint.rgb);
+    float3 base = input.color.rgb * vtint;
+    float alpha = input.color.a;
+    bool translucent = alpha < 0.999f;
+    if (translucent) {
+        alpha = alpha * input.vtint.a;
+    }
+
+    float3 t_raw = float3(0.0f, 0.0f, 0.0f);
+    float4 t = float4(0.0f, 0.0f, 0.0f, 1.0f);
+    [branch]
+    if (mode != 0u || kind == 6.0f) {
+        bool decal_clamp = (mode == 2u) && all(abs(input.mscale - float4(1.0f, 1.0f, 0.0f, 0.0f)) < 1e-4f);
+        float2 edge_px = 0.5f / (float2)tex_dims2d(tex);
+        float2 suv = decal_clamp ? clamp(input.uv, edge_px, 1.0f - edge_px) : input.uv;
+        float4 t_s = tex.SampleGrad(tex_sampler, suv, udx, udy);
+        t_raw = linear_to_srgb(t_s.rgb);
+        t = float4(t_raw * t_raw, t_s.a);
+    }
+
+    [branch]
+    if (kind == 6.0f) {
+        float3 view = normalize(g.cam_pos.xyz - input.world);
+        float rim = 1.0f - saturate(2.0f * abs(dot(n, view)));
+        float phase = abs(cos(0.3f * g.cam_pos.w) * cos(g.cam_pos.w));
+        float red = t_raw.r;
+        float pulse = (mode != 0u && red > 0.0f) ? ((1.0f - saturate(13.0f * abs(red - phase))) * t.a) : 0.0f;
+        float edge = max(rim, pulse);
+        float cover = alpha * max(lerp(pulse, 1.0f, edge) * edge, 0.05f);
+        float f = (g.fog.z > 0.5f) ? fog_amount(length(input.world - g.cam_pos.xyz)) : 0.0f;
+        float3 fog_col = (g.atmos.w > 0.5f) ? g.atmos.rgb : fog_rgb();
+        return float4(lerp(base, fog_col, f) * cover, cover * (1.0f - f));
+    }
+
+    [branch]
+    if (mode != 0u) {
+        bool surface = input.tint.w > 0.5f;
+        float3 sa_raw = t_raw * input.tint.rgb * sqrt(max(input.emissive_albedo, 0.0f));
+        if (mode == 1u && surface) {
+            float3 under = sqrt(max(input.color.rgb, float3(0.0f, 0.0f, 0.0f))) * input.vtint.rgb;
+            float3 raw = lerp(under, sa_raw, t.a);
+            base = raw * raw;
+        } else if (mode == 1u) {
+            base = lerp(base, t.rgb * input.emissive_albedo * vtint, t.a);
+        } else if (mode == 6u) {
+            float3 raw = t_raw * lerp(float3(1.0f, 1.0f, 1.0f), input.tint.rgb, t.a) * sqrt(max(input.emissive_albedo, 0.0f));
+            base = raw * raw;
+        } else if (mode == 2u) {
+            base = t.rgb * base;
+            alpha = alpha * t.a;
+        } else if (mode == 3u) {
+            base = t.rgb * input.emissive_albedo * vtint;
+            if (translucent) { alpha = alpha * t.a; }
+        } else if (mode == 5u) {
+            base = t.rgb * input.color.rgb * vtint;
+            if (translucent) { alpha = alpha * t.a; }
+        } else if (mode == 4u) {
+            base = surface ? (sa_raw * sa_raw) : (t.rgb * input.emissive_albedo * vtint);
+            alpha = input.color.a * input.vtint.a * t.a;
+        }
+    } else if (layer >= 0) {
+        float4 mp0 = float4(-1.0f, 0.0f, 0.0f, 1.0f);
+        float4 mp1 = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if ((uint)layer < MAT_PARAM_LAYERS) {
+            mp0 = mat_params[5u * (uint)layer];
+            mp1 = mat_params[5u * (uint)layer + 1u];
+        }
+        uint shader_type = (uint)(mp1.z + 0.5f);
+        float dk = mp0.w;
+        float2 duv = muv * dk;
+        float4 a = mat_albedo.SampleGrad(studs_sampler, float3(duv, (float)layer), mdx * dk, mdy * dk);
+        if (translucent && (shader_type == 10u || shader_type == 11u)) {
+            alpha = saturate(2.0f * alpha - 1.0f + a.a);
+        }
+        float tint_k = (mp1.w > 0.5f && shader_type != 10u && shader_type != 11u) ? a.a : 1.0f;
+        base = sq(lerp(float3(1.0f, 1.0f, 1.0f), sqrt(max(base, float3(0.0f, 0.0f, 0.0f))), tint_k) * a.rgb);
+    }
+
+    uint packed_flags = (uint)(input.extra.y + 0.5f);
+    uint faces = (packed_flags >> 1u) & 0x3FFFFu;
+    [branch]
+    if (faces != 0u) {
+        base *= surface_shade(faces, input.objn, input.local, input.half_ext, ddx_l, ddy_l);
+    }
+
+    if (g.lamp1.w > 1.5f) {
+        float3 lit = min(g.ambient.rgb + g.sun_color.rgb * max(dot(n, normalize(g.sun_dir.xyz)), 0.0f), float3(1.0f, 1.0f, 1.0f));
+        return float4(lit * base * alpha, alpha);
+    }
+
+    if (kind > 4.5f && kind < 5.5f) {
+        float3 up = normalize(input.normal);
+        bool below = dot(up, g.cam_pos.xyz - input.world) < 0.0f;
+        if (under_water() && (!below || up.y < WATER_INSIDE_MIN_UP)) {
+            discard;
+        }
+        float3 vd = normalize(input.world - g.cam_pos.xyz);
+        float sv_w = light_grid(input.world, up);
+        float3 lit_w = base * (g.ambient.rgb + g.outdoor.rgb * sv_w * sky_gain()
+            + g.sun_color.rgb * g.sun_dir.w * WATER_SUN + local_grid(input.world, up));
+        float fres = saturate((saturate(0.78f - 2.5f * abs(dot(n, vd))) + 0.3f) * input.emissive.x);
+        float3 c_w;
+        if (below) {
+            c_w = lit_w;
+            alpha = WATER_BELOW_ALPHA;
+        } else {
+            c_w = lerp(lit_w, sky_color(reflect(vd, n)), fres);
+            alpha = saturate(1.0f - input.emissive.y * (1.0f - fres));
+        }
+        [branch]
+        if (g.fog.z > 0.5f) {
+            float3 fog_col = (g.atmos.w > 0.5f) ? g.atmos.rgb : fog_rgb();
+            c_w = lerp(c_w, fog_col, fog_amount(length(input.world - g.cam_pos.xyz)));
+        }
+        return float4(c_w * alpha, alpha);
+    }
+
+    float3 c;
+    if (kind > 0.5f && kind < 1.5f) {
+        c = base * base * NEON_GLOW;
+    } else {
+        float3 l = normalize(g.sun_dir.xyz);
+        float ndl = max(dot(n, l), 0.0f);
+        float sv = light_grid(input.world, n);
+        float sun_vis = (g.bloom.z > 0.5f && g.sun_color.w > 0.5f) ? light_grid_sun(input.world, n) : 1.0f;
+        float3 light = env_cube(n, sv) + g.ambient.rgb + g.outdoor.rgb * sv * sky_gain()
+            + g.sun_color.rgb * g.sun_dir.w * ndl * sun_vis * sun_cover()
+            + g.lamp1.rgb * max(-dot(n, l), 0.0f)
+            + local_grid(input.world, n);
+        c = base * light;
+        float refl = input.extra.z - 2.0f * step(1.5f, input.extra.z);
+        if (refl > 0.01f && !(kind > 2.5f && kind < 3.5f)) {
+            float3 vd = normalize(input.world - g.cam_pos.xyz);
+            float3 r = reflect(vd, n);
+            c = lerp(c, sky_color(r) * lerp(g.sky_grad[1].rgb, g.sky_grad[0].rgb, saturate(r.y * ENV_REFLECT_UP_GAIN)), refl);
+        }
+    }
+    if ((mode == 1u || mode >= 3u) && any(input.emissive > 0.0f)) {
+        c += t.rgb * input.emissive;
+    }
+    c = c + float3(0.004f, 0.008f, 0.014f) * step(1.5f, input.extra.z);
+    [branch]
+    if (g.fog.z > 0.5f) {
+        float3 fog_col = (g.atmos.w > 0.5f) ? g.atmos.rgb : fog_rgb();
+        c = lerp(c, fog_col, fog_amount(length(input.world - g.cam_pos.xyz)));
+    }
+    return float4(c * alpha, alpha);
+}
+
 float4 fs_part(PartOut input, bool front : SV_IsFrontFace) : SV_Target {
     return part_shade_impl(input, front, false, false);
 }
@@ -1069,6 +1242,70 @@ float4 fs_terrain(TerrainOut input) : SV_Target {
     }
     if (g.sky_rot.z > 3.5f) {
         c = (float3)sv;
+    }
+    return float4(c, 1.0f);
+}
+
+// Fast low-tier terrain pixel shader (QualityLevel <= 3): uses dominant corner
+// palette, single mat_albedo fetch, vertex normal directly, and fast fog.
+float4 fs_terrain_low(TerrainOut input) : SV_Target {
+    float2 d0x = ddx(input.uv01.xy);
+    float2 d0y = ddy(input.uv01.xy);
+    float2 d1x = ddx(input.uv01.zw);
+    float2 d1y = ddy(input.uv01.zw);
+    float2 d2x = ddx(input.uv2);
+    float2 d2y = ddy(input.uv2);
+
+    bool use0 = input.bary.x >= input.bary.y && input.bary.x >= input.bary.z;
+    bool use1 = !use0 && (input.bary.y >= input.bary.z);
+    uint pal = use0 ? input.palette.x : (use1 ? input.palette.y : input.palette.z);
+    float2 uv = use0 ? input.uv01.xy : (use1 ? input.uv01.zw : input.uv2);
+    float2 dx = use0 ? d0x : (use1 ? d1x : d2x);
+    float2 dy = use0 ? d0y : (use1 ? d1y : d2y);
+
+    bool is_blade = input.palette.w > 0u;
+    int layer = (int)tp_p[pal * 4u].w;
+    float4 mean = tp_p[pal * 4u + 3u];
+    float3 sample_rgb = is_blade ? GRASS_BLADE_COLOR : mean.rgb;
+    [branch]
+    if (layer >= 0 && !is_blade) {
+        float fp = max(length(dx), length(dy)) * 1024.0f;
+        float k = (fp < 2.0f) ? (2.0f / max(fp, 1e-6f)) : 1.0f;
+        sample_rgb = mat_albedo.SampleGrad(studs_sampler, float3(uv, (float)layer), dx * k, dy * k).rgb;
+    }
+
+    float4 rc = tp_p[pal * 4u + 2u];
+    float3 albedo;
+    if (rc.w > 0.5f) {
+        float3 blade_base = (mean.w > 0.5f) ? mean.rgb : (float3(194.0f, 196.0f, 188.0f) / 255.0f);
+        albedo = is_blade ? (blade_base * rc.rgb) : sample_rgb;
+    } else {
+        float3 y = ycocg(sample_rgb);
+        float3 yc = float3(y.x * rc.x, rc.y * y.y - rc.z * y.z, rc.z * y.y + rc.y * y.z);
+        albedo = float3(yc.x - yc.z + yc.y, yc.x + yc.z, yc.x - yc.z - yc.y);
+    }
+
+    float3 n = normalize(input.normal);
+    float3 base = albedo * albedo;
+    float sv = light_grid(input.world, n);
+
+    float3 c;
+    if (is_blade) {
+        c = base * (g.ambient.rgb + g.outdoor.rgb * sv * sky_gain() + input.grass_direct);
+    } else {
+        float3 l = normalize(g.sun_dir.xyz);
+        float ndl = max(dot(n, l), 0.0f);
+        float sun_vis = (g.bloom.z > 0.5f && g.sun_color.w > 0.5f) ? light_grid_sun(input.world, n) : 1.0f;
+        float3 light = env_cube(n, sv) + g.ambient.rgb + g.outdoor.rgb * sv * sky_gain()
+            + g.sun_color.rgb * g.sun_dir.w * ndl * sun_vis * sun_cover()
+            + g.lamp1.rgb * max(-dot(n, l), 0.0f)
+            + local_grid(input.world, n);
+        c = base * light;
+    }
+    [branch]
+    if (g.fog.z > 0.5f) {
+        float3 fog_col = (g.atmos.w > 0.5f) ? g.atmos.rgb : fog_rgb();
+        c = lerp(c, fog_col, fog_amount(length(input.world - g.cam_pos.xyz)));
     }
     return float4(c, 1.0f);
 }

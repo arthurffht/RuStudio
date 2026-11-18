@@ -22,15 +22,18 @@ pub fn record_gpu_frame_seconds(secs: f64) {
     LAST_GPU_FRAME_SECS_BITS.store(clamped.to_bits(), Ordering::Relaxed);
 }
 
+#[allow(dead_code)] // Read by UI PerfStats once window/viewport overlays integrate.
 pub fn last_gpu_frame_seconds() -> f64 {
     f64::from_bits(LAST_GPU_FRAME_SECS_BITS.load(Ordering::Relaxed))
 }
 
+#[allow(dead_code)] // Read by UI PerfStats once window/viewport overlays integrate.
 pub fn last_gpu_frame_ms() -> f32 {
     (last_gpu_frame_seconds() * 1000.0) as f32
 }
 
 const MAX_QUERIES: u32 = 256;
+const LITE_QUERIES: u32 = 2;
 const RING: usize = 4;
 const FREE: u8 = 0;
 const RECORDING: u8 = 1;
@@ -64,7 +67,7 @@ struct State {
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 static UNSUPPORTED: OnceLock<()> = OnceLock::new();
 
-fn init(device: &ID3D11Device) -> Option<State> {
+fn init(device: &ID3D11Device, query_count: u32) -> Option<State> {
     let dj_desc = D3D11_QUERY_DESC {
         Query: D3D11_QUERY_TIMESTAMP_DISJOINT,
         MiscFlags: 0,
@@ -78,17 +81,21 @@ fn init(device: &ID3D11Device) -> Option<State> {
         let mut dj = None;
         if unsafe { device.CreateQuery(&dj_desc, Some(&mut dj)) }.is_err() {
             UNSUPPORTED.get_or_init(|| {
-                eprintln!("RUSTUDIO_GPU_TIMING: D3D11 timestamp disjoint queries unsupported")
+                if on() {
+                    eprintln!("RUSTUDIO_GPU_TIMING: D3D11 timestamp disjoint queries unsupported");
+                }
             });
             return None;
         }
         let disjoint = dj?;
-        let mut queries = Vec::with_capacity(MAX_QUERIES as usize);
-        for _ in 0..MAX_QUERIES {
+        let mut queries = Vec::with_capacity(query_count as usize);
+        for _ in 0..query_count {
             let mut q = None;
             if unsafe { device.CreateQuery(&ts_desc, Some(&mut q)) }.is_err() {
                 UNSUPPORTED.get_or_init(|| {
-                    eprintln!("RUSTUDIO_GPU_TIMING: D3D11 timestamp queries unsupported")
+                    if on() {
+                        eprintln!("RUSTUDIO_GPU_TIMING: D3D11 timestamp queries unsupported");
+                    }
                 });
                 return None;
             }
@@ -121,7 +128,7 @@ fn ensure_recording(slot: &mut Slot, ctx: &ID3D11DeviceContext) {
 fn write(st: &mut State, ctx: &ID3D11DeviceContext) -> Option<u32> {
     let slot = &mut st.slots[st.cur?];
     ensure_recording(slot, ctx);
-    if slot.used >= MAX_QUERIES {
+    if slot.used as usize >= slot.queries.len() {
         return None;
     }
     let i = slot.used;
@@ -151,15 +158,25 @@ fn get_data<T: Copy>(ctx: &ID3D11DeviceContext, query: &ID3D11Query, flags: u32)
 }
 
 /// Starts a timed run of work on `ctx`.
+/// Even when `RUSTUDIO_GPU_TIMING` is unset, issues a single start timestamp
+/// so lightweight 2-timestamp total GPU frame timing stays active with minimal overhead.
 pub fn begin(device: &ID3D11Device, ctx: &ID3D11DeviceContext) {
-    if !on() || UNSUPPORTED.get().is_some() {
+    if UNSUPPORTED.get().is_some() {
         return;
     }
+    let detailed = on();
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if g.is_none() {
-        *g = init(device);
+        *g = init(device, if detailed { MAX_QUERIES } else { LITE_QUERIES });
     }
     let Some(st) = g.as_mut() else { return };
+    if !detailed {
+        if let Some(cur) = st.cur {
+            if st.slots[cur].state == RECORDING {
+                return;
+            }
+        }
+    }
     st.last = write(st, ctx);
 }
 
@@ -180,16 +197,23 @@ pub fn mark(ctx: &ID3D11DeviceContext, label: &'static str) {
 /// Once per frame, after the frame's work is issued: close this frame's
 /// disjoint block and collect earlier frames that finished without flushing.
 pub fn end_frame(_device: &ID3D11Device, ctx: &ID3D11DeviceContext) {
-    if !on() {
+    if UNSUPPORTED.get().is_some() {
         return;
     }
+    let detailed = on();
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(st) = g.as_mut() else { return };
     if let Some(cur) = st.cur {
-        let slot = &mut st.slots[cur];
-        if slot.state == RECORDING {
+        let recording = st.slots[cur].state == RECORDING;
+        if recording {
+            if !detailed {
+                if let (Some(a), Some(b)) = (st.last, write(st, ctx)) {
+                    st.slots[cur].spans.push((a, b, "gpu: frame"));
+                }
+            }
+            let slot = &mut st.slots[cur];
             unsafe { ctx.End(&slot.disjoint) };
-            if slot.used > 0 && !slot.spans.is_empty() {
+            if slot.used >= 2 && !slot.spans.is_empty() {
                 slot.state = PENDING;
             } else {
                 slot.used = 0;
@@ -197,6 +221,7 @@ pub fn end_frame(_device: &ID3D11Device, ctx: &ID3D11DeviceContext) {
                 slot.state = FREE;
             }
         } else {
+            let slot = &mut st.slots[cur];
             slot.used = 0;
             slot.spans.clear();
         }
@@ -240,12 +265,19 @@ pub fn end_frame(_device: &ID3D11Device, ctx: &ID3D11DeviceContext) {
                 continue;
             }
             total += ms;
-            match st.results.iter_mut().find(|e| e.0 == *label) {
-                Some(e) => e.1 += ms,
-                None => st.results.push((label, ms)),
+            if detailed {
+                match st.results.iter_mut().find(|e| e.0 == *label) {
+                    Some(e) => e.1 += ms,
+                    None => st.results.push((label, ms)),
+                }
             }
         }
-        st.totals.push(total);
+        if total > 0.0 {
+            record_gpu_frame_seconds(total * 0.001);
+        }
+        if detailed {
+            st.totals.push(total);
+        }
         slot.used = 0;
         slot.spans.clear();
         slot.state = FREE;
@@ -279,7 +311,7 @@ pub fn scope<R>(
     let (slot_idx, start) = {
         let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
         if g.is_none() {
-            *g = init(device);
+            *g = init(device, MAX_QUERIES);
         }
         match g.as_mut() {
             Some(st) => (st.cur, write(st, ctx)),

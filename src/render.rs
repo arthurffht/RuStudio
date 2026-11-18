@@ -34,10 +34,10 @@ const LSHADOW_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
 /// The local light shadow atlas (Studio's Future path: a cube map per
 /// shadowed light, Studio measurements "Local light shadows").
 pub struct LightShadows {
+    side: u32,
     moments_rtv: ID3D11RenderTargetView,
     moments_srv: ID3D11ShaderResourceView,
     depth_dsv: ID3D11DepthStencilView,
-    sampler: ID3D11SamplerState,
     /// ShadowSlot per light (6 view-projections + position / 1 over Range).
     slots_buf: ID3D11Buffer,
     slots_srv: ID3D11ShaderResourceView,
@@ -48,8 +48,8 @@ pub struct LightShadows {
 }
 
 impl LightShadows {
-    fn new(device: &ID3D11Device) -> Self {
-        let side = crate::mech::LSHADOW_ATLAS;
+    fn new(device: &ID3D11Device, side: u32) -> Self {
+        let side = side.max(1);
         let moments_tex = crate::d3d11::create_tex2d(
             device,
             &crate::d3d11::Tex2dSpec {
@@ -75,22 +75,14 @@ impl LightShadows {
             None,
         );
         let depth_dsv = crate::d3d11::create_dsv(device, &depth_tex, DEPTH_FORMAT, false, false);
-        let sampler = crate::d3d11::create_sampler(
-            device,
-            D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT,
-            D3D11_TEXTURE_ADDRESS_CLAMP,
-            D3D11_TEXTURE_ADDRESS_CLAMP,
-            D3D11_TEXTURE_ADDRESS_CLAMP,
-            1,
-        );
         let n = crate::mech::LSHADOW_MAX_LIGHTS.max(1) as u32;
         let (slots_buf, slots_srv) = crate::d3d11::create_structured_srv(device, 6 * 64 + 16, n, true, None);
         let face_cb = crate::d3d11::create_cb(device, 96);
         Self {
+            side,
             moments_rtv,
             moments_srv,
             depth_dsv,
-            sampler,
             slots_buf,
             slots_srv,
             face_cb,
@@ -113,7 +105,32 @@ impl LightShadows {
 /// DepthOfFieldEffect intensity from which Studio runs the reduced near chain
 /// instead of the full-resolution cheap pass (DOF_CHEAP_BELOW).
 const DOF_CHEAP_BELOW: f32 = 0.22;
-const SHADOW_SIZE: u32 = crate::mech::SHADOW_MAP_TEXELS;
+struct SunShadowRes {
+    side: u32,
+    depth_dsv: ID3D11DepthStencilView,
+    sun: crate::sun_shadow::SunShadows,
+}
+
+impl SunShadowRes {
+    fn new(device: &ID3D11Device, side: u32) -> Self {
+        let side = side.max(1);
+        let shadow_tex = crate::d3d11::create_tex2d(
+            device,
+            &crate::d3d11::Tex2dSpec {
+                width: side,
+                height: side,
+                format: DXGI_FORMAT_R32_TYPELESS,
+                bind_flags: (D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+                ..Default::default()
+            },
+            None,
+        );
+        let depth_dsv = crate::d3d11::create_dsv(device, &shadow_tex, DEPTH_FORMAT, false, false);
+        let depth_srv = crate::d3d11::create_srv_2d(device, &shadow_tex, DXGI_FORMAT_R32_FLOAT, false, 0, 1);
+        let sun = crate::sun_shadow::SunShadows::new(device, &depth_srv, side);
+        Self { side, depth_dsv, sun }
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -173,7 +190,7 @@ pub struct Globals {
     pub dof: [f32; 4],
 }
 
-/// One local light as the shader reads it (see `Light` in shader.wgsl).
+/// One local light as the shader reads it (see `Light` in `src/shaders/common.hlsli`).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
 pub struct LightRaw {
@@ -1062,6 +1079,32 @@ impl SeeThrough {
     }
 }
 
+struct BloomTargets {
+    bright_capture: Option<ID3D11Texture2D>,
+    sizes: [[u32; 2]; 5],
+    textures: Vec<ID3D11Texture2D>,
+    rtvs: Vec<ID3D11RenderTargetView>,
+    srvs: Vec<ID3D11ShaderResourceView>,
+}
+
+struct DofTargets {
+    rtvs: [ID3D11RenderTargetView; 2],
+    srvs: [ID3D11ShaderResourceView; 2],
+}
+
+struct NearTargets {
+    sizes: [[u32; 2]; 11],
+    rtvs: Vec<ID3D11RenderTargetView>,
+    srvs: Vec<ID3D11ShaderResourceView>,
+}
+
+struct SsaoTargets {
+    depth_rtv: ID3D11RenderTargetView,
+    depth_srv: ID3D11ShaderResourceView,
+    rtvs: [ID3D11RenderTargetView; 2],
+    srvs: [ID3D11ShaderResourceView; 2],
+}
+
 struct Target {
     size: [u32; 2],
     samples: u32,
@@ -1079,32 +1122,161 @@ struct Target {
     hdr_tex: ID3D11Texture2D,
     hdr_rtv: ID3D11RenderTargetView,
     hdr_srv: ID3D11ShaderResourceView,
-    /// The opaque scene's colour, copied for the water/glass/ssao/clouds passes.
-    scene_copy_tex: ID3D11Texture2D,
-    scene_copy_srv: ID3D11ShaderResourceView,
-    water_depth_dsv: ID3D11DepthStencilView,
-    glass_depth_rtv: ID3D11RenderTargetView,
-    glass_depth_srv: ID3D11ShaderResourceView,
-    dof_rtvs: [ID3D11RenderTargetView; 2],
-    dof_srvs: [ID3D11ShaderResourceView; 2],
-    near_sizes: [[u32; 2]; 11],
-    near_rtvs: Vec<ID3D11RenderTargetView>,
-    near_srvs: Vec<ID3D11ShaderResourceView>,
-    /// Linear bloom pyramid, from half resolution through 1/32 resolution.
-    bloom_bright_capture: Option<ID3D11Texture2D>,
-    bloom_sizes: [[u32; 2]; 5],
-    bloom_textures: Vec<ID3D11Texture2D>,
-    bloom_rtvs: Vec<ID3D11RenderTargetView>,
-    bloom_srvs: Vec<ID3D11ShaderResourceView>,
-    /// SSAO at half resolution: the AO depth, then (occlusion, depth) ping-ponged through blurs.
-    ssao_depth_rtv: ID3D11RenderTargetView,
-    ssao_depth_srv: ID3D11ShaderResourceView,
-    ssao_rtvs: [ID3D11RenderTargetView; 2],
-    ssao_srvs: [ID3D11ShaderResourceView; 2],
+    /// Optional targets allocated lazily only when the active passes need them.
+    scene_copy: Option<(ID3D11Texture2D, ID3D11ShaderResourceView)>,
+    water_depth_dsv: Option<ID3D11DepthStencilView>,
+    glass_depth: Option<(ID3D11RenderTargetView, ID3D11ShaderResourceView)>,
+    dof: Option<DofTargets>,
+    near: Option<NearTargets>,
+    bloom: Option<BloomTargets>,
+    ssao: Option<SsaoTargets>,
     /// The tone-mapped image egui shows.
     display_tex: ID3D11Texture2D,
     display_rtv: ID3D11RenderTargetView,
     display_srv: ID3D11ShaderResourceView,
+}
+
+impl Target {
+    fn mk_rt(
+        device: &ID3D11Device,
+        w: u32,
+        h: u32,
+        format: DXGI_FORMAT,
+        s: u32,
+    ) -> (ID3D11Texture2D, ID3D11RenderTargetView, ID3D11ShaderResourceView) {
+        let tex = crate::d3d11::create_tex2d(
+            device,
+            &crate::d3d11::Tex2dSpec {
+                width: w,
+                height: h,
+                mips: 1,
+                array_size: 1,
+                format,
+                samples: s,
+                bind_flags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+                misc_flags: 0,
+            },
+            None,
+        );
+        let rtv = crate::d3d11::create_rtv(device, &tex, format, 0, s > 1);
+        let srv = crate::d3d11::create_srv_2d(device, &tex, format, s > 1, 0, 1);
+        (tex, rtv, srv)
+    }
+
+    fn ensure_scene_copy(&mut self, device: &ID3D11Device) -> &(ID3D11Texture2D, ID3D11ShaderResourceView) {
+        self.scene_copy.get_or_insert_with(|| {
+            let (tex, _, srv) = Self::mk_rt(device, self.size[0], self.size[1], HDR_FORMAT, 1);
+            (tex, srv)
+        })
+    }
+
+    fn ensure_water_depth(&mut self, device: &ID3D11Device) -> &ID3D11DepthStencilView {
+        self.water_depth_dsv.get_or_insert_with(|| {
+            let water_depth_tex = crate::d3d11::create_tex2d(
+                device,
+                &crate::d3d11::Tex2dSpec {
+                    width: self.size[0],
+                    height: self.size[1],
+                    format: DEPTH_FORMAT,
+                    samples: self.samples,
+                    bind_flags: D3D11_BIND_DEPTH_STENCIL.0 as u32,
+                    ..Default::default()
+                },
+                None,
+            );
+            crate::d3d11::create_dsv(device, &water_depth_tex, DEPTH_FORMAT, self.samples > 1, false)
+        })
+    }
+
+    fn ensure_glass_depth(&mut self, device: &ID3D11Device) -> &(ID3D11RenderTargetView, ID3D11ShaderResourceView) {
+        self.glass_depth.get_or_insert_with(|| {
+            let (_, rtv, srv) = Self::mk_rt(device, self.size[0], self.size[1], DXGI_FORMAT_R32_FLOAT, 1);
+            (rtv, srv)
+        })
+    }
+
+    fn ensure_bloom(&mut self, device: &ID3D11Device) -> &BloomTargets {
+        self.bloom.get_or_insert_with(|| {
+            let mut sizes = [[1u32; 2]; 5];
+            let mut textures = Vec::with_capacity(5);
+            let mut rtvs = Vec::with_capacity(5);
+            let mut srvs = Vec::with_capacity(5);
+            for level in 1..=5usize {
+                let bw = (self.size[0] >> level).max(1);
+                let bh = (self.size[1] >> level).max(1);
+                sizes[level - 1] = [bw, bh];
+                let (tex, rtv, srv) = Self::mk_rt(device, bw, bh, HDR_FORMAT, 1);
+                textures.push(tex);
+                rtvs.push(rtv);
+                srvs.push(srv);
+            }
+            let bright_capture = std::env::var_os("RUSTUDIO_DUMP_HDR").map(|_| {
+                crate::d3d11::create_tex2d(
+                    device,
+                    &crate::d3d11::Tex2dSpec {
+                        width: sizes[0][0],
+                        height: sizes[0][1],
+                        format: HDR_FORMAT,
+                        bind_flags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                        ..Default::default()
+                    },
+                    None,
+                )
+            });
+            BloomTargets {
+                bright_capture,
+                sizes,
+                textures,
+                rtvs,
+                srvs,
+            }
+        })
+    }
+
+    fn ensure_dof(&mut self, device: &ID3D11Device) -> &DofTargets {
+        self.dof.get_or_insert_with(|| {
+            let (_, dof_rtv0, dof_srv0) = Self::mk_rt(device, self.size[0], self.size[1], HDR_FORMAT, 1);
+            let (_, dof_rtv1, dof_srv1) = Self::mk_rt(device, self.size[0], self.size[1], HDR_FORMAT, 1);
+            DofTargets {
+                rtvs: [dof_rtv0, dof_rtv1],
+                srvs: [dof_srv0, dof_srv1],
+            }
+        })
+    }
+
+    fn ensure_near(&mut self, device: &ID3D11Device) -> &NearTargets {
+        self.near.get_or_insert_with(|| {
+            let mut sizes = [[1u32; 2]; 11];
+            let mut rtvs = Vec::with_capacity(11);
+            let mut srvs = Vec::with_capacity(11);
+            for i in 0..11usize {
+                let nw = (self.size[0] / 4).max(1);
+                let nh = if i == 0 { self.size[1] } else { (self.size[1] / 4).max(1) };
+                sizes[i] = [nw, nh];
+                let (_, rtv, srv) = Self::mk_rt(device, nw, nh, HDR_FORMAT, 1);
+                rtvs.push(rtv);
+                srvs.push(srv);
+            }
+            NearTargets { sizes, rtvs, srvs }
+        })
+    }
+
+    fn ensure_ssao(&mut self, device: &ID3D11Device) -> &SsaoTargets {
+        self.ssao.get_or_insert_with(|| {
+            let (_, depth_rtv, depth_srv) =
+                Self::mk_rt(device, self.half_size[0], self.half_size[1], DXGI_FORMAT_R32_FLOAT, 1);
+            let (_, rtv0, srv0) =
+                Self::mk_rt(device, self.half_size[0], self.half_size[1], DXGI_FORMAT_R32G32_FLOAT, 1);
+            let (_, rtv1, srv1) =
+                Self::mk_rt(device, self.half_size[0], self.half_size[1], DXGI_FORMAT_R32G32_FLOAT, 1);
+            SsaoTargets {
+                depth_rtv,
+                depth_srv,
+                rtvs: [rtv0, rtv1],
+                srvs: [srv0, srv1],
+            }
+        })
+    }
 }
 
 pub struct Renderer {
@@ -1156,10 +1328,12 @@ pub struct Renderer {
     ps_sky: ID3D11PixelShader,
     vs_part: ID3D11VertexShader,
     ps_part_opaque: ID3D11PixelShader,
+    ps_part_low: ID3D11PixelShader,
     ps_part: ID3D11PixelShader,
     ps_part_enc: ID3D11PixelShader,
     ps_decal_depth: ID3D11PixelShader,
     vs_terrain: ID3D11VertexShader,
+    ps_terrain_low: ID3D11PixelShader,
     ps_terrain: ID3D11PixelShader,
     vs_terrain_shadow: ID3D11VertexShader,
     vs_shadow: ID3D11VertexShader,
@@ -1189,8 +1363,11 @@ pub struct Renderer {
     ps_bloom_down: ID3D11PixelShader,
     ps_bloom_up: ID3D11PixelShader,
     post_bloom_size: f32,
-    /// Local light shadow maps (Studio's Future path) and their pass.
-    lshadow: LightShadows,
+    post_deferred: bool,
+    /// Local light shadow maps (Studio's Future path), allocated lazily when enabled.
+    lshadow: Option<LightShadows>,
+    lshadow_sampler: ID3D11SamplerState,
+    lshadow_empty_slots_srv: ID3D11ShaderResourceView,
     /// Bumped whenever the static instances change (light shadow cache key).
     static_gen: u64,
     terrain_params_cb: ID3D11Buffer,
@@ -1201,10 +1378,8 @@ pub struct Renderer {
     globals_cb: ID3D11Buffer,
     lights_buf: ID3D11Buffer,
     lights_srv: ID3D11ShaderResourceView,
-    /// The depth map the sun's cascades are drawn into, one at a time.
-    shadow_dsv: ID3D11DepthStencilView,
-    /// The sun's shadow cascades: the atlas the shaders read (sun_shadow.rs).
-    sun: crate::sun_shadow::SunShadows,
+    /// Sun shadow depth map + EVSM atlas, allocated lazily when sun shadows are enabled.
+    sun_res: Option<SunShadowRes>,
     /// Terrain.Clouds' passes (clouds.rs), made on first use.
     clouds: Option<crate::clouds::CloudsGpu>,
     sky_srv: ID3D11ShaderResourceView,
@@ -1268,10 +1443,11 @@ pub struct Renderer {
     pub texture_id: Option<egui::TextureId>,
 }
 
-fn unbind_all_srvs(ctx: &ID3D11DeviceContext) {
-    crate::d3d11::unbind_ps_srvs(ctx, 0, 32);
-    let slots: [Option<ID3D11ShaderResourceView>; 16] = std::array::from_fn(|_| None);
-    unsafe { ctx.VSSetShaderResources(0, Some(&slots)) };
+fn unbind_rtv_srvs(ctx: &ID3D11DeviceContext) {
+    crate::d3d11::unbind_ps_srvs(ctx, 2, 1);
+    crate::d3d11::unbind_ps_srvs(ctx, 8, 1);
+    crate::d3d11::unbind_ps_srvs(ctx, 10, 1);
+    crate::d3d11::unbind_ps_srvs(ctx, 14, 10);
 }
 
 fn input_elem(
@@ -1389,20 +1565,6 @@ impl Renderer {
             None,
         );
 
-        let shadow_tex = crate::d3d11::create_tex2d(
-            device,
-            &crate::d3d11::Tex2dSpec {
-                width: SHADOW_SIZE,
-                height: SHADOW_SIZE,
-                format: DXGI_FORMAT_R32_TYPELESS,
-                bind_flags: (D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE).0 as u32,
-                ..Default::default()
-            },
-            None,
-        );
-        let shadow_dsv = crate::d3d11::create_dsv(device, &shadow_tex, DEPTH_FORMAT, false, false);
-        let shadow_srv = crate::d3d11::create_srv_2d(device, &shadow_tex, DXGI_FORMAT_R32_FLOAT, false, 0, 1);
-
         let [lg_x, lg_y, lg_z] = crate::lightgrid::dims().map(|n| n as u32);
         let lightgrid_tex = crate::d3d11::create_tex3d(
             device,
@@ -1469,8 +1631,15 @@ impl Renderer {
         );
         let studs_srv = Self::studs_texture(device, 1, 1, &[128, 128, 128, 255]);
         let materials = MaterialArrays::new(device, ctx, 1, 1);
-        let lshadow = LightShadows::new(device);
-        let sun = crate::sun_shadow::SunShadows::new(device, &shadow_srv);
+        let lshadow_sampler = crate::d3d11::create_sampler(
+            device,
+            D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+            1,
+        );
+        let (_, lshadow_empty_slots_srv) = crate::d3d11::create_structured_srv(device, 6 * 64 + 16, 1, false, None);
         // Studio's scene environment probe (env_probe.rs): t8 is current slot, t14 blend target.
         let probe = env_probe_gpu::ProbeGpu::new(device, ctx, samples, std::mem::size_of::<Globals>());
 
@@ -1578,10 +1747,12 @@ impl Renderer {
         let ps_sky = crate::d3d11::create_ps(device, shaders::PS_SKY);
         let vs_part = crate::d3d11::create_vs(device, shaders::VS_PART);
         let ps_part_opaque = crate::d3d11::create_ps(device, shaders::PS_PART_OPAQUE);
+        let ps_part_low = crate::d3d11::create_ps(device, shaders::PS_PART_LOW);
         let ps_part = crate::d3d11::create_ps(device, shaders::PS_PART);
         let ps_part_enc = crate::d3d11::create_ps(device, shaders::PS_PART_ENC);
         let ps_decal_depth = crate::d3d11::create_ps(device, shaders::PS_DECAL_DEPTH);
         let vs_terrain = crate::d3d11::create_vs(device, shaders::VS_TERRAIN);
+        let ps_terrain_low = crate::d3d11::create_ps(device, shaders::PS_TERRAIN_LOW);
         let ps_terrain = crate::d3d11::create_ps(device, shaders::PS_TERRAIN);
         let vs_terrain_shadow = crate::d3d11::create_vs(device, shaders::VS_TERRAIN_SHADOW);
         let vs_shadow = crate::d3d11::create_vs(device, shaders::VS_SHADOW);
@@ -1680,10 +1851,12 @@ impl Renderer {
             ps_sky,
             vs_part,
             ps_part_opaque,
+            ps_part_low,
             ps_part,
             ps_part_enc,
             ps_decal_depth,
             vs_terrain,
+            ps_terrain_low,
             ps_terrain,
             vs_terrain_shadow,
             vs_shadow,
@@ -1713,7 +1886,10 @@ impl Renderer {
             ps_bloom_down,
             ps_bloom_up,
             post_bloom_size: 24.0,
-            lshadow,
+            post_deferred: false,
+            lshadow: None,
+            lshadow_sampler,
+            lshadow_empty_slots_srv,
             static_gen: 0,
             terrain_params_cb,
             terrain_params_cpu,
@@ -1722,8 +1898,7 @@ impl Renderer {
             globals_cb,
             lights_buf,
             lights_srv,
-            shadow_dsv,
-            sun,
+            sun_res: None,
             clouds: None,
             sky_srv,
             indoor_srv,
@@ -1771,11 +1946,41 @@ impl Renderer {
 
     pub fn set_quality(&mut self, mut q: crate::quality::QualityProfile) {
         q.msaa_samples = if q.msaa_samples >= 4 && self.can_msaa_4x { 4 } else { 1 };
-        if q.shadow_cascades != self.quality.shadow_cascades || q.enable_shadows != self.quality.enable_shadows {
-            self.sun.forget();
+        if !q.enable_shadows
+            || q.shadow_cascades == 0
+            || q.shadow_atlas_side != self.quality.shadow_atlas_side
+        {
+            self.sun_res = None;
+            self.last_cascades = None;
+        } else if q.shadow_cascades != self.quality.shadow_cascades {
+            if let Some(s) = &mut self.sun_res {
+                s.sun.forget();
+            }
         }
-        if q.max_local_shadows != self.quality.max_local_shadows {
-            self.lshadow.key = None;
+        if !q.enable_shadows
+            || q.max_local_shadows == 0
+            || q.shadow_atlas_side != self.quality.shadow_atlas_side
+        {
+            self.lshadow = None;
+        } else if q.max_local_shadows != self.quality.max_local_shadows {
+            if let Some(l) = &mut self.lshadow {
+                l.key = None;
+            }
+        }
+        if let Some(t) = self.target.as_mut() {
+            if !q.enable_bloom {
+                t.bloom = None;
+            }
+            if !q.enable_ssao {
+                t.ssao = None;
+            }
+            if !q.enable_dof {
+                t.dof = None;
+                t.near = None;
+            }
+            if q.level < crate::mech::QUALITY_WATER_REFRACT_MIN_LEVEL {
+                t.water_depth_dsv = None;
+            }
         }
         self.quality = q;
     }
@@ -1814,13 +2019,15 @@ impl Renderer {
         let target = self.target.as_ref()?;
         if let Ok(path) = std::env::var("RUSTUDIO_DUMP_HDR") {
             let half = [(target.size[0] >> 1).max(1), (target.size[1] >> 1).max(1)];
-            if let Some(texture) = &target.bloom_bright_capture {
-                if let Some((w, h, data)) = self.read_hdr_texture(rs, texture, half) {
-                    let _ = std::fs::write(format!("{path}.extract-{w}x{h}"), data);
+            if let Some(bloom) = &target.bloom {
+                if let Some(texture) = &bloom.bright_capture {
+                    if let Some((w, h, data)) = self.read_hdr_texture(rs, texture, half) {
+                        let _ = std::fs::write(format!("{path}.extract-{w}x{h}"), data);
+                    }
                 }
-            }
-            if let Some((w, h, data)) = self.read_hdr_texture(rs, &target.bloom_textures[0], half) {
-                let _ = std::fs::write(format!("{path}.bloom-{w}x{h}"), data);
+                if let Some((w, h, data)) = self.read_hdr_texture(rs, &bloom.textures[0], half) {
+                    let _ = std::fs::write(format!("{path}.bloom-{w}x{h}"), data);
+                }
             }
             // The scene environment probe's current slot, level 0 (env_probe.rs).
             for f in 0..6 {
@@ -2000,10 +2207,13 @@ impl Renderer {
 
     pub(super) fn bind_scene_globals_with(&self, ctx: &ID3D11DeviceContext, globals_cb: &ID3D11Buffer) {
         let cbs = [Some(globals_cb.clone()), Some(self.materials.params_cb.clone())];
+        let sun_srv = self.sun_res.as_ref().map_or(&self.black_srv, |s| &s.sun.atlas_srv);
+        let lshadow_srv = self.lshadow.as_ref().map_or(&self.black_srv, |l| &l.moments_srv);
+        let lshadow_slots_srv = self.lshadow.as_ref().map_or(&self.lshadow_empty_slots_srv, |l| &l.slots_srv);
         let srvs = [
             Some(self.lights_srv.clone()),                        // t0
             Some(self.sky_srv.clone()),                           // t1
-            Some(self.sun.atlas_srv.clone()),                     // t2
+            Some(sun_srv.clone()),                                // t2
             Some(self.studs_srv.clone()),                         // t3
             Some(self.materials.albedo_srv.clone()),              // t4
             Some(self.materials.surface_srv.clone()),             // t5
@@ -2011,8 +2221,8 @@ impl Renderer {
             Some(self.lightocc_srv.clone()),                      // t7
             Some(self.probe.slot_srvs[self.probe.cur].clone()),   // t8
             Some(self.brdf_srv.clone()),                          // t9
-            Some(self.lshadow.moments_srv.clone()),               // t10
-            Some(self.lshadow.slots_srv.clone()),                 // t11
+            Some(lshadow_srv.clone()),                            // t10
+            Some(lshadow_slots_srv.clone()),                      // t11
             Some(self.materials.emission_srv.clone()),            // t12
             Some(self.localgrid_srv.clone()),                     // t13
             Some(self.probe.slot_srvs[self.probe.next()].clone()), // t14
@@ -2020,17 +2230,24 @@ impl Renderer {
         let samps = [
             Some(self.sky_sampler.clone()),     // s0
             Some(self.active_sampler().clone()), // s1
-            Some(self.lshadow.sampler.clone()), // s2
+            Some(self.lshadow_sampler.clone()), // s2
         ];
         let glass_fallback = [Some(self.black_srv.clone()), Some(self.black_srv.clone())];
         unsafe {
             ctx.VSSetConstantBuffers(0, Some(&cbs));
             ctx.PSSetConstantBuffers(0, Some(&cbs));
-            ctx.VSSetShaderResources(0, Some(&srvs));
+            // Vertex shaders only read globals/material CBs and vertex buffers, never t0..t14 / s0..s2.
             ctx.PSSetShaderResources(0, Some(&srvs));
-            ctx.VSSetSamplers(0, Some(&samps));
             ctx.PSSetSamplers(0, Some(&samps));
             ctx.PSSetShaderResources(19, Some(&glass_fallback));
+        }
+    }
+
+    pub(super) fn bind_instance_buffer(ctx: &ID3D11DeviceContext, inst_buf: &ID3D11Buffer) {
+        let stride = std::mem::size_of::<InstanceRaw>() as u32;
+        let offset = 0u32;
+        unsafe {
+            ctx.IASetVertexBuffers(1, 1, Some(&Some(inst_buf.clone())), Some(&stride), Some(&offset));
         }
     }
 
@@ -2040,11 +2257,19 @@ impl Renderer {
         transparent: bool,
         cull_back: bool,
     ) {
+        let low_shaders = self.quality.level <= crate::mech::QUALITY_LOW_SHADER_MAX_LEVEL;
+        let ps = if low_shaders {
+            &self.ps_part_low
+        } else if transparent {
+            &self.ps_part
+        } else {
+            &self.ps_part_opaque
+        };
         unsafe {
             ctx.IASetInputLayout(&self.il_part);
             ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             ctx.VSSetShader(&self.vs_part, None);
-            ctx.PSSetShader(if transparent { &self.ps_part } else { &self.ps_part_opaque }, None);
+            ctx.PSSetShader(ps, None);
             ctx.PSSetSamplers(3, Some(&[Some(self.active_sampler().clone())]));
             ctx.RSSetState(if cull_back { &self.rs_cull_back } else { &self.rs_cull_none });
             ctx.OMSetDepthStencilState(
@@ -2063,33 +2288,31 @@ impl Renderer {
         &self,
         ctx: &ID3D11DeviceContext,
         key: (usize, usize),
-        inst_buf: &ID3D11Buffer,
         range: std::ops::Range<u32>,
+        last_tex: &mut Option<usize>,
     ) {
         let Some(mesh) = self.meshes.get(key.0) else {
             return;
         };
-        let tex = self.textures.get(key.1).unwrap_or(&self.textures[0]);
-        let tex_srvs = [
-            Some(tex.albedo_srv.clone()),
-            Some(tex.emissive_srv.clone()),
-            Some(tex.surface_srv.clone()),
-        ];
-        let vbs = [Some(mesh.vbuf.clone()), Some(inst_buf.clone())];
-        let strides = [
-            std::mem::size_of::<Vertex>() as u32,
-            std::mem::size_of::<InstanceRaw>() as u32,
-        ];
-        let offsets = [0u32, 0u32];
+        if *last_tex != Some(key.1) {
+            let tex = self.textures.get(key.1).unwrap_or(&self.textures[0]);
+            let tex_srvs = [
+                Some(tex.albedo_srv.clone()),
+                Some(tex.emissive_srv.clone()),
+                Some(tex.surface_srv.clone()),
+            ];
+            unsafe { ctx.PSSetShaderResources(15, Some(&tex_srvs)) };
+            *last_tex = Some(key.1);
+        }
+        let stride = std::mem::size_of::<Vertex>() as u32;
+        let offset = 0u32;
         crate::runtime::domains::services::perf::draw(
             crate::runtime::domains::services::perf::SCENE,
             1,
             (mesh.count / 3) as u64 * (range.end - range.start) as u64,
         );
         unsafe {
-            ctx.PSSetShaderResources(15, Some(&tex_srvs));
-            ctx.PSSetSamplers(3, Some(&[Some(self.active_sampler().clone())]));
-            ctx.IASetVertexBuffers(0, 2, Some(vbs.as_ptr()), Some(strides.as_ptr()), Some(offsets.as_ptr()));
+            ctx.IASetVertexBuffers(0, 1, Some(&Some(mesh.vbuf.clone())), Some(&stride), Some(&offset));
             ctx.DrawInstanced(mesh.count, range.end - range.start, 0, range.start);
         }
     }
@@ -2492,33 +2715,13 @@ impl Renderer {
             return;
         }
         let device = &rs.device;
-        let mk_rt = |w: u32, h: u32, format: DXGI_FORMAT, s: u32| {
-            let tex = crate::d3d11::create_tex2d(
-                device,
-                &crate::d3d11::Tex2dSpec {
-                    width: w,
-                    height: h,
-                    mips: 1,
-                    array_size: 1,
-                    format,
-                    samples: s,
-                    bind_flags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
-                    misc_flags: 0,
-                },
-                None,
-            );
-            let rtv = crate::d3d11::create_rtv(device, &tex, format, 0, s > 1);
-            let srv = crate::d3d11::create_srv_2d(device, &tex, format, s > 1, 0, 1);
-            (tex, rtv, srv)
-        };
-
-        let (hdr_tex, hdr_rtv, hdr_srv) = mk_rt(size[0], size[1], HDR_FORMAT, 1);
+        let (hdr_tex, hdr_rtv, hdr_srv) = Target::mk_rt(device, size[0], size[1], HDR_FORMAT, 1);
         let (msaa_tex, msaa_rtv, msaa_srv) = if samples > 1 {
-            mk_rt(size[0], size[1], HDR_FORMAT, samples)
+            Target::mk_rt(device, size[0], size[1], HDR_FORMAT, samples)
         } else {
             (hdr_tex.clone(), hdr_rtv.clone(), hdr_srv.clone())
         };
-        let (_see_tex, see_rtv, see_srv) = mk_rt(size[0], size[1], HDR_FORMAT, samples);
+        let (_see_tex, see_rtv, see_srv) = Target::mk_rt(device, size[0], size[1], HDR_FORMAT, samples);
 
         let depth_tex = crate::d3d11::create_tex2d(
             device,
@@ -2535,78 +2738,9 @@ impl Renderer {
         let depth_dsv = crate::d3d11::create_dsv(device, &depth_tex, DEPTH_FORMAT, samples > 1, false);
         let depth_dsv_ro = crate::d3d11::create_dsv(device, &depth_tex, DEPTH_FORMAT, samples > 1, true);
         let depth_srv = crate::d3d11::create_srv_2d(device, &depth_tex, DXGI_FORMAT_R32_FLOAT, samples > 1, 0, 1);
-
-        let water_depth_tex = crate::d3d11::create_tex2d(
-            device,
-            &crate::d3d11::Tex2dSpec {
-                width: size[0],
-                height: size[1],
-                format: DEPTH_FORMAT,
-                samples,
-                bind_flags: D3D11_BIND_DEPTH_STENCIL.0 as u32,
-                ..Default::default()
-            },
-            None,
-        );
-        let water_depth_dsv = crate::d3d11::create_dsv(device, &water_depth_tex, DEPTH_FORMAT, samples > 1, false);
-
-        let (scene_copy_tex, _, scene_copy_srv) = mk_rt(size[0], size[1], HDR_FORMAT, 1);
-        let (_, glass_depth_rtv, glass_depth_srv) = mk_rt(size[0], size[1], DXGI_FORMAT_R32_FLOAT, 1);
-
         let half_size = [size[0].div_ceil(2).max(1), size[1].div_ceil(2).max(1)];
-        let mut bloom_sizes = [[1u32; 2]; 5];
-        let mut bloom_textures = Vec::with_capacity(5);
-        let mut bloom_rtvs = Vec::with_capacity(5);
-        let mut bloom_srvs = Vec::with_capacity(5);
-        for level in 1..=5usize {
-            let bw = (size[0] >> level).max(1);
-            let bh = (size[1] >> level).max(1);
-            bloom_sizes[level - 1] = [bw, bh];
-            let (tex, rtv, srv) = mk_rt(bw, bh, HDR_FORMAT, 1);
-            bloom_textures.push(tex);
-            bloom_rtvs.push(rtv);
-            bloom_srvs.push(srv);
-        }
-        let bloom_bright_capture = std::env::var_os("RUSTUDIO_DUMP_HDR").map(|_| {
-            crate::d3d11::create_tex2d(
-                device,
-                &crate::d3d11::Tex2dSpec {
-                    width: bloom_sizes[0][0],
-                    height: bloom_sizes[0][1],
-                    format: HDR_FORMAT,
-                    bind_flags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-                    ..Default::default()
-                },
-                None,
-            )
-        });
 
-        // Native CheapBokeh far path retains full-resolution color/CoC.
-        // Downsampling here imposes blur even as FarIntensity approaches zero.
-        let (_, dof_rtv0, dof_srv0) = mk_rt(size[0], size[1], HDR_FORMAT, 1);
-        let (_, dof_rtv1, dof_srv1) = mk_rt(size[0], size[1], HDR_FORMAT, 1);
-        let dof_rtvs = [dof_rtv0, dof_rtv1];
-        let dof_srvs = [dof_srv0, dof_srv1];
-
-        let mut near_sizes = [[1u32; 2]; 11];
-        let mut near_rtvs = Vec::with_capacity(11);
-        let mut near_srvs = Vec::with_capacity(11);
-        for i in 0..11usize {
-            let nw = (size[0] / 4).max(1);
-            let nh = if i == 0 { size[1] } else { (size[1] / 4).max(1) };
-            near_sizes[i] = [nw, nh];
-            let (_, rtv, srv) = mk_rt(nw, nh, HDR_FORMAT, 1);
-            near_rtvs.push(rtv);
-            near_srvs.push(srv);
-        }
-
-        let (_, ssao_depth_rtv, ssao_depth_srv) = mk_rt(half_size[0], half_size[1], DXGI_FORMAT_R32_FLOAT, 1);
-        let (_, ssao_rtv0, ssao_srv0) = mk_rt(half_size[0], half_size[1], DXGI_FORMAT_R32G32_FLOAT, 1);
-        let (_, ssao_rtv1, ssao_srv1) = mk_rt(half_size[0], half_size[1], DXGI_FORMAT_R32G32_FLOAT, 1);
-        let ssao_rtvs = [ssao_rtv0, ssao_rtv1];
-        let ssao_srvs = [ssao_srv0, ssao_srv1];
-
-        let (display_tex, display_rtv, display_srv) = mk_rt(size[0], size[1], DISPLAY_FORMAT, 1);
+        let (display_tex, display_rtv, display_srv) = Target::mk_rt(device, size[0], size[1], DISPLAY_FORMAT, 1);
         match self.texture_id {
             Some(id) => rs.update_native_texture(id, display_srv.clone(), size),
             None => self.texture_id = Some(rs.register_native_texture(display_srv.clone(), size)),
@@ -2627,25 +2761,13 @@ impl Renderer {
             hdr_tex,
             hdr_rtv,
             hdr_srv,
-            scene_copy_tex,
-            scene_copy_srv,
-            water_depth_dsv,
-            glass_depth_rtv,
-            glass_depth_srv,
-            dof_rtvs,
-            dof_srvs,
-            near_sizes,
-            near_rtvs,
-            near_srvs,
-            bloom_bright_capture,
-            bloom_sizes,
-            bloom_textures,
-            bloom_rtvs,
-            bloom_srvs,
-            ssao_depth_rtv,
-            ssao_depth_srv,
-            ssao_rtvs,
-            ssao_srvs,
+            scene_copy: None,
+            water_depth_dsv: None,
+            glass_depth: None,
+            dof: None,
+            near: None,
+            bloom: None,
+            ssao: None,
             display_tex,
             display_rtv,
             display_srv,
@@ -2653,7 +2775,14 @@ impl Renderer {
     }
 
     fn bind_see_pipe(&self, ctx: &ID3D11DeviceContext, kind: SeePipeKind, encoded: bool) {
-        let ps = if encoded { &self.ps_part_enc } else { &self.ps_part };
+        let low_shaders = self.quality.level <= crate::mech::QUALITY_LOW_SHADER_MAX_LEVEL;
+        let ps = if encoded {
+            &self.ps_part_enc
+        } else if low_shaders {
+            &self.ps_part_low
+        } else {
+            &self.ps_part
+        };
         let rs = match kind {
             SeePipeKind::TransparentCulled | SeePipeKind::GlassCulled => &self.rs_cull_back,
             _ => &self.rs_cull_none,
@@ -2718,10 +2847,12 @@ impl Renderer {
         }
     }
 
-    fn resolve_glass_depth(&self, ctx: &ID3D11DeviceContext, target: &Target) {
+    fn resolve_glass_depth(&self, device: &ID3D11Device, ctx: &ID3D11DeviceContext, target: &mut Target) {
+        target.ensure_glass_depth(device);
+        let glass_rtv = target.glass_depth.as_ref().unwrap().0.clone();
         self.run_post_pass(
             ctx,
-            &target.glass_depth_rtv,
+            &glass_rtv,
             target.size,
             Some([0.0; 4]),
             self.ps_glass_depth.get(target.samples > 1),
@@ -2746,7 +2877,10 @@ impl Renderer {
         let pass = self
             .world_gui
             .get_or_insert_with(|| crate::world_gui::WorldGuiPass::new(&rs.device, &rs.context));
-        pass.sun_atlas = self.sun.atlas_srv.clone();
+        pass.sun_atlas = self
+            .sun_res
+            .as_ref()
+            .map_or_else(|| self.black_srv.clone(), |s| s.sun.atlas_srv.clone());
         pass.sun_grid = self.lightgrid_srv.clone();
         pass.lightgrid = self.gui_lightgrid;
         pass.sun_params = self.gui_sun_params;
@@ -2768,7 +2902,8 @@ impl Renderer {
             tone_curve,
             self.gui_fog.0,
             self.gui_fog.1,
-        ) {
+        ) && !self.post_deferred
+        {
             self.finish_again(rs);
         }
     }
@@ -2835,28 +2970,29 @@ impl Renderer {
         );
     }
 
-    /// The bloom and the final image again, from the HDR image as it is now
-    /// (effects drawn into it after `render`).
-    fn encode_bloom(&self, ctx: &ID3D11DeviceContext, target: &Target, size: f32) {
+    /// Runs the bloom downsample/upsample pyramid into `target.bloom`.
+    fn encode_bloom(&self, device: &ID3D11Device, ctx: &ID3D11DeviceContext, target: &mut Target, size: f32) {
+        let _ = target.ensure_bloom(device);
+        let bloom = target.bloom.as_ref().unwrap();
         let scale = ((target.size[0] as f32 * target.size[1] as f32) / 2073600.0).sqrt();
         let levels = ((3.0 + (scale.log2() + (size / 7.0).log2().max(0.0)).max(-1.0)).min(5.999) as usize).clamp(1, 5);
         for i in 0..levels {
-            let src = if i == 0 { &target.hdr_srv } else { &target.bloom_srvs[i - 1] };
+            let src = if i == 0 { &target.hdr_srv } else { &bloom.srvs[i - 1] };
             let ps = if i == 0 { &self.ps_bloom_bright } else { &self.ps_bloom_down };
             self.run_post_pass(
                 ctx,
-                &target.bloom_rtvs[i],
-                target.bloom_sizes[i],
+                &bloom.rtvs[i],
+                bloom.sizes[i],
                 Some([0.0; 4]),
                 ps,
                 [Some(src), None, None, None, None, None, None, None],
                 &self.bs_opaque,
             );
             if i == 0 {
-                if let Some(capture) = &target.bloom_bright_capture {
+                if let Some(capture) = &bloom.bright_capture {
                     unsafe {
                         ctx.OMSetRenderTargets(None, None);
-                        ctx.CopyResource(capture, &target.bloom_textures[0]);
+                        ctx.CopyResource(capture, &bloom.textures[0]);
                     }
                 }
             }
@@ -2864,22 +3000,27 @@ impl Renderer {
         for i in (1..levels).rev() {
             self.run_post_pass(
                 ctx,
-                &target.bloom_rtvs[i - 1],
-                target.bloom_sizes[i - 1],
+                &bloom.rtvs[i - 1],
+                bloom.sizes[i - 1],
                 None,
                 &self.ps_bloom_up,
-                [Some(&target.bloom_srvs[i]), None, None, None, None, None, None, None],
+                [Some(&bloom.srvs[i]), None, None, None, None, None, None, None],
                 &self.bs_bloom_up,
             );
         }
     }
 
-    fn run_dof_and_post(&self, ctx: &ID3D11DeviceContext, target: &Target) {
+    fn run_dof_and_post(&self, device: &ID3D11Device, ctx: &ID3D11DeviceContext, target: &mut Target) {
         let msaa = target.samples > 1;
         if self.post_dof {
+            let _ = target.ensure_dof(device);
+            if self.post_dof_near {
+                let _ = target.ensure_near(device);
+            }
+            let dof = target.dof.as_ref().unwrap();
             self.run_post_pass(
                 ctx,
-                &target.dof_rtvs[0],
+                &dof.rtvs[0],
                 target.size,
                 Some([0.0; 4]),
                 self.ps_dof_h.get(msaa),
@@ -2888,14 +3029,15 @@ impl Renderer {
             );
             self.run_post_pass(
                 ctx,
-                &target.dof_rtvs[1],
+                &dof.rtvs[1],
                 target.size,
                 Some([0.0; 4]),
                 self.ps_dof_v.get(msaa),
-                [Some(&target.dof_srvs[0]), None, Some(&target.depth_srv), None, None, None, None, None],
+                [Some(&dof.srvs[0]), None, Some(&target.depth_srv), None, None, None, None, None],
                 &self.bs_opaque,
             );
             if self.post_dof_near {
+                let near = target.near.as_ref().unwrap();
                 for i in 0..11usize {
                     let ps = match i {
                         0 => self.ps_near_h.get(msaa),
@@ -2906,18 +3048,18 @@ impl Renderer {
                         _ => &self.ps_near_tent,
                     };
                     let t15 = if i == 0 {
-                        &target.dof_srvs[1]
+                        &dof.srvs[1]
                     } else if i == 8 {
-                        &target.near_srvs[1]
+                        &near.srvs[1]
                     } else {
-                        &target.near_srvs[i - 1]
+                        &near.srvs[i - 1]
                     };
-                    let t16 = if i == 8 || i == 9 { Some(&target.near_srvs[7]) } else { None };
+                    let t16 = if i == 8 || i == 9 { Some(&near.srvs[7]) } else { None };
                     let t17 = if i <= 1 { Some(&target.depth_srv) } else { None };
                     self.run_post_pass(
                         ctx,
-                        &target.near_rtvs[i],
-                        target.near_sizes[i],
+                        &near.rtvs[i],
+                        near.sizes[i],
                         Some([0.0; 4]),
                         ps,
                         [Some(t15), t16, t17, None, None, None, None, None],
@@ -2926,6 +3068,23 @@ impl Renderer {
                 }
             }
         }
+        crate::gpu_timing::mark(ctx, "gpu: dof");
+        let bloom_srv = if self.quality.enable_bloom {
+            target.bloom.as_ref().map_or(&self.black_srv, |b| &b.srvs[0])
+        } else {
+            &self.black_srv
+        };
+        let scene_copy_srv = target.scene_copy.as_ref().map_or(&self.black_srv, |s| &s.1);
+        let dof_srv = if self.post_dof {
+            target.dof.as_ref().map_or(&self.black_srv, |d| &d.srvs[1])
+        } else {
+            &self.black_srv
+        };
+        let near_srv = if self.post_dof_near {
+            target.near.as_ref().map_or(&self.black_srv, |n| &n.srvs[10])
+        } else {
+            &self.black_srv
+        };
         self.run_post_pass(
             ctx,
             &target.display_rtv,
@@ -2934,13 +3093,13 @@ impl Renderer {
             self.ps_post.get(msaa),
             [
                 Some(&target.hdr_srv),
-                Some(&target.bloom_srvs[0]),
+                Some(bloom_srv),
                 Some(&target.depth_srv),
                 None,
                 None,
-                Some(&target.scene_copy_srv),
-                Some(&target.dof_srvs[1]),
-                Some(&target.near_srvs[10]),
+                Some(scene_copy_srv),
+                Some(dof_srv),
+                Some(near_srv),
             ],
             &self.bs_opaque,
         );
@@ -2948,20 +3107,36 @@ impl Renderer {
         unsafe { ctx.OMSetRenderTargets(None, None) };
     }
 
-    pub(super) fn finish_again(&self, rs: &crate::d3d11::RenderState) {
-        let _b = crate::bench::scope("fx_post_again");
-        let Some(target) = self.target.as_ref() else { return };
-        let ctx = &rs.context;
-        self.bind_scene_globals_with(ctx, &self.globals_cb);
+    fn run_bloom_dof_post(&self, device: &ID3D11Device, ctx: &ID3D11DeviceContext, target: &mut Target) {
         if self.quality.enable_bloom {
-            self.encode_bloom(ctx, target, self.post_bloom_size);
-        } else {
-            unsafe { ctx.ClearRenderTargetView(&target.bloom_rtvs[0], &[0.0; 4]) };
+            self.encode_bloom(device, ctx, target, self.post_bloom_size);
         }
-        self.run_dof_and_post(ctx, target);
+        crate::gpu_timing::mark(ctx, "gpu: bloom");
+        self.run_dof_and_post(device, ctx, target);
+        crate::gpu_timing::mark(ctx, "gpu: post");
     }
 
-    pub fn finalize_post(&mut self, _rs: &crate::d3d11::RenderState) {}
+    pub(super) fn finish_again(&mut self, rs: &crate::d3d11::RenderState) {
+        let _b = crate::bench::scope("fx_post_again");
+        let Some(mut target) = self.target.take() else { return };
+        let ctx = &rs.context;
+        self.bind_scene_globals_with(ctx, &self.globals_cb);
+        self.run_bloom_dof_post(&rs.device, ctx, &mut target);
+        self.target = Some(target);
+    }
+
+    #[allow(dead_code)] // Called by viewport.rs when frame.defer_post is true.
+    pub fn finalize_post(&mut self, rs: &crate::d3d11::RenderState) {
+        if !self.post_deferred {
+            return;
+        }
+        self.post_deferred = false;
+        let Some(mut target) = self.target.take() else { return };
+        let ctx = &rs.context;
+        self.bind_scene_globals_with(ctx, &self.globals_cb);
+        self.run_bloom_dof_post(&rs.device, ctx, &mut target);
+        self.target = Some(target);
+    }
 
     /// The last frame's fog (`Globals::fog`) and its linear colour, as
     /// fog_rgb works it out (world GUIs are fogged the same).
@@ -3029,11 +3204,30 @@ impl Renderer {
             }
             globals.env_spec[3] = pf.blend;
         }
+        let low_shaders = self.quality.level <= crate::mech::QUALITY_LOW_SHADER_MAX_LEVEL;
+        if low_shaders {
+            globals.env_spec = [0.0; 4];
+            globals.lightocc[3] = 0.0;
+        } else if self.quality.level < crate::mech::QUALITY_LIGHTOCC_MIN_LEVEL {
+            globals.lightocc[3] = 0.0;
+        }
         if !shadows_on {
             globals.bloom[2] = 0.0;
         }
         for ci in active_cascades..crate::sun_shadow::CASCADES {
+            globals.sun_casc[ci] = [[0.0; 4]; 4];
             globals.sun_sphere[ci][3] = 0.0;
+            globals.sun_rect[ci] = [0.0; 4];
+        }
+        let active_sun_dist = if active_cascades > 0 && active_cascades < crate::sun_shadow::CASCADES {
+            crate::mech::SUN_CASCADE_SPLITS[active_cascades.saturating_sub(1)].min(crate::mech::SUN_DIST)
+        } else {
+            crate::mech::SUN_DIST
+        };
+        if active_cascades > 0 && active_cascades < crate::sun_shadow::CASCADES {
+            globals.bloom[3] = active_sun_dist;
+        } else {
+            globals.bloom[3] = 0.0;
         }
         if !self.quality.enable_ssao {
             globals.ssao[3] = 0.0;
@@ -3087,7 +3281,7 @@ impl Renderer {
         self.gui_lightgrid = globals.lightgrid;
         self.gui_sun_params = [
             if globals.sun_color[3] < 0.5 { 1.0 } else { 0.0 },
-            crate::mech::SUN_DIST,
+            active_sun_dist,
             crate::mech::HYBRID_LERP_SLOPE,
             if shadows_on { 1.0 } else { 0.0 },
         ];
@@ -3336,26 +3530,42 @@ impl Renderer {
         let scene_gen = self.static_gen.wrapping_add(if diagnostic_back { 1u64 << 63 } else { 0 });
         static GRASS_SHADOWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let grass_shadows = *GRASS_SHADOWS.get_or_init(|| std::env::var_os("RUSTUDIO_NO_GRASS_SHADOW").is_none());
-        if self.last_cascades != Some(active_cascades) {
-            self.sun.clear_atlas(ctx);
-            self.last_cascades = Some(active_cascades);
+        let shadow_side = self.quality.shadow_atlas_side;
+        if shadows_on && active_cascades > 0 {
+            if self.sun_res.as_ref().is_none_or(|s| s.side != shadow_side) {
+                self.sun_res = Some(SunShadowRes::new(device, shadow_side));
+                self.last_cascades = None;
+            }
+        } else {
+            self.sun_res = None;
+            self.last_cascades = None;
         }
-        let sun_due = if shadows_on && active_cascades > 0 {
-            self.sun.upload(ctx, &frame.sun_cascades);
-            self.sun.plan(
+        if shadows_on && max_local_shadows > 0 {
+            if self.lshadow.as_ref().is_none_or(|l| l.side != shadow_side) {
+                self.lshadow = Some(LightShadows::new(device, shadow_side));
+            }
+        } else {
+            self.lshadow = None;
+        }
+
+        let sun_due = if let Some(sun_res) = self.sun_res.as_mut() {
+            if self.last_cascades != Some(active_cascades) {
+                sun_res.sun.clear_atlas(ctx);
+                self.last_cascades = Some(active_cascades);
+            }
+            sun_res.sun.upload(ctx, &frame.sun_cascades);
+            sun_res.sun.plan(
                 &frame.sun_cascades,
                 scene_gen,
                 !opaque_runs.is_empty() || !self.terrain_grass.is_empty(),
             )
         } else {
-            self.sun.forget();
             [false; crate::sun_shadow::CASCADES]
         };
 
-        let target = self.target.as_ref()?;
+        let mut target = self.target.take()?;
         let msaa = target.samples > 1;
         let part_stride = std::mem::size_of::<Vertex>() as u32;
-        let inst_stride = std::mem::size_of::<InstanceRaw>() as u32;
         let terrain_stride = std::mem::size_of::<crate::terrain::TerrainVertex>() as u32;
         let line_stride = std::mem::size_of::<LineVertex>() as u32;
 
@@ -3380,7 +3590,7 @@ impl Renderer {
                     &target.depth_srv,
                     msaa,
                 );
-                unbind_all_srvs(ctx);
+                unbind_rtv_srvs(ctx);
                 unsafe { ctx.OMSetRenderTargets(None, None) };
             }
             None => {
@@ -3392,145 +3602,151 @@ impl Renderer {
         crate::gpu_timing::mark(ctx, "gpu: clouds");
 
         // Sun shadow cascades (0..active_cascades).
-        for (ci, cascade) in frame.sun_cascades.iter().enumerate().take(active_cascades) {
-            if !sun_due[ci] {
-                continue;
-            }
-            let sp = frustum(cascade.caster_view_proj());
-            let mut shadow_ranges: Vec<((usize, usize), u32, u32)> = Vec::new();
-            for b in self.st.batches.iter().filter(|b| b.pass == Pass::Opaque) {
-                if !box_visible(&sp, b.lo, b.hi) {
+        if let Some(sun_res) = self.sun_res.as_ref() {
+            for (ci, cascade) in frame.sun_cascades.iter().enumerate().take(active_cascades) {
+                if !sun_due[ci] {
                     continue;
                 }
-                let r_min = lod_k * box_distance(cam, b.lo, b.hi) * crate::mech::SHADOW_LOD_SCALE;
-                let radii = &self.st.radii[b.start as usize..(b.start + b.count) as usize];
-                let n = radii.partition_point(|r| *r >= r_min) as u32;
-                if n == 0 {
-                    continue;
-                }
-                match shadow_ranges.last_mut() {
-                    Some(last) if last.0 == b.key && last.2 == b.start => last.2 = b.start + n,
-                    _ => shadow_ranges.push((b.key, b.start, b.start + n)),
-                }
-            }
-
-            unbind_all_srvs(ctx);
-            let side = cascade.tile.min(SHADOW_SIZE);
-            unsafe {
-                ctx.ClearDepthStencilView(&self.shadow_dsv, D3D11_CLEAR_DEPTH.0 as u32, 1.0, 0);
-                ctx.OMSetRenderTargets(None, Some(&self.shadow_dsv));
-            }
-            crate::d3d11::set_viewport(ctx, 0.0, 0.0, side as f32, side as f32);
-            crate::d3d11::set_scissor(ctx, 0, 0, side as i32, side as i32);
-            unsafe {
-                ctx.IASetInputLayout(&self.il_part);
-                ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                ctx.VSSetShader(&self.vs_shadow, None);
-                ctx.PSSetShader(None, None);
-                ctx.VSSetConstantBuffers(0, Some(&[Some(self.globals_cb.clone())]));
-                ctx.PSSetConstantBuffers(0, Some(&[Some(self.globals_cb.clone())]));
-                ctx.RSSetState(&self.rs_scissor_none);
-                ctx.OMSetDepthStencilState(&self.ds_less_eq_rw, 0);
-                ctx.OMSetBlendState(&self.bs_no_color, Some(&[0.0; 4]), 0xFFFFFFFF);
-            }
-            self.sun.bind(ctx, ci);
-
-            let cast = |key: (usize, usize), inst: &ID3D11Buffer, range: std::ops::Range<u32>| {
-                if let Some(mesh) = self.meshes.get(key.0) {
-                    crate::runtime::domains::services::perf::draw(
-                        crate::runtime::domains::services::perf::SHADOW,
-                        1,
-                        (mesh.count / 3) as u64 * (range.end - range.start) as u64,
-                    );
-                    let vbs = [Some(mesh.vbuf.clone()), Some(inst.clone())];
-                    let strides = [part_stride, inst_stride];
-                    let offsets = [0u32, 0u32];
-                    unsafe {
-                        ctx.IASetVertexBuffers(0, 2, Some(vbs.as_ptr()), Some(strides.as_ptr()), Some(offsets.as_ptr()));
-                        ctx.DrawInstanced(mesh.count, range.end - range.start, 0, range.start);
+                let sp = frustum(cascade.caster_view_proj());
+                let mut shadow_ranges: Vec<((usize, usize), u32, u32)> = Vec::new();
+                for b in self.st.batches.iter().filter(|b| b.pass == Pass::Opaque) {
+                    if !box_visible(&sp, b.lo, b.hi) {
+                        continue;
+                    }
+                    let r_min = lod_k * box_distance(cam, b.lo, b.hi) * crate::mech::SHADOW_LOD_SCALE;
+                    let radii = &self.st.radii[b.start as usize..(b.start + b.count) as usize];
+                    let n = radii.partition_point(|r| *r >= r_min) as u32;
+                    if n == 0 {
+                        continue;
+                    }
+                    match shadow_ranges.last_mut() {
+                        Some(last) if last.0 == b.key && last.2 == b.start => last.2 = b.start + n,
+                        _ => shadow_ranges.push((b.key, b.start, b.start + n)),
                     }
                 }
-            };
-            for r in &shadow_ranges {
-                cast(r.0, &self.static_buf, r.1..r.2);
-            }
-            for r in &opaque_runs {
-                cast(r.0, &self.instance_buf, r.1..r.2);
-            }
-            if !self.terrain_chunks.is_empty() || !self.terrain_grass.is_empty() {
+
+                unbind_rtv_srvs(ctx);
+                let sc = sun_res.sun.scale_cascade(cascade);
+                let side = sc.tile.min(sun_res.side);
                 unsafe {
-                    ctx.IASetInputLayout(&self.il_terrain);
-                    ctx.VSSetShader(&self.vs_terrain_shadow, None);
+                    ctx.ClearDepthStencilView(&sun_res.depth_dsv, D3D11_CLEAR_DEPTH.0 as u32, 1.0, 0);
+                    ctx.OMSetRenderTargets(None, Some(&sun_res.depth_dsv));
                 }
-                if let Some(dir) = std::env::var_os("RUSTUDIO_CULL_EXPORT") {
-                    let dir = std::path::PathBuf::from(dir);
-                    std::fs::create_dir_all(&dir).unwrap();
-                    let vp = cascade.view_proj();
-                    let mut clip = Vec::<[f32; 4]>::new();
-                    let mut chunks = Vec::new();
-                    for (key, c) in &self.terrain_chunks {
-                        if box_visible(&sp, c.lo, c.hi) {
-                            chunks.push((*key, c.count));
-                            clip.extend(c.diagnostic_positions.iter().map(|p| (vp * Vec3::from(*p).extend(1.0)).to_array()));
-                        }
-                    }
-                    std::fs::write(dir.join(format!("cascade{ci}-clip.bin")), bytemuck::cast_slice(&clip)).unwrap();
-                    std::fs::write(
-                        dir.join(format!("cascade{ci}.json")),
-                        serde_json::to_vec_pretty(&serde_json::json!({
-                            "vp": vp.to_cols_array(),
-                            "tile": cascade.tile,
-                            "chunks": chunks,
-                            "vertices": clip.len()
-                        }))
-                        .unwrap(),
-                    )
-                    .unwrap();
+                crate::d3d11::set_viewport(ctx, 0.0, 0.0, side as f32, side as f32);
+                crate::d3d11::set_scissor(ctx, 0, 0, side as i32, side as i32);
+                unsafe {
+                    ctx.IASetInputLayout(&self.il_part);
+                    ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    ctx.VSSetShader(&self.vs_shadow, None);
+                    ctx.PSSetShader(None, None);
+                    ctx.VSSetConstantBuffers(0, Some(&[Some(self.globals_cb.clone())]));
+                    ctx.PSSetConstantBuffers(0, Some(&[Some(self.globals_cb.clone())]));
+                    ctx.RSSetState(&self.rs_scissor_none);
+                    ctx.OMSetDepthStencilState(&self.ds_less_eq_rw, 0);
+                    ctx.OMSetBlendState(&self.bs_no_color, Some(&[0.0; 4]), 0xFFFFFFFF);
                 }
-                for (solid, c) in self
-                    .terrain_chunks
-                    .values()
-                    .map(|c| (true, c))
-                    .chain(self.terrain_grass.values().filter(|_| grass_shadows).map(|c| (false, c)))
-                {
-                    unsafe {
-                        ctx.RSSetState(if solid && diagnostic_back {
-                            &self.rs_scissor_back
-                        } else {
-                            &self.rs_scissor_none
-                        });
-                    }
-                    if box_visible(&sp, c.lo, c.hi) {
+                sun_res.sun.bind(ctx, ci);
+
+                let cast = |key: (usize, usize), range: std::ops::Range<u32>| {
+                    if let Some(mesh) = self.meshes.get(key.0) {
                         crate::runtime::domains::services::perf::draw(
                             crate::runtime::domains::services::perf::SHADOW,
                             1,
-                            (c.count / 3) as u64,
+                            (mesh.count / 3) as u64 * (range.end - range.start) as u64,
                         );
                         unsafe {
-                            ctx.IASetVertexBuffers(0, 1, Some(&Some(c.vbuf.clone())), Some(&terrain_stride), Some(&0));
-                            if c.grass_ranges.is_empty() {
-                                ctx.Draw(c.count, 0);
+                            ctx.IASetVertexBuffers(0, 1, Some(&Some(mesh.vbuf.clone())), Some(&part_stride), Some(&0));
+                            ctx.DrawInstanced(mesh.count, range.end - range.start, 0, range.start);
+                        }
+                    }
+                };
+                if !shadow_ranges.is_empty() {
+                    Self::bind_instance_buffer(ctx, &self.static_buf);
+                    for r in &shadow_ranges {
+                        cast(r.0, r.1..r.2);
+                    }
+                }
+                if !opaque_runs.is_empty() {
+                    Self::bind_instance_buffer(ctx, &self.instance_buf);
+                    for r in &opaque_runs {
+                        cast(r.0, r.1..r.2);
+                    }
+                }
+                if !self.terrain_chunks.is_empty() || !self.terrain_grass.is_empty() {
+                    unsafe {
+                        ctx.IASetInputLayout(&self.il_terrain);
+                        ctx.VSSetShader(&self.vs_terrain_shadow, None);
+                    }
+                    if let Some(dir) = std::env::var_os("RUSTUDIO_CULL_EXPORT") {
+                        let dir = std::path::PathBuf::from(dir);
+                        std::fs::create_dir_all(&dir).unwrap();
+                        let vp = cascade.view_proj();
+                        let mut clip = Vec::<[f32; 4]>::new();
+                        let mut chunks = Vec::new();
+                        for (key, c) in &self.terrain_chunks {
+                            if box_visible(&sp, c.lo, c.hi) {
+                                chunks.push((*key, c.count));
+                                clip.extend(c.diagnostic_positions.iter().map(|p| (vp * Vec3::from(*p).extend(1.0)).to_array()));
+                            }
+                        }
+                        std::fs::write(dir.join(format!("cascade{ci}-clip.bin")), bytemuck::cast_slice(&clip)).unwrap();
+                        std::fs::write(
+                            dir.join(format!("cascade{ci}.json")),
+                            serde_json::to_vec_pretty(&serde_json::json!({
+                                "vp": vp.to_cols_array(),
+                                "tile": cascade.tile,
+                                "chunks": chunks,
+                                "vertices": clip.len()
+                            }))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    for (solid, c) in self
+                        .terrain_chunks
+                        .values()
+                        .map(|c| (true, c))
+                        .chain(self.terrain_grass.values().filter(|_| grass_shadows).map(|c| (false, c)))
+                    {
+                        unsafe {
+                            ctx.RSSetState(if solid && diagnostic_back {
+                                &self.rs_scissor_back
                             } else {
-                                let camera = Vec3::new(
-                                    frame.globals.cam_pos[0],
-                                    frame.globals.cam_pos[1],
-                                    frame.globals.cam_pos[2],
-                                );
-                                for range in &c.grass_ranges {
-                                    ctx.Draw(range.count(camera), range.start);
+                                &self.rs_scissor_none
+                            });
+                        }
+                        if box_visible(&sp, c.lo, c.hi) {
+                            crate::runtime::domains::services::perf::draw(
+                                crate::runtime::domains::services::perf::SHADOW,
+                                1,
+                                (c.count / 3) as u64,
+                            );
+                            unsafe {
+                                ctx.IASetVertexBuffers(0, 1, Some(&Some(c.vbuf.clone())), Some(&terrain_stride), Some(&0));
+                                if c.grass_ranges.is_empty() {
+                                    ctx.Draw(c.count, 0);
+                                } else {
+                                    let camera = Vec3::new(
+                                        frame.globals.cam_pos[0],
+                                        frame.globals.cam_pos[1],
+                                        frame.globals.cam_pos[2],
+                                    );
+                                    for range in &c.grass_ranges {
+                                        ctx.Draw(range.count(camera), range.start);
+                                    }
                                 }
                             }
                         }
                     }
                 }
+                unsafe { ctx.OMSetRenderTargets(None, None) };
+                sun_res.sun.blur(ctx, cascade, ci);
             }
-            unsafe { ctx.OMSetRenderTargets(None, None) };
-            self.sun.blur(ctx, cascade, ci);
         }
         crate::gpu_timing::mark(ctx, "gpu: sun shadows");
 
         // Local light shadow maps (Studio's Future path).
-        if shadows_on && max_local_shadows > 0 {
+        if let Some(lshadow) = self.lshadow.as_mut() {
             let slots: Vec<(usize, Vec3, f32)> = lights_upload
                 .iter()
                 .filter(|l| l.extra[3] >= 0.0)
@@ -3548,8 +3764,8 @@ impl Renderer {
                 }
                 h.finish()
             };
-            if !slots.is_empty() && self.lshadow.key != Some(key) {
-                self.lshadow.key = Some(key);
+            if !slots.is_empty() && lshadow.key != Some(key) {
+                lshadow.key = Some(key);
                 let n = crate::mech::LSHADOW_MAX_LIGHTS;
                 let mut slot_data = vec![0f32; n * 100];
                 for (slot, pos, range) in &slots {
@@ -3559,18 +3775,18 @@ impl Renderer {
                     }
                     slot_data[slot * 100 + 96..slot * 100 + 100].copy_from_slice(&[pos.x, pos.y, pos.z, inv]);
                 }
-                crate::d3d11::update_dynamic(ctx, &self.lshadow.slots_buf, bytemuck::cast_slice(&slot_data));
+                crate::d3d11::update_dynamic(ctx, &lshadow.slots_buf, bytemuck::cast_slice(&slot_data));
 
                 let far_p = crate::mech::EVSM_POS_EXP.exp();
                 let far_n = -(-crate::mech::EVSM_NEG_EXP).exp();
                 let clear_col = [far_p, far_p * far_p, far_n, far_n * far_n];
-                unbind_all_srvs(ctx);
+                unbind_rtv_srvs(ctx);
                 unsafe {
-                    ctx.ClearRenderTargetView(&self.lshadow.moments_rtv, &clear_col);
-                    ctx.ClearDepthStencilView(&self.lshadow.depth_dsv, D3D11_CLEAR_DEPTH.0 as u32, 1.0, 0);
+                    ctx.ClearRenderTargetView(&lshadow.moments_rtv, &clear_col);
+                    ctx.ClearDepthStencilView(&lshadow.depth_dsv, D3D11_CLEAR_DEPTH.0 as u32, 1.0, 0);
                     ctx.OMSetRenderTargets(
-                        Some(&[Some(self.lshadow.moments_rtv.clone())]),
-                        Some(&self.lshadow.depth_dsv),
+                        Some(&[Some(lshadow.moments_rtv.clone())]),
+                        Some(&lshadow.depth_dsv),
                     );
                     ctx.IASetInputLayout(&self.il_part);
                     ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -3578,15 +3794,16 @@ impl Renderer {
                     ctx.PSSetShader(&self.ps_light_shadow, None);
                     ctx.VSSetConstantBuffers(0, Some(&[Some(self.globals_cb.clone())]));
                     ctx.PSSetConstantBuffers(0, Some(&[Some(self.globals_cb.clone())]));
-                    ctx.VSSetConstantBuffers(2, Some(&[Some(self.lshadow.face_cb.clone())]));
-                    ctx.PSSetConstantBuffers(2, Some(&[Some(self.lshadow.face_cb.clone())]));
+                    ctx.VSSetConstantBuffers(2, Some(&[Some(lshadow.face_cb.clone())]));
+                    ctx.PSSetConstantBuffers(2, Some(&[Some(lshadow.face_cb.clone())]));
                     ctx.RSSetState(&self.rs_scissor_none);
                     ctx.OMSetDepthStencilState(&self.ds_less_eq_rw, 0);
                     ctx.OMSetBlendState(&self.bs_opaque, Some(&[0.0; 4]), 0xFFFFFFFF);
                 }
+                Self::bind_instance_buffer(ctx, &self.static_buf);
 
                 let cols = crate::mech::LSHADOW_ATLAS / crate::mech::LSHADOW_FACE;
-                let face_px = crate::mech::LSHADOW_FACE;
+                let face_px = (crate::mech::LSHADOW_FACE * lshadow.side / crate::mech::LSHADOW_ATLAS).max(1);
                 for (slot, pos, range) in &slots {
                     let near: Vec<&Batch> = self
                         .st
@@ -3601,7 +3818,7 @@ impl Renderer {
                         u[..16].copy_from_slice(&vp.to_cols_array());
                         u[16..20].copy_from_slice(&[pos.x, pos.y, pos.z, inv]);
                         u[20..24].copy_from_slice(&[axis.x, axis.y, axis.z, 0.0]);
-                        crate::d3d11::upload_cb(ctx, &self.lshadow.face_cb, &u);
+                        crate::d3d11::upload_cb(ctx, &lshadow.face_cb, &u);
                         let k = *slot as u32 * 6 + f as u32;
                         let (x, y) = ((k % cols) * face_px, (k / cols) * face_px);
                         crate::d3d11::set_viewport(ctx, x as f32, y as f32, face_px as f32, face_px as f32);
@@ -3613,11 +3830,8 @@ impl Renderer {
                                     1,
                                     (mesh.count / 3) as u64 * b.count as u64,
                                 );
-                                let vbs = [Some(mesh.vbuf.clone()), Some(self.static_buf.clone())];
-                                let strides = [part_stride, inst_stride];
-                                let offsets = [0u32, 0u32];
                                 unsafe {
-                                    ctx.IASetVertexBuffers(0, 2, Some(vbs.as_ptr()), Some(strides.as_ptr()), Some(offsets.as_ptr()));
+                                    ctx.IASetVertexBuffers(0, 1, Some(&Some(mesh.vbuf.clone())), Some(&part_stride), Some(&0));
                                     ctx.DrawInstanced(mesh.count, b.count, 0, b.start);
                                 }
                             }
@@ -3631,7 +3845,8 @@ impl Renderer {
 
         let has_glass = blended.iter().any(|e| (e.2.extra[0] as u32 & 7) == 3);
         let has_neon = blended.iter().any(|e| (e.2.extra[0] as u32 & 7) == 1);
-        let split = !water_runs.is_empty() || has_glass || has_neon;
+        let water_refract = !water_runs.is_empty() && self.quality.level >= crate::mech::QUALITY_WATER_REFRACT_MIN_LEVEL;
+        let split = water_refract || has_glass || has_neon;
         let mut calls = 0usize;
 
         // Scene environment probe work (env_probe.rs).
@@ -3653,7 +3868,7 @@ impl Renderer {
                     crate::d3d11::update_dynamic(ctx, &self.probe.globals_cb, bytemuck::bytes_of(&pg));
                     let face_planes = frustum(ordinary * view);
 
-                    unbind_all_srvs(ctx);
+                    unbind_rtv_srvs(ctx);
                     unsafe {
                         ctx.ClearRenderTargetView(&self.probe.face_rtv, &[0.0; 4]);
                         ctx.ClearDepthStencilView(&self.probe.face_dsv, D3D11_CLEAR_DEPTH.0 as u32, 0.0, 0);
@@ -3669,10 +3884,13 @@ impl Renderer {
                         ctx.IASetInputLayout(&self.il_part);
                         ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                         ctx.VSSetShader(&self.vs_part, None);
-                        ctx.PSSetShader(&self.ps_part_opaque, None);
+                        ctx.PSSetShader(if low_shaders { &self.ps_part_low } else { &self.ps_part_opaque }, None);
+                        ctx.PSSetSamplers(3, Some(&[Some(self.active_sampler().clone())]));
                         ctx.OMSetDepthStencilState(&self.ds_greater_rw, 0);
                         ctx.OMSetBlendState(&self.bs_opaque, Some(&[0.0; 4]), 0xFFFFFFFF);
                     }
+                    let mut last_tex = None;
+                    Self::bind_instance_buffer(ctx, &self.static_buf);
                     for b in self.st.batches.iter().filter(|b| b.pass == Pass::Opaque) {
                         if !box_visible(&face_planes, b.lo, b.hi) {
                             continue;
@@ -3680,25 +3898,28 @@ impl Renderer {
                         unsafe {
                             ctx.RSSetState(if self.culls_back(b.key.0) { &self.rs_cull_back } else { &self.rs_cull_none });
                         }
-                        self.draw_part_run(ctx, b.key, &self.static_buf, b.start..b.start + b.count);
+                        self.draw_part_run(ctx, b.key, b.start..b.start + b.count, &mut last_tex);
                         if self.meshes.get(b.key.0).is_some() {
                             calls += 1;
                         }
                     }
-                    for r in &opaque_runs {
-                        unsafe {
-                            ctx.RSSetState(if self.culls_back(r.0 .0) { &self.rs_cull_back } else { &self.rs_cull_none });
-                        }
-                        self.draw_part_run(ctx, r.0, &self.instance_buf, r.1..r.2);
-                        if self.meshes.get(r.0 .0).is_some() {
-                            calls += 1;
+                    if !opaque_runs.is_empty() {
+                        Self::bind_instance_buffer(ctx, &self.instance_buf);
+                        for r in &opaque_runs {
+                            unsafe {
+                                ctx.RSSetState(if self.culls_back(r.0 .0) { &self.rs_cull_back } else { &self.rs_cull_none });
+                            }
+                            self.draw_part_run(ctx, r.0, r.1..r.2, &mut last_tex);
+                            if self.meshes.get(r.0 .0).is_some() {
+                                calls += 1;
+                            }
                         }
                     }
                     if !self.terrain_chunks.is_empty() {
                         unsafe {
                             ctx.IASetInputLayout(&self.il_terrain);
                             ctx.VSSetShader(&self.vs_terrain, None);
-                            ctx.PSSetShader(&self.ps_terrain, None);
+                            ctx.PSSetShader(if low_shaders { &self.ps_terrain_low } else { &self.ps_terrain }, None);
                             ctx.VSSetConstantBuffers(2, Some(&[Some(self.terrain_params_cb.clone())]));
                             ctx.PSSetConstantBuffers(2, Some(&[Some(self.terrain_params_cb.clone())]));
                             ctx.RSSetState(&self.rs_cull_back);
@@ -3713,10 +3934,10 @@ impl Renderer {
                         }
                     }
                     unsafe { ctx.OMSetRenderTargets(None, None) };
-                    unbind_all_srvs(ctx);
+                    unbind_rtv_srvs(ctx);
                     self.probe.store_face(ctx, f);
                 } else {
-                    unbind_all_srvs(ctx);
+                    unbind_rtv_srvs(ctx);
                     unsafe { ctx.OMSetRenderTargets(None, None) };
                     self.probe.encode(ctx, *task);
                 }
@@ -3724,8 +3945,8 @@ impl Renderer {
         }
         crate::gpu_timing::mark(ctx, "gpu: env probe");
 
-        let draw_part = |key: (usize, usize), inst: &ID3D11Buffer, range: std::ops::Range<u32>, calls: &mut usize| {
-            self.draw_part_run(ctx, key, inst, range);
+        let draw_part = |key: (usize, usize), range: std::ops::Range<u32>, last_tex: &mut Option<usize>, calls: &mut usize| {
+            self.draw_part_run(ctx, key, range, last_tex);
             if self.meshes.get(key.0).is_some() {
                 *calls += 1;
             }
@@ -3741,24 +3962,33 @@ impl Renderer {
         let draw_surface_decals = |calls: &mut usize| {
             if !surface_decal_runs.is_empty() {
                 self.bind_see_pipe(ctx, SeePipeKind::Transparent, encoded);
+                Self::bind_instance_buffer(ctx, &self.instance_buf);
+                let mut last_tex = None;
                 for r in &surface_decal_runs {
-                    draw_part(r.0, &self.instance_buf, r.1..r.2, calls);
+                    draw_part(r.0, r.1..r.2, &mut last_tex, calls);
                 }
             }
         };
-        let draw_see_through = |glass_ready: bool, calls: &mut usize| {
+        let draw_see_through = |target: &Target, glass_ready: bool, calls: &mut usize| {
             let glass_srvs = if glass_ready {
-                [Some(target.scene_copy_srv.clone()), Some(target.glass_depth_srv.clone())]
+                if let (Some(sc), Some(gd)) = (target.scene_copy.as_ref(), target.glass_depth.as_ref()) {
+                    [Some(sc.1.clone()), Some(gd.1.clone())]
+                } else {
+                    [Some(self.black_srv.clone()), Some(self.black_srv.clone())]
+                }
             } else {
                 [Some(self.black_srv.clone()), Some(self.black_srv.clone())]
             };
             unsafe { ctx.PSSetShaderResources(19, Some(&glass_srvs)) };
             self.bind_see_pipe(ctx, SeePipeKind::Transparent, encoded);
+            let mut last_tex = None;
+            Self::bind_instance_buffer(ctx, &self.static_buf);
             for r in static_ranges.iter().filter(|r| r.0 == Pass::Decal) {
-                draw_part(r.1, &self.static_buf, r.2..r.3, calls);
+                draw_part(r.1, r.2..r.3, &mut last_tex, calls);
             }
+            Self::bind_instance_buffer(ctx, &self.instance_buf);
             for r in &decal_runs {
-                draw_part(r.0, &self.instance_buf, r.1..r.2, calls);
+                draw_part(r.0, r.1..r.2, &mut last_tex, calls);
             }
             for r in &blend_runs {
                 let kind = if r.1 < glass_end {
@@ -3769,18 +3999,19 @@ impl Renderer {
                     SeePipeKind::Transparent
                 };
                 self.bind_see_pipe(ctx, kind, encoded);
-                draw_part(r.0, &self.instance_buf, r.1..r.2, calls);
+                draw_part(r.0, r.1..r.2, &mut last_tex, calls);
             }
             if !overlay_runs.is_empty() {
                 self.bind_see_pipe(ctx, SeePipeKind::Overlay, encoded);
                 for r in &overlay_runs {
-                    draw_part(r.0, &self.instance_buf, r.1..r.2, calls);
+                    draw_part(r.0, r.1..r.2, &mut last_tex, calls);
                 }
             }
         };
+        let target_size = target.size;
         let draw_lines = || {
             if !frame.lines.is_empty() {
-                crate::d3d11::set_scissor(ctx, 0, 0, target.size[0] as i32, target.size[1] as i32);
+                crate::d3d11::set_scissor(ctx, 0, 0, target_size[0] as i32, target_size[1] as i32);
                 unsafe {
                     ctx.IASetInputLayout(&self.il_line);
                     ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
@@ -3794,7 +4025,7 @@ impl Renderer {
                 }
             }
         };
-        let run_see_encode = || {
+        let run_see_encode = |target: &Target| {
             crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
             unsafe { ctx.OMSetRenderTargets(None, None) };
             self.bind_scene_globals_with(ctx, &self.globals_cb);
@@ -3819,7 +4050,7 @@ impl Renderer {
             unsafe { ctx.OMSetRenderTargets(Some(&[Some(target.see_rtv.clone())]), Some(&target.depth_dsv)) };
             crate::d3d11::set_viewport(ctx, 0.0, 0.0, target.size[0] as f32, target.size[1] as f32);
         };
-        let run_see_decode = |with_lines: bool| {
+        let run_see_decode = |target: &Target, with_lines: bool| {
             crate::gpu_timing::mark(ctx, "gpu: see-through draws");
             crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
             unsafe { ctx.OMSetRenderTargets(None, None) };
@@ -3848,7 +4079,7 @@ impl Renderer {
         };
 
         // Initial viewport pass: sky, opaque parts, decal depth, terrain & grass.
-        unbind_all_srvs(ctx);
+        unbind_rtv_srvs(ctx);
         self.bind_scene_globals_with(ctx, &self.globals_cb);
         unsafe {
             ctx.ClearRenderTargetView(&target.msaa_rtv, &[0.0; 4]);
@@ -3875,26 +4106,32 @@ impl Renderer {
             ctx.IASetInputLayout(&self.il_part);
             ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             ctx.VSSetShader(&self.vs_part, None);
-            ctx.PSSetShader(&self.ps_part_opaque, None);
+            ctx.PSSetShader(if low_shaders { &self.ps_part_low } else { &self.ps_part_opaque }, None);
             ctx.PSSetSamplers(3, Some(&[Some(self.active_sampler().clone())]));
             ctx.OMSetDepthStencilState(&self.ds_greater_rw, 0);
             ctx.OMSetBlendState(&self.bs_opaque, Some(&[0.0; 4]), 0xFFFFFFFF);
         }
+        let mut last_tex = None;
+        Self::bind_instance_buffer(ctx, &self.static_buf);
         for r in static_ranges.iter().filter(|r| r.0 == Pass::Opaque) {
             unsafe {
                 ctx.RSSetState(if self.culls_back(r.1 .0) { &self.rs_cull_back } else { &self.rs_cull_none });
             }
-            draw_part(r.1, &self.static_buf, r.2..r.3, &mut calls);
+            draw_part(r.1, r.2..r.3, &mut last_tex, &mut calls);
         }
-        for r in &opaque_runs {
-            unsafe {
-                ctx.RSSetState(if self.culls_back(r.0 .0) { &self.rs_cull_back } else { &self.rs_cull_none });
+        if !opaque_runs.is_empty() {
+            Self::bind_instance_buffer(ctx, &self.instance_buf);
+            for r in &opaque_runs {
+                unsafe {
+                    ctx.RSSetState(if self.culls_back(r.0 .0) { &self.rs_cull_back } else { &self.rs_cull_none });
+                }
+                draw_part(r.0, r.1..r.2, &mut last_tex, &mut calls);
             }
-            draw_part(r.0, &self.instance_buf, r.1..r.2, &mut calls);
         }
 
         // Decal opaque texel depth.
         if !surface_decal_runs.is_empty() || !blend_runs.is_empty() {
+            Self::bind_instance_buffer(ctx, &self.instance_buf);
             unsafe {
                 ctx.PSSetShader(&self.ps_decal_depth, None);
                 ctx.RSSetState(&self.rs_cull_none);
@@ -3902,7 +4139,7 @@ impl Renderer {
                 ctx.OMSetBlendState(&self.bs_no_color, Some(&[0.0; 4]), 0xFFFFFFFF);
             }
             for r in surface_decal_runs.iter().chain(&blend_runs) {
-                draw_part(r.0, &self.instance_buf, r.1..r.2, &mut calls);
+                draw_part(r.0, r.1..r.2, &mut last_tex, &mut calls);
             }
         }
 
@@ -3912,7 +4149,7 @@ impl Renderer {
                 ctx.IASetInputLayout(&self.il_terrain);
                 ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 ctx.VSSetShader(&self.vs_terrain, None);
-                ctx.PSSetShader(&self.ps_terrain, None);
+                ctx.PSSetShader(if low_shaders { &self.ps_terrain_low } else { &self.ps_terrain }, None);
                 ctx.VSSetConstantBuffers(2, Some(&[Some(self.terrain_params_cb.clone())]));
                 ctx.PSSetConstantBuffers(2, Some(&[Some(self.terrain_params_cb.clone())]));
                 ctx.RSSetState(&self.rs_cull_back);
@@ -3945,40 +4182,56 @@ impl Renderer {
             }
         }
 
+        // Low-quality water fallback (< QUALITY_WATER_REFRACT_MIN_LEVEL): shade water parts directly
+        // via scene.hlsl kind == 5.0 without splitting, copying hdr_tex, or building water_depth.
+        if !water_runs.is_empty() && !water_refract {
+            self.bind_part_pipeline(ctx, true, false);
+            Self::bind_instance_buffer(ctx, &self.instance_buf);
+            let mut water_last_tex = None;
+            for r in &water_runs {
+                draw_part(r.0, r.1..r.2, &mut water_last_tex, &mut calls);
+            }
+        }
+
         if !encoded {
             draw_surface_decals(&mut calls);
             draw_lines();
             if !split {
-                draw_see_through(false, &mut calls);
+                draw_see_through(&target, false, &mut calls);
             }
         }
         unsafe { ctx.OMSetRenderTargets(None, None) };
         if split || !encoded {
-            self.resolve_msaa(ctx, target);
+            self.resolve_msaa(ctx, &target);
         }
         crate::gpu_timing::mark(ctx, "gpu: scene (opaque, terrain, unencoded blends)");
 
         if encoded && split && !surface_decal_runs.is_empty() {
-            run_see_encode();
+            run_see_encode(&target);
             draw_surface_decals(&mut calls);
-            run_see_decode(false);
+            run_see_decode(&target, false);
         }
 
         let mut glass_depth_ran = false;
         if split {
             crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
-            unsafe {
-                ctx.OMSetRenderTargets(None, None);
-                ctx.CopyResource(&target.scene_copy_tex, &target.hdr_tex);
+            {
+                let copy_tex = target.ensure_scene_copy(device).0.clone();
+                unsafe {
+                    ctx.OMSetRenderTargets(None, None);
+                    ctx.CopyResource(&copy_tex, &target.hdr_tex);
+                }
             }
-            if !water_runs.is_empty() {
+            if water_refract {
                 let u = self.water.uniforms(&frame.water, target.size);
                 self.water.upload(ctx, &u);
+                let copy_srv = target.scene_copy.as_ref().unwrap().1.clone();
+                let water_dsv = target.ensure_water_depth(device).clone();
                 unsafe {
-                    ctx.ClearDepthStencilView(&target.water_depth_dsv, D3D11_CLEAR_DEPTH.0 as u32, 0.0, 0);
+                    ctx.ClearDepthStencilView(&water_dsv, D3D11_CLEAR_DEPTH.0 as u32, 0.0, 0);
                     ctx.OMSetRenderTargets(
                         Some(&[Some(target.msaa_rtv.clone())]),
-                        Some(&target.water_depth_dsv),
+                        Some(&water_dsv),
                     );
                 }
                 crate::d3d11::set_viewport(ctx, 0.0, 0.0, target.size[0] as f32, target.size[1] as f32);
@@ -3988,15 +4241,17 @@ impl Renderer {
                     ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                     ctx.PSSetSamplers(3, Some(&[Some(self.active_sampler().clone())]));
                 }
-                self.water.bind(ctx, &target.scene_copy_srv, &target.depth_srv, msaa);
+                self.water.bind(ctx, &copy_srv, &target.depth_srv, msaa);
+                Self::bind_instance_buffer(ctx, &self.instance_buf);
+                let mut water_last_tex = None;
                 for r in &water_runs {
-                    draw_part(r.0, &self.instance_buf, r.1..r.2, &mut calls);
+                    draw_part(r.0, r.1..r.2, &mut water_last_tex, &mut calls);
                 }
                 crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
-                self.resolve_msaa(ctx, target);
+                self.resolve_msaa(ctx, &target);
             }
             if has_glass {
-                self.resolve_glass_depth(ctx, target);
+                self.resolve_glass_depth(device, ctx, &mut target);
                 glass_depth_ran = true;
             }
             if !encoded {
@@ -4008,43 +4263,58 @@ impl Renderer {
                     );
                 }
                 crate::d3d11::set_viewport(ctx, 0.0, 0.0, target.size[0] as f32, target.size[1] as f32);
-                draw_see_through(has_glass, &mut calls);
+                draw_see_through(&target, has_glass, &mut calls);
                 crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
-                self.resolve_msaa(ctx, target);
+                self.resolve_msaa(ctx, &target);
             }
         }
         if encoded {
-            run_see_encode();
+            run_see_encode(&target);
             if !split {
                 draw_surface_decals(&mut calls);
             }
-            draw_see_through(has_glass, &mut calls);
-            run_see_decode(true);
+            draw_see_through(&target, has_glass, &mut calls);
+            run_see_decode(&target, true);
         }
         if split || encoded {
             crate::gpu_timing::mark(ctx, "gpu: water, glass, split see-through");
         }
         stats.draw_calls = calls;
 
+        let ssao_needed = self.quality.enable_ssao && globals.ssao[3] > 0.0;
+        let clouds_needed = clouds_active && frame.clouds.is_some() && self.clouds.is_some();
+
         crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
-        unsafe {
-            ctx.OMSetRenderTargets(None, None);
-            ctx.CopyResource(&target.scene_copy_tex, &target.hdr_tex);
+        if ssao_needed {
+            let copy_tex = target.ensure_scene_copy(device).0.clone();
+            unsafe {
+                ctx.OMSetRenderTargets(None, None);
+                ctx.CopyResource(&copy_tex, &target.hdr_tex);
+            }
+            crate::gpu_timing::mark(ctx, "gpu: scene copy");
+        } else {
+            unsafe { ctx.OMSetRenderTargets(None, None) };
         }
-        crate::gpu_timing::mark(ctx, "gpu: scene copy");
 
         self.bind_scene_globals_with(ctx, &self.globals_cb);
 
         // SSAO passes.
-        if self.quality.enable_ssao {
+        if ssao_needed {
             if msaa && !glass_depth_ran {
-                self.resolve_glass_depth(ctx, target);
+                self.resolve_glass_depth(device, ctx, &mut target);
                 glass_depth_ran = true;
             }
-            let depth_1x_srv = if msaa { &target.glass_depth_srv } else { &target.depth_srv };
+            let _ = target.ensure_ssao(device);
+            let ssao = target.ssao.as_ref().unwrap();
+            let copy_srv = &target.scene_copy.as_ref().unwrap().1;
+            let depth_1x_srv = if msaa {
+                &target.glass_depth.as_ref().unwrap().1
+            } else {
+                &target.depth_srv
+            };
             self.run_post_pass(
                 ctx,
-                &target.ssao_depth_rtv,
+                &ssao.depth_rtv,
                 target.half_size,
                 Some([1.0; 4]),
                 self.ps_ssao_down.get(msaa),
@@ -4053,16 +4323,16 @@ impl Renderer {
             );
             self.run_post_pass(
                 ctx,
-                &target.ssao_rtvs[0],
+                &ssao.rtvs[0],
                 target.half_size,
                 Some([1.0; 4]),
                 &self.ps_ssao_main,
-                [None, None, None, None, Some(&target.ssao_depth_srv), None, None, None],
+                [None, None, None, None, Some(&ssao.depth_srv), None, None, None],
                 &self.bs_opaque,
             );
             self.run_post_pass(
                 ctx,
-                &target.ssao_rtvs[1],
+                &ssao.rtvs[1],
                 target.half_size,
                 Some([1.0; 4]),
                 &self.ps_ssao_blur_x,
@@ -4071,8 +4341,8 @@ impl Renderer {
                     None,
                     None,
                     None,
-                    Some(&target.ssao_srvs[0]),
-                    Some(&target.scene_copy_srv),
+                    Some(&ssao.srvs[0]),
+                    Some(copy_srv),
                     None,
                     None,
                 ],
@@ -4080,7 +4350,7 @@ impl Renderer {
             );
             self.run_post_pass(
                 ctx,
-                &target.ssao_rtvs[0],
+                &ssao.rtvs[0],
                 target.half_size,
                 Some([1.0; 4]),
                 &self.ps_ssao_blur_y,
@@ -4089,8 +4359,8 @@ impl Renderer {
                     None,
                     None,
                     None,
-                    Some(&target.ssao_srvs[1]),
-                    Some(&target.scene_copy_srv),
+                    Some(&ssao.srvs[1]),
+                    Some(copy_srv),
                     None,
                     None,
                 ],
@@ -4110,8 +4380,8 @@ impl Renderer {
                         None,
                         None,
                         Some(depth_1x_srv),
-                        Some(&target.ssao_srvs[0]),
-                        Some(&target.scene_copy_srv),
+                        Some(&ssao.srvs[0]),
+                        Some(copy_srv),
                         None,
                         None,
                     ],
@@ -4124,40 +4394,39 @@ impl Renderer {
         crate::gpu_timing::mark(ctx, "gpu: ssao");
 
         // Terrain.Clouds over the sky (Studio composes them after SSAO).
-        if clouds_active && frame.clouds.is_some() {
+        if clouds_needed {
             if msaa && !glass_depth_ran {
-                self.resolve_glass_depth(ctx, target);
+                self.resolve_glass_depth(device, ctx, &mut target);
             }
-            let depth_1x_srv = if msaa { &target.glass_depth_srv } else { &target.depth_srv };
-            if self.clouds.is_some() {
-                crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
-                unsafe {
-                    ctx.OMSetRenderTargets(None, None);
-                    ctx.CopyResource(&target.scene_copy_tex, &target.hdr_tex);
-                }
-                self.bind_scene_globals_with(ctx, &self.globals_cb);
-                crate::d3d11::set_viewport(ctx, 0.0, 0.0, target.size[0] as f32, target.size[1] as f32);
-                if let Some(c) = self.clouds.as_mut() {
-                    c.composite(ctx, &target.hdr_rtv, &target.scene_copy_srv, depth_1x_srv);
-                }
-                crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
-                unsafe { ctx.OMSetRenderTargets(None, None) };
+            let copy = target.ensure_scene_copy(device);
+            let copy_tex = copy.0.clone();
+            let copy_srv = copy.1.clone();
+            let depth_1x_srv = if msaa {
+                &target.glass_depth.as_ref().unwrap().1
+            } else {
+                &target.depth_srv
+            };
+            crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
+            unsafe {
+                ctx.OMSetRenderTargets(None, None);
+                ctx.CopyResource(&copy_tex, &target.hdr_tex);
             }
+            self.bind_scene_globals_with(ctx, &self.globals_cb);
+            crate::d3d11::set_viewport(ctx, 0.0, 0.0, target.size[0] as f32, target.size[1] as f32);
+            if let Some(c) = self.clouds.as_mut() {
+                c.composite(ctx, &target.hdr_rtv, &copy_srv, depth_1x_srv);
+            }
+            crate::d3d11::unbind_ps_srvs(ctx, 15, 17);
+            unsafe { ctx.OMSetRenderTargets(None, None) };
         }
         crate::gpu_timing::mark(ctx, "gpu: clouds composite");
 
-        if self.quality.enable_bloom {
-            self.encode_bloom(ctx, target, globals.bloom[1]);
-        } else {
-            unsafe { ctx.ClearRenderTargetView(&target.bloom_rtvs[0], &[0.0; 4]) };
+        self.post_deferred = frame.defer_post;
+        if !frame.defer_post {
+            self.run_bloom_dof_post(device, ctx, &mut target);
         }
-        crate::gpu_timing::mark(ctx, "gpu: bloom");
 
-        self.run_dof_and_post(ctx, target);
-        crate::gpu_timing::mark(ctx, "gpu: dof");
-        crate::gpu_timing::mark(ctx, "gpu: post");
-
-        crate::gpu_timing::end_frame(device, ctx);
+        self.target = Some(target);
         self.probe.flush(ctx);
         if let Some(c) = self.clouds.as_mut() {
             c.after_submit();
@@ -4407,11 +4676,6 @@ impl Renderer {
         let m = &self.meshes[idx as usize + BUILTIN_MESHES];
         self.skin.queue(device, ctx, idx, &m.vbuf, req);
         idx
-    }
-
-    /// GPU bytes written for skinning since the last call (bench).
-    pub fn take_skin_bytes(&mut self) -> u64 {
-        self.skin.take_bytes()
     }
 
     /// Rewrites a loaded mesh's vertices in place (skinned parts re-upload

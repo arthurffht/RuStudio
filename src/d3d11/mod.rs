@@ -1,8 +1,6 @@
 //! Native Windows Direct3D 11 rendering backend, DXGI swapchain management,
 //! egui DX11 painter, and winit OS window host.
 
-#![allow(dead_code, unused_imports)]
-
 pub mod device;
 pub mod egui_painter;
 pub mod offscreen;
@@ -21,5 +19,4 @@ pub use device::{
 };
 pub use egui_painter::EguiD3d11;
 pub use offscreen::OffscreenTarget;
-pub use swapchain::Swapchain;
-pub use window::{window_hwnd, WindowApp, WindowOptions};
+pub use window::{WindowApp, WindowOptions};

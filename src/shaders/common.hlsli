@@ -329,24 +329,34 @@ float sun_shadow_map(float3 world) {
     float3 d0 = world - g.sun_sphere[0].xyz;
     float3 d1 = world - g.sun_sphere[1].xyz;
     float3 d2 = world - g.sun_sphere[2].xyz;
+    float3 d3 = world - g.sun_sphere[3].xyz;
     float4x4 casc = g.sun_casc[3];
     float4 r = g.sun_rect[3];
+    bool hit = false;
     if (dot(d0, d0) < g.sun_sphere[0].w) {
         casc = g.sun_casc[0];
         r = g.sun_rect[0];
+        hit = true;
     } else if (dot(d1, d1) < g.sun_sphere[1].w) {
         casc = g.sun_casc[1];
         r = g.sun_rect[1];
+        hit = true;
     } else if (dot(d2, d2) < g.sun_sphere[2].w) {
         casc = g.sun_casc[2];
         r = g.sun_rect[2];
+        hit = true;
+    } else if (dot(d3, d3) < g.sun_sphere[3].w) {
+        hit = true;
     }
-    float4 p = mul(casc, float4(world, 1.0f));
-    if (any(p.xy <= 0.0f) || any(p.xy >= 1.0f)) {
-        return -1.0f;
+    float vis = -1.0f;
+    if (hit) {
+        float4 p = mul(casc, float4(world, 1.0f));
+        if (all(p.xy > 0.0f) && all(p.xy < 1.0f)) {
+            float4 m = sun_evsm_tex.SampleLevel(lshadow_sampler, r.xy + p.xy * r.zw, 0.0f);
+            vis = evsm_visibility(m, 2.0f * p.z - 1.0f);
+        }
     }
-    float4 m = sun_evsm_tex.SampleLevel(lshadow_sampler, r.xy + p.xy * r.zw, 0.0f);
-    return evsm_visibility(m, 2.0f * p.z - 1.0f);
+    return vis;
 }
 
 float sun_visibility_at(float3 world, float3 n, float3 receiver) {
@@ -361,7 +371,8 @@ float sun_visibility_at(float3 world, float3 n, float3 receiver) {
     if (mapped < 0.0f) {
         return voxel;
     }
-    return lerp(mapped, voxel, saturate((length(world - g.cam_pos.xyz) - SUN_DIST) * HYBRID_LERP_SLOPE));
+    float sun_dist = (g.bloom.w > 0.0f) ? g.bloom.w : SUN_DIST;
+    return lerp(mapped, voxel, saturate((length(world - g.cam_pos.xyz) - sun_dist) * HYBRID_LERP_SLOPE));
 }
 
 float sun_visibility(float3 world, float3 n) {
@@ -505,18 +516,24 @@ float light_shadow(int slot, float3 world) {
     return evsm_visibility(m, 2.0f * (w * pos.w) - 1.0f);
 }
 
+float3 local_grid(float3 world, float3 n) {
+    if (g.lightgrid.w <= 0.0f) {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+    float3 p = (world + n * 6.0f) * 0.25f - g.lightgrid.xyz;
+    float3 t = p.xzy / (float3)tex_dims3d(localgrid_tex);
+    if (any(abs(t - 0.5f) >= LIGHTGRID_BORDER)) {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+    float4 v = localgrid_tex.SampleLevel(sky_sampler, t, 0.0f);
+    return v.rgb * (v.a * 120.0f);
+}
+
 float3 local_lights(float3 world, float3 n) {
     float3 sum = float3(0.0f, 0.0f, 0.0f);
     [branch]
     if (g.sun_color.w > 0.5f) {
-        if (g.lightgrid.w > 0.0f) {
-            float3 p = (world + n * 6.0f) * 0.25f - g.lightgrid.xyz;
-            float3 t = p.xzy / (float3)tex_dims3d(localgrid_tex);
-            if (!any(abs(t - 0.5f) >= LIGHTGRID_BORDER)) {
-                float4 v = localgrid_tex.SampleLevel(sky_sampler, t, 0.0f);
-                sum = v.rgb * (v.a * 120.0f);
-            }
-        }
+        sum = local_grid(world, n);
     } else {
         uint count = (uint)g.params.x;
         [branch]

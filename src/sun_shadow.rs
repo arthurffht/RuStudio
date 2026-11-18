@@ -246,9 +246,7 @@ struct Drawn {
 /// The atlas, its passes and which tiles are current.
 pub struct SunShadows {
     pub atlas_srv: ID3D11ShaderResourceView,
-    atlas_tex: ID3D11Texture2D,
     atlas_rtv: ID3D11RenderTargetView,
-    temp_tex: ID3D11Texture2D,
     temp_srv: ID3D11ShaderResourceView,
     temp_rtv: ID3D11RenderTargetView,
     depth_srv: ID3D11ShaderResourceView,
@@ -262,12 +260,13 @@ pub struct SunShadows {
     blend: ID3D11BlendState,
     drawn: [Option<Drawn>; CASCADES],
     frame: u64,
+    pub side: u32,
 }
 
 impl SunShadows {
     /// `depth_srv`: SRV (`R32_FLOAT`) over the square depth map the cascades are
-    /// drawn into one at a time (at least the largest tile across).
-    pub fn new(device: &ID3D11Device, depth_srv: &ID3D11ShaderResourceView) -> Self {
+    /// drawn into one at a time, sized for `side` (2048, 1024, or 512).
+    pub fn new(device: &ID3D11Device, depth_srv: &ID3D11ShaderResourceView, side: u32) -> Self {
         let make_rt = |[w, h]: [u32; 2]| {
             let tex = d3d11::create_tex2d(
                 device,
@@ -285,11 +284,15 @@ impl SunShadows {
             );
             let srv = d3d11::create_srv_2d(device, &tex, ATLAS_FORMAT, false, 0, 1);
             let rtv = d3d11::create_rtv(device, &tex, ATLAS_FORMAT, 0, false);
-            (tex, srv, rtv)
+            (srv, rtv)
         };
-        let side = mech::SUN_CASCADE_TILES.iter().copied().max().unwrap_or(1);
-        let (atlas_tex, atlas_srv, atlas_rtv) = make_rt(mech::SUN_SHADOW_ATLAS);
-        let (temp_tex, temp_srv, temp_rtv) = make_rt([side, side]);
+        let side = side.max(1);
+        let atlas_w = (mech::SUN_SHADOW_ATLAS[0] * side / mech::SHADOW_MAP_TEXELS).max(1);
+        let atlas_h = (mech::SUN_SHADOW_ATLAS[1] * side / mech::SHADOW_MAP_TEXELS).max(1);
+        let max_tile = mech::SUN_CASCADE_TILES.iter().copied().max().unwrap_or(mech::SHADOW_MAP_TEXELS);
+        let temp_side = (max_tile * side / mech::SHADOW_MAP_TEXELS).max(1);
+        let (atlas_srv, atlas_rtv) = make_rt([atlas_w, atlas_h]);
+        let (temp_srv, temp_rtv) = make_rt([temp_side, temp_side]);
         let pass_cbs = std::array::from_fn(|_| d3d11::create_cb(device, std::mem::size_of::<PassRaw>()));
         let sampler = d3d11::create_sampler(
             device,
@@ -307,9 +310,7 @@ impl SunShadows {
         let blend = d3d11::create_blend_state(device, BlendMode::Opaque);
         SunShadows {
             atlas_srv,
-            atlas_tex,
             atlas_rtv,
-            temp_tex,
             temp_srv,
             temp_rtv,
             depth_srv: depth_srv.clone(),
@@ -323,7 +324,22 @@ impl SunShadows {
             blend,
             drawn: [None; CASCADES],
             frame: 0,
+            side,
         }
+    }
+
+    pub fn scale_cascade(&self, c: &Cascade) -> Cascade {
+        if self.side == mech::SHADOW_MAP_TEXELS {
+            return *c;
+        }
+        let mut out = *c;
+        out.tile = (c.tile * self.side / mech::SHADOW_MAP_TEXELS).max(1);
+        out.origin = [
+            c.origin[0] * self.side / mech::SHADOW_MAP_TEXELS,
+            c.origin[1] * self.side / mech::SHADOW_MAP_TEXELS,
+        ];
+        out.level = (c.level * self.side / mech::SHADOW_MAP_TEXELS).max(1);
+        out
     }
 
     /// Clears the full EVSM atlas to unshadowed far-depth moments.
@@ -361,14 +377,15 @@ impl SunShadows {
     /// Uploads the passes' constants; before any of them is drawn.
     pub fn upload(&self, ctx: &ID3D11DeviceContext, cascades: &[Cascade; CASCADES]) {
         for (i, c) in cascades.iter().enumerate() {
-            let k = (c.level as usize).clamp(1, EVSM_H_WEIGHTS.len()) - 1;
+            let sc = self.scale_cascade(c);
+            let k = (sc.level as usize).clamp(1, EVSM_H_WEIGHTS.len()) - 1;
             let mut raw = PassRaw {
-                vp: c.view_proj().to_cols_array_2d(),
-                rect: [c.tile as f32, 0.0, c.origin[0] as f32, c.origin[1] as f32],
+                vp: sc.view_proj().to_cols_array_2d(),
+                rect: [sc.tile as f32, 0.0, sc.origin[0] as f32, sc.origin[1] as f32],
                 hw: [0.0; 12],
                 vw: [0.0; 8],
                 vo: EVSM_V_OFFSETS[k],
-                centre: c.centre.extend(0.0).to_array(),
+                centre: sc.centre.extend(0.0).to_array(),
             };
             raw.hw[..9].copy_from_slice(&EVSM_H_WEIGHTS[k]);
             raw.vw[..5].copy_from_slice(&EVSM_V_WEIGHTS[k]);
@@ -388,7 +405,8 @@ impl SunShadows {
     /// Cascade `i`'s depth (in the depth map's corner) to blurred moments
     /// in its atlas tile.
     pub fn blur(&self, ctx: &ID3D11DeviceContext, c: &Cascade, i: usize) {
-        let t = c.tile as f32;
+        let sc = self.scale_cascade(c);
+        let t = sc.tile as f32;
         let cb = [Some(self.pass_cbs[i].clone())];
 
         d3d11::unbind_ps_srvs(ctx, 0, 32);
@@ -401,7 +419,7 @@ impl SunShadows {
             ctx.OMSetBlendState(&self.blend, None, !0);
         }
         d3d11::set_viewport(ctx, 0.0, 0.0, t, t);
-        d3d11::set_scissor(ctx, 0, 0, c.tile as i32, c.tile as i32);
+        d3d11::set_scissor(ctx, 0, 0, sc.tile as i32, sc.tile as i32);
         unsafe {
             ctx.VSSetShader(&self.vs_blur, None);
             ctx.PSSetShader(&self.ps_h, None);
@@ -414,8 +432,8 @@ impl SunShadows {
         unsafe {
             ctx.OMSetRenderTargets(Some(&[Some(self.atlas_rtv.clone())]), None);
         }
-        d3d11::set_viewport(ctx, c.origin[0] as f32, c.origin[1] as f32, t, t);
-        d3d11::set_scissor(ctx, c.origin[0] as i32, c.origin[1] as i32, c.tile as i32, c.tile as i32);
+        d3d11::set_viewport(ctx, sc.origin[0] as f32, sc.origin[1] as f32, t, t);
+        d3d11::set_scissor(ctx, sc.origin[0] as i32, sc.origin[1] as i32, sc.tile as i32, sc.tile as i32);
         unsafe {
             ctx.PSSetShader(&self.ps_v, None);
             ctx.PSSetConstantBuffers(0, Some(&cb));

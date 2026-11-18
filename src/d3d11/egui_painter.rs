@@ -426,14 +426,24 @@ impl EguiD3d11 {
         }
         set_viewport(ctx, 0.0, 0.0, screen_size_px[0] as f32, screen_size_px[1] as f32);
 
+        let mut last_scissor: Option<[i32; 4]> = None;
+        let mut last_tex_id: Option<egui::TextureId> = None;
         for cmd in &self.draw_cmds {
-            let Some((srv, sampler)) = self.resolve_binding(cmd.texture_id) else {
-                continue;
-            };
-            set_scissor(ctx, cmd.scissor[0], cmd.scissor[1], cmd.scissor[2], cmd.scissor[3]);
+            if last_tex_id != Some(cmd.texture_id) {
+                let Some((srv, sampler)) = self.resolve_binding(cmd.texture_id) else {
+                    continue;
+                };
+                unsafe {
+                    ctx.PSSetShaderResources(0, Some(&[Some(srv.clone())]));
+                    ctx.PSSetSamplers(0, Some(&[Some(sampler.clone())]));
+                }
+                last_tex_id = Some(cmd.texture_id);
+            }
+            if last_scissor != Some(cmd.scissor) {
+                set_scissor(ctx, cmd.scissor[0], cmd.scissor[1], cmd.scissor[2], cmd.scissor[3]);
+                last_scissor = Some(cmd.scissor);
+            }
             unsafe {
-                ctx.PSSetShaderResources(0, Some(&[Some(srv.clone())]));
-                ctx.PSSetSamplers(0, Some(&[Some(sampler.clone())]));
                 ctx.DrawIndexed(cmd.index_count, cmd.start_index, cmd.base_vertex);
             }
         }

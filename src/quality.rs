@@ -35,7 +35,10 @@ impl QualityProfile {
             } else {
                 1
             };
-        let max_anisotropy = if lvl >= mech::QUALITY_ANISO_HIGH_MIN_LEVEL && !caps.is_uma {
+        let low_tier = lvl <= mech::QUALITY_LOW_SHADER_MAX_LEVEL;
+        let max_anisotropy = if low_tier {
+            mech::QUALITY_ANISO_LOW
+        } else if lvl >= mech::QUALITY_ANISO_HIGH_MIN_LEVEL && !caps.is_uma {
             (mech::TEXTURE_ANISOTROPY as u32).min(caps.max_anisotropy).max(1)
         } else if lvl >= mech::QUALITY_ANISO_MID_MIN_LEVEL && lvl > mech::QUALITY_ANISO_LOW_MAX_LEVEL {
             mech::QUALITY_ANISO_MID.min(caps.max_anisotropy).max(1)
@@ -53,7 +56,9 @@ impl QualityProfile {
             } else {
                 mech::QUALITY_SHADOW_ATLAS_LOW
             },
-            shadow_cascades: if lvl >= mech::QUALITY_CASCADES_4_MIN_LEVEL {
+            shadow_cascades: if low_tier {
+                0
+            } else if lvl >= mech::QUALITY_CASCADES_4_MIN_LEVEL {
                 4
             } else if lvl >= mech::QUALITY_CASCADES_3_MIN_LEVEL {
                 3
@@ -62,12 +67,14 @@ impl QualityProfile {
             } else {
                 1
             },
-            enable_shadows: lvl >= mech::QUALITY_SHADOWS_MIN_LEVEL,
-            enable_ssao: lvl >= mech::QUALITY_SSAO_MIN_LEVEL && (!auto_mode || !caps.is_uma),
-            enable_dof: lvl >= mech::QUALITY_DOF_MIN_LEVEL && (!auto_mode || !caps.is_uma),
-            enable_bloom: lvl >= mech::QUALITY_BLOOM_MIN_LEVEL,
-            enable_clouds: lvl >= mech::QUALITY_SHADOWS_MIN_LEVEL,
-            max_local_shadows: if lvl >= mech::QUALITY_MSAA_MIN_LEVEL && !caps.is_uma {
+            enable_shadows: !low_tier && lvl >= mech::QUALITY_SHADOWS_MIN_LEVEL,
+            enable_ssao: !low_tier && lvl >= mech::QUALITY_SSAO_MIN_LEVEL && (!auto_mode || !caps.is_uma),
+            enable_dof: !low_tier && lvl >= mech::QUALITY_DOF_MIN_LEVEL && (!auto_mode || !caps.is_uma),
+            enable_bloom: !low_tier && lvl >= mech::QUALITY_BLOOM_MIN_LEVEL,
+            enable_clouds: !low_tier && lvl >= mech::QUALITY_SHADOWS_MIN_LEVEL,
+            max_local_shadows: if low_tier {
+                0
+            } else if lvl >= mech::QUALITY_MSAA_MIN_LEVEL && !caps.is_uma {
                 mech::QUALITY_MAX_LOCAL_SHADOWS_HIGH
             } else if lvl >= mech::QUALITY_LOCAL_SHADOWS_MIN_LEVEL {
                 mech::QUALITY_MAX_LOCAL_SHADOWS_MID
@@ -108,7 +115,7 @@ impl QualityProfile {
         let raw_level = if quality_setting == 0 {
             frm_level.unwrap_or_else(|| Self::recommended_for_caps(caps))
         } else if frm_enabled {
-            frm_level.unwrap_or(quality_setting)
+            frm_level.unwrap_or(quality_setting).min(quality_setting)
         } else {
             quality_setting
         };
@@ -325,6 +332,37 @@ mod tests {
         let frm_active = QualityProfile::resolve(&high, 18, true, Some(9));
         assert!(frm_active.auto_mode);
         assert_eq!(frm_active.level, 9);
+        // Manual setting caps FRM rather than allowing FRM to upgrade above it.
+        let frm_capped = QualityProfile::resolve(&high, 10, true, Some(21));
+        assert_eq!(frm_capped.level, 10);
+    }
+
+    #[test]
+    fn manual_level01_on_uma_not_upgraded_and_low_tier_disables_heavy_effects() {
+        let uma = intel_hd_4000_caps();
+        for frm in [None, Some(5), Some(12), Some(21)] {
+            let p = QualityProfile::resolve(&uma, 1, true, frm);
+            assert_eq!(p.level, 1, "manual Level01 must stay at level 1 for frm={frm:?}");
+            assert!(!p.enable_shadows);
+            assert!(!p.enable_clouds);
+            assert!(!p.enable_bloom);
+            assert!(!p.enable_ssao);
+            assert!(!p.enable_dof);
+            assert_eq!(p.shadow_cascades, 0);
+            assert_eq!(p.max_local_shadows, 0);
+            assert_eq!(p.max_anisotropy, 1);
+        }
+        for lvl in 1..=mech::QUALITY_LOW_SHADER_MAX_LEVEL {
+            let p = QualityProfile::from_level(lvl, &discrete_gpu_caps(8192, 4), false);
+            assert!(!p.enable_shadows);
+            assert!(!p.enable_clouds);
+            assert!(!p.enable_bloom);
+            assert!(!p.enable_ssao);
+            assert!(!p.enable_dof);
+            assert_eq!(p.shadow_cascades, 0);
+            assert_eq!(p.max_local_shadows, 0);
+            assert_eq!(p.max_anisotropy, 1);
+        }
     }
 
     #[test]
