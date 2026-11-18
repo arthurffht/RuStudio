@@ -14,6 +14,8 @@ pub mod tools_session;
 pub mod tools_terrain;
 pub mod tools_viewport;
 pub mod variants;
+#[cfg(test)]
+mod offline_catalog;
 
 use std::sync::mpsc::Sender;
 
@@ -203,4 +205,70 @@ fn run_omni_batch(
     }));
     out.is_error = any_error && stop_on_error;
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn schema_and_offline_catalog_have_100_percent_parity() {
+        let live = all_schemas();
+        let offline = offline_catalog::engine_tools();
+        assert_eq!(live.len(), 53, "expected 53 OmniMCP engine tools");
+        assert_eq!(
+            offline.len(),
+            live.len(),
+            "offline catalog count mismatch ({} vs {})",
+            offline.len(),
+            live.len()
+        );
+
+        let mut seen = HashSet::new();
+        for (idx, (l, o)) in live.iter().zip(offline.iter()).enumerate() {
+            assert!(
+                seen.insert(l.name.clone()),
+                "duplicate tool name in all_schemas(): {}",
+                l.name
+            );
+            assert_eq!(l.name, o.name, "tool name mismatch at index {idx}");
+            assert_eq!(
+                l.description, o.description,
+                "description mismatch for tool '{}'",
+                l.name
+            );
+            assert_eq!(
+                l.input_schema, o.input_schema,
+                "inputSchema mismatch for tool '{}'",
+                l.name
+            );
+        }
+
+        let live_res = resources_prompts::resources();
+        let off_res = offline_catalog::engine_resources();
+        assert_eq!(live_res.len(), 6);
+        assert_eq!(off_res.len(), live_res.len());
+        for (l, o) in live_res.iter().zip(off_res.iter()) {
+            assert_eq!(l.uri, o.uri);
+            assert_eq!(l.name, o.name);
+            assert_eq!(l.description, o.description);
+            assert_eq!(l.mime_type, o.mime_type);
+        }
+
+        let live_prompts = resources_prompts::prompts();
+        let off_prompts = offline_catalog::engine_prompts();
+        assert_eq!(live_prompts.len(), 4);
+        assert_eq!(off_prompts.len(), live_prompts.len());
+        for (l, o) in live_prompts.iter().zip(off_prompts.iter()) {
+            assert_eq!(l.name, o.name);
+            assert_eq!(l.description, o.description);
+            assert_eq!(l.arguments.len(), o.arguments.len());
+            for (la, oa) in l.arguments.iter().zip(o.arguments.iter()) {
+                assert_eq!(la.name, oa.name);
+                assert_eq!(la.description, oa.description);
+                assert_eq!(la.required, oa.required);
+            }
+        }
+    }
 }

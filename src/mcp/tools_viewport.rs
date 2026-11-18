@@ -36,7 +36,7 @@ pub fn schemas() -> Vec<ToolDef> {
             json!({
                 "type": "object",
                 "properties": {
-                    "datamodel": { "type": "string", "enum": ["edit", "play"], "description": "DataModel used when resolving focus_target (defaults to active)." },
+                    "datamodel": { "type": "string", "enum": ["Active", "Edit", "Server", "Client"], "description": "DataModel used when resolving focus_target (defaults to Active)." },
                     "pos": { "type": ["array", "object"], "description": "Camera world position [x, y, z] or {x, y, z}." },
                     "look_at": { "type": ["array", "object", "string"], "description": "Target world point [x, y, z], {x, y, z}, or instance path/ref to orient the camera toward." },
                     "focus": { "type": ["array", "object"], "description": "Explicit orbit focus point [x, y, z] without changing orientation." },
@@ -58,6 +58,7 @@ pub fn schemas() -> Vec<ToolDef> {
             json!({
                 "type": "object",
                 "properties": {
+                    "datamodel": { "type": "string", "enum": ["Active", "Edit", "Server", "Client"], "description": "DataModel used when resolving camera.focus_target (defaults to Active)." },
                     "target": { "type": "string", "enum": ["viewport", "window"], "default": "viewport", "description": "Capture only the 3D viewport render or the full application window." },
                     "camera": {
                         "type": "object",
@@ -78,7 +79,7 @@ pub fn schemas() -> Vec<ToolDef> {
             json!({
                 "type": "object",
                 "properties": {
-                    "datamodel": { "type": "string", "enum": ["edit", "play"] },
+                    "datamodel": { "type": "string", "enum": ["Active", "Edit", "Server", "Client"], "description": "Target DataModel (defaults to Active)." },
                     "preset": {
                         "type": "string",
                         "enum": ["daylight", "golden_hour", "cyberpunk_night", "foggy_horror", "studio_neutral"],
@@ -644,8 +645,8 @@ fn handle_lighting(ed: &mut crate::app::Editor, ctx: &egui::Context, args: &Valu
         return ToolCallResult::json(&read_lighting_state(doc, dm_name));
     }
 
-    let dm_name = match dm_arg {
-        Some("play") | Some("server") => "play",
+    let dm_name = match dm_arg.map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("play") | Some("server") | Some("client") => "play",
         Some("edit") => "edit",
         _ => {
             if ed.play.is_some() {

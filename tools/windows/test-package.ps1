@@ -10,6 +10,9 @@ try {
     if (!(Test-Path (Join-Path $bundle 'rustudio-mcp.exe'))) {
         throw 'Bundle missing rustudio-mcp.exe'
     }
+    if (!(Test-Path (Join-Path $bundle 'register-mcp.ps1'))) {
+        throw 'Bundle missing register-mcp.ps1'
+    }
     # LoadLibraryEx as data avoids executing application code.
     Add-Type @'
 using System;
@@ -34,6 +37,10 @@ public class IconResource {
     if ($link.WorkingDirectory -ne $prefix) { throw 'Wrong working directory' }
     if ((Get-FileHash (Join-Path $prefix 'api-dump.json')).Hash -ne (Get-FileHash (Join-Path $bundle 'api-dump.json')).Hash) { throw 'API data missing or changed' }
     if ((Get-FileHash (Join-Path $prefix 'rustudio-mcp.exe')).Hash -ne (Get-FileHash (Join-Path $bundle 'rustudio-mcp.exe')).Hash) { throw 'rustudio-mcp.exe missing or changed' }
+    if ((Get-FileHash (Join-Path $prefix 'register-mcp.ps1')).Hash -ne (Get-FileHash (Join-Path $bundle 'register-mcp.ps1')).Hash) { throw 'register-mcp.ps1 missing or changed' }
+    $mcpVer = & (Join-Path $prefix 'rustudio-mcp.exe') --version
+    if ($LASTEXITCODE -ne 0 -or !($mcpVer -match '^rustudio-mcp\s+')) { throw "rustudio-mcp.exe --version failed: $mcpVer" }
+    & (Join-Path $prefix 'register-mcp.ps1') -Targets Antigravity -DryRun | Out-Null
     Set-Content (Join-Path $prefix 'user-project.rbxl') 'preserve'
     & $installer -Prefix $prefix -ProgramsDirectory $programs
     & (Join-Path $prefix 'install.ps1') -Uninstall -Prefix $prefix -ProgramsDirectory $programs
@@ -41,6 +48,7 @@ public class IconResource {
     if (Test-Path (Join-Path $programs 'rustudio.lnk')) { throw 'Shortcut remains' }
     if (Test-Path (Join-Path $prefix 'rustudio.exe')) { throw 'Executable remains' }
     if (Test-Path (Join-Path $prefix 'rustudio-mcp.exe')) { throw 'MCP executable remains' }
+    if (Test-Path (Join-Path $prefix 'register-mcp.ps1')) { throw 'register-mcp.ps1 remains' }
     if ((Get-Content (Join-Path $prefix 'user-project.rbxl')) -ne 'preserve') { throw 'User data lost' }
     & $installer -Prefix $prefix -ProgramsDirectory $programs -NoShortcut
     if (Test-Path (Join-Path $programs 'rustudio.lnk')) { throw 'Unwanted shortcut created' }

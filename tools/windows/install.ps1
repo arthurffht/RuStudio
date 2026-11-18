@@ -80,7 +80,7 @@ trap {
 }
 $Prefix = [IO.Path]::GetFullPath($Prefix)
 $shortcutPath = Join-Path $ProgramsDirectory 'rustudio.lnk'
-$files = @('rustudio.exe', 'rustudio-mcp.exe', 'api-dump.json', 'LICENSE-MIT', 'LICENSE-APACHE', 'README.md', 'install.ps1', 'uninstall.cmd')
+$files = @('rustudio.exe', 'rustudio-mcp.exe', 'api-dump.json', 'LICENSE-MIT', 'LICENSE-APACHE', 'README.md', 'install.ps1', 'register-mcp.ps1', 'uninstall.cmd')
 $exe = Join-Path $Prefix 'rustudio.exe'
 $mcpExe = Join-Path $Prefix 'rustudio-mcp.exe'
 # Fail before copying if an installed executable is still running.

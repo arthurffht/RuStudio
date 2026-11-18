@@ -58,7 +58,7 @@ pub fn schemas() -> Vec<ToolDef> {
                     "game_id": { "type": "integer", "minimum": 0 },
                     "clean": { "type": "boolean", "default": false, "description": "Clear non-empty target export directory before exporting." },
                     "open": { "type": "boolean", "default": false, "description": "Open exported project or built .rbxl place in Studio afterwards." },
-                    "datamodel": { "type": "string", "enum": ["edit", "play"] }
+                    "datamodel": { "type": "string", "enum": ["Active", "Edit", "Server", "Client"] }
                 },
                 "required": ["action"],
                 "additionalProperties": false
@@ -97,7 +97,7 @@ pub fn schemas() -> Vec<ToolDef> {
                     "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Optional world [x, y, z] position for imported model/part center." },
                     "mode": { "type": "string", "enum": ["auto", "model", "animation"], "default": "auto", "description": "For .fbx files: import meshes ('model'), KeyframeSequence ('animation'), or auto-detect." },
                     "r15": { "type": "boolean", "default": true, "description": "Include R15 AnimationRigData when importing FBX animations." },
-                    "datamodel": { "type": "string", "enum": ["edit", "play"] }
+                    "datamodel": { "type": "string", "enum": ["Active", "Edit", "Server", "Client"] }
                 },
                 "additionalProperties": false
             }),
@@ -719,8 +719,8 @@ fn handle_asset_import(
     };
 
     let dm_arg = args.get("datamodel").and_then(Value::as_str);
-    let dm_name = match dm_arg {
-        Some("play") | Some("server") => "play",
+    let dm_name = match dm_arg.map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("play") | Some("server") | Some("client") => "play",
         Some("edit") => "edit",
         _ => {
             if ed.play.is_some() {

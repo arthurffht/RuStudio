@@ -51,7 +51,7 @@ pub fn schemas() -> Vec<ToolDef> {
                         "enum": ["get", "set", "add", "remove", "clear", "select_all_of_class"],
                         "default": "get"
                     },
-                    "datamodel": { "type": "string", "enum": ["edit", "play"] },
+                    "datamodel": { "type": "string", "enum": ["Active", "Edit", "Server", "Client"] },
                     "targets": {
                         "type": ["array", "string", "object"],
                         "description": "Target instance ref(s) or path(s) for set, add, or remove."
@@ -71,7 +71,7 @@ pub fn schemas() -> Vec<ToolDef> {
                 "properties": {
                     "action": { "type": "string", "enum": ["status", "undo", "redo", "clear"], "default": "status" },
                     "steps": { "type": "integer", "minimum": 1, "maximum": 200, "default": 1, "description": "Number of undo or redo steps to execute." },
-                    "datamodel": { "type": "string", "enum": ["edit", "play"] }
+                    "datamodel": { "type": "string", "enum": ["Active", "Edit", "Server", "Client"] }
                 },
                 "additionalProperties": false
             }),
@@ -130,7 +130,7 @@ pub fn schemas() -> Vec<ToolDef> {
             json!({
                 "type": "object",
                 "properties": {
-                    "datamodel": { "type": "string", "enum": ["edit", "play"] },
+                    "datamodel": { "type": "string", "enum": ["Active", "Edit", "Server", "Client"] },
                     "root": { "type": ["string", "object"], "description": "Optional GUI root container ref/path (defaults to StarterGui or active PlayerGui)." },
                     "include_world_guis": { "type": "boolean", "default": true, "description": "Include Workspace SurfaceGui and BillboardGui objects when no explicit root is specified." },
                     "include_hidden": { "type": "boolean", "default": true, "description": "Include objects with Visible=false or inside disabled ScreenGuis." },
@@ -201,10 +201,11 @@ fn handle_selection(ed: &mut crate::app::Editor, ctx: &egui::Context, args: &Val
         _ => Vec::new(),
     };
 
-    let touch_editor_selection = matches!(dm_arg, None | Some("") | Some("active"))
-        || (dm_arg == Some("edit") && ed.play.is_none());
-    let dm_name = match dm_arg {
-        Some("play") | Some("server") => "play",
+    let dm_lower = dm_arg.map(|s| s.to_ascii_lowercase());
+    let touch_editor_selection = matches!(dm_lower.as_deref(), None | Some("") | Some("active"))
+        || (dm_lower.as_deref() == Some("edit") && ed.play.is_none());
+    let dm_name = match dm_lower.as_deref() {
+        Some("play") | Some("server") | Some("client") => "play",
         Some("edit") => "edit",
         _ => {
             if ed.play.is_some() {
@@ -370,8 +371,8 @@ fn handle_undo_redo(ed: &mut crate::app::Editor, ctx: &egui::Context, args: &Val
         .unwrap_or(1)
         .clamp(1, 200) as usize;
 
-    let dm_name = match dm_arg {
-        Some("play") | Some("server") => "play",
+    let dm_name = match dm_arg.map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("play") | Some("server") | Some("client") => "play",
         Some("edit") => "edit",
         _ => {
             if ed.play.is_some() {
